@@ -3,6 +3,7 @@ import {
   Battery,
   Camera,
   Circle,
+  Clock,
   LayoutGrid,
   Lightbulb,
   Maximize2,
@@ -14,6 +15,7 @@ import {
 } from 'lucide-react'
 import type {
   LiveStreamSession,
+  NvrStatus,
   PackageDetectionRecord,
   RingCameraInfo,
 } from '@shared/types'
@@ -23,6 +25,8 @@ import { LiveVideoPlayer } from './LiveVideoPlayer'
 interface CamerasViewProps {
   cameras: RingCameraInfo[]
   streamsByCamera: Record<string, LiveStreamSession>
+  nvrStatus: NvrStatus
+  nvrBusy: boolean
   recordingsCount: number
   packageDetections: PackageDetectionRecord[]
   defaultCaptureSeconds: number
@@ -31,6 +35,9 @@ interface CamerasViewProps {
   onStartStream: (cameraId: string) => Promise<void>
   onStopStream: (cameraId: string) => Promise<void>
   onCaptureRecording: (cameraId: string, durationSeconds: number) => Promise<void>
+  onToggleAllRecording: () => Promise<void>
+  onToggleCameraContinuous: (cameraId: string, enable: boolean) => Promise<void>
+  onOpenTimeline: () => void
   onCaptureSnapshot: (cameraId: string) => Promise<void>
   onScanPackages: (cameraId: string) => Promise<void>
   onToggleLight: (cameraId: string, on: boolean) => Promise<void>
@@ -40,6 +47,8 @@ interface CamerasViewProps {
 export function CamerasView({
   cameras,
   streamsByCamera,
+  nvrStatus,
+  nvrBusy,
   recordingsCount,
   packageDetections,
   defaultCaptureSeconds,
@@ -48,6 +57,9 @@ export function CamerasView({
   onStartStream,
   onStopStream,
   onCaptureRecording,
+  onToggleAllRecording,
+  onToggleCameraContinuous,
+  onOpenTimeline,
   onCaptureSnapshot,
   onScanPackages,
   onToggleLight,
@@ -74,7 +86,6 @@ export function CamerasView({
   }
 
   const onlineCount = cameras.filter((c) => c.online).length
-  const liveCount = Object.keys(streamsByCamera).length
   const positivePackages = packageDetections.filter((d) => d.packageDetected).length
 
   const focusedCamera = focusedCameraId
@@ -92,9 +103,18 @@ export function CamerasView({
           <span className="telemetry-note">Connected Ring devices</span>
         </div>
         <div className="telemetry-card">
-          <span className="telemetry-label">Active Live Streams</span>
-          <span className="telemetry-value">{liveCount}</span>
-          <span className="telemetry-note">Low-latency HLS / preview</span>
+          <span className="telemetry-label">Continuous NVR</span>
+          <span
+            className="telemetry-value"
+            style={{ color: nvrStatus.active ? '#f87171' : undefined }}
+          >
+            {nvrStatus.activeCameraCount}/{cameras.length}
+          </span>
+          <span className="telemetry-note">
+            {nvrStatus.active
+              ? `${nvrStatus.totalSegmentsCaptured} rolling MP4 segment(s) saved`
+              : 'All-camera timeline recorder idle'}
+          </span>
         </div>
         <div className="telemetry-card">
           <span className="telemetry-label">Local MP4 Vault</span>
@@ -107,6 +127,70 @@ export function CamerasView({
           <span className="telemetry-note">Detected across scans</span>
         </div>
       </section>
+
+      {cameras.length > 0 && (
+        <section className="panel nvr-banner" aria-label="All-camera NVR recording controls">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span className={`chip ${nvrStatus.active ? 'alert' : ''}`}>
+              <Circle
+                size={9}
+                fill={nvrStatus.active ? '#ef4444' : 'currentColor'}
+                color={nvrStatus.active ? '#ef4444' : 'currentColor'}
+              />
+              {nvrStatus.active ? 'NVR RECORDING LIVE' : 'NVR STANDBY'}
+            </span>
+            <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
+              {nvrStatus.active ? (
+                <>
+                  Continuously recording{' '}
+                  <strong>
+                    {nvrStatus.activeCameraCount} of {cameras.length} camera(s)
+                  </strong>{' '}
+                  in rolling {Math.round(nvrStatus.segmentSeconds / 60 * 10) / 10}m MP4
+                  segments ({nvrStatus.totalSegmentsCaptured} saved this session) — live
+                  view shares the same stream with zero extra delay.
+                </>
+              ) : (
+                <>
+                  Record live streams across <strong>all {cameras.length} camera(s)</strong>{' '}
+                  into rolling {Math.round(nvrStatus.segmentSeconds / 60 * 10) / 10}-minute
+                  local MP4 segments so every motion, doorbell, and sensor event is playable on
+                  the Timeline.
+                </>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={onOpenTimeline}
+            >
+              <Clock size={13} />
+              Open Timeline
+            </button>
+            <button
+              type="button"
+              className={`btn btn-sm ${nvrStatus.active ? 'btn-danger' : 'btn-primary'}`}
+              disabled={nvrBusy}
+              onClick={() => void onToggleAllRecording()}
+            >
+              {nvrStatus.active ? (
+                <>
+                  <Square size={12} fill="currentColor" />
+                  {nvrBusy ? 'Stopping…' : 'Stop All Recording'}
+                </>
+              ) : (
+                <>
+                  <Circle size={11} fill="#ef4444" color="#ef4444" />
+                  {nvrBusy ? 'Starting…' : 'Record All Cameras'}
+                </>
+              )}
+            </button>
+          </div>
+        </section>
+      )}
 
       {focusedCamera ? (
         <section className="theater-layout" aria-label="Focused camera live view">
@@ -335,12 +419,19 @@ export function CamerasView({
           {cameras.map((cam) => {
             const session = streamsByCamera[cam.id]
             const busy = busyByCamera[cam.id]
+            const camNvr = nvrStatus.cameras[cam.id]
+            const isNvrOn = Boolean(
+              camNvr &&
+                (camNvr.state === 'recording' ||
+                  camNvr.state === 'connecting' ||
+                  camNvr.state === 'reconnecting'),
+            )
             return (
               <article key={cam.id} className="camera-card">
                 <div className="camera-viewport">
                   <LiveVideoPlayer camera={cam} session={session} />
                   <div className="viewport-hud-top">
-                    <div style={{ display: 'flex', gap: 6 }}>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                       {session ? (
                         <span className="hud-pill live-dot">LIVE</span>
                       ) : (
@@ -348,9 +439,20 @@ export function CamerasView({
                           {cam.online ? 'READY' : 'OFFLINE'}
                         </span>
                       )}
-                      {cam.isRecording && (
+                      {isNvrOn ? (
+                        <span
+                          className="hud-pill rec-dot"
+                          title={camNvr?.lastError ?? 'Continuous NVR recording active'}
+                        >
+                          {camNvr?.state === 'connecting'
+                            ? 'NVR SYNC…'
+                            : camNvr?.state === 'reconnecting'
+                              ? 'NVR RETRY'
+                              : `NVR REC${camNvr?.segmentsCaptured ? ` (${camNvr.segmentsCaptured})` : ''}`}
+                        </span>
+                      ) : cam.isRecording ? (
                         <span className="hud-pill rec-dot">REC</span>
-                      )}
+                      ) : null}
                     </div>
                     <button
                       type="button"
@@ -371,6 +473,11 @@ export function CamerasView({
                       <div className="camera-sub">
                         {cam.model} · Last motion {formatRelativeTime(cam.lastMotionAt)}
                       </div>
+                      {camNvr?.lastError && isNvrOn && (
+                        <div style={{ fontSize: 11, color: '#fbbf24', marginTop: 2 }}>
+                          {camNvr.lastError}
+                        </div>
+                      )}
                     </div>
                     <div className="camera-stats">
                       <span title={formatSignalQuality(cam.rssi)}>
@@ -420,19 +527,48 @@ export function CamerasView({
 
                     <button
                       type="button"
-                      className="btn btn-sm"
-                      disabled={cam.isRecording || Boolean(busy)}
+                      className={`btn btn-sm ${isNvrOn ? 'btn-danger' : ''}`}
+                      disabled={Boolean(busy)}
                       onClick={() =>
-                        void runBusy(cam.id, 'rec', () =>
-                          onCaptureRecording(cam.id, defaultCaptureSeconds),
+                        void runBusy(cam.id, 'nvr', () =>
+                          onToggleCameraContinuous(cam.id, !isNvrOn),
                         )
                       }
+                      title={
+                        isNvrOn
+                          ? 'Stop continuous NVR recording for this camera'
+                          : 'Start continuous rolling MP4 recording for this camera'
+                      }
                     >
-                      <Circle size={11} fill="#ef4444" color="#ef4444" />
-                      {cam.isRecording
-                        ? 'Recording…'
-                        : `Record ${defaultCaptureSeconds}s`}
+                      {isNvrOn ? (
+                        <>
+                          <Square size={11} fill="currentColor" />
+                          Stop NVR
+                        </>
+                      ) : (
+                        <>
+                          <Circle size={11} fill="#ef4444" color="#ef4444" />
+                          {busy === 'nvr' ? 'Starting…' : 'Continuous'}
+                        </>
+                      )}
                     </button>
+
+                    {!isNvrOn && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={cam.isRecording || Boolean(busy)}
+                        onClick={() =>
+                          void runBusy(cam.id, 'rec', () =>
+                            onCaptureRecording(cam.id, defaultCaptureSeconds),
+                          )
+                        }
+                      >
+                        {cam.isRecording
+                          ? 'Capturing…'
+                          : `Clip ${defaultCaptureSeconds}s`}
+                      </button>
+                    )}
 
                     <button
                       type="button"

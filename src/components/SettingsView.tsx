@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import {
   CheckCircle2,
+  Circle,
   FolderOpen,
   KeyRound,
   Link2,
@@ -15,11 +16,13 @@ import type {
   AppSettingsPatch,
   ConnectionStatus,
   RingAuthStepResult,
+  RingCameraInfo,
 } from '@shared/types'
 
 interface SettingsViewProps {
   connection: ConnectionStatus
   settings: AppSettings
+  cameras: RingCameraInfo[]
   onSwitchMode: (mode: AppMode) => Promise<void>
   onLoginCredentials: (params: {
     email: string
@@ -40,6 +43,7 @@ interface SettingsViewProps {
 export function SettingsView({
   connection,
   settings,
+  cameras,
   onSwitchMode,
   onLoginCredentials,
   onConnectToken,
@@ -467,6 +471,177 @@ export function SettingsView({
                 </span>
               )}
             </div>
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <h3>Continuous All-Camera Recording (NVR)</h3>
+            <span className="chip accent">
+              <Circle size={10} fill="currentColor" />
+              Rolling MP4
+            </span>
+          </div>
+
+          <div className="panel-body form-stack">
+            <div className="field">
+              <label htmlFor="nvr-segment-seconds">
+                Rolling Segment Length (how often each camera writes a Timeline MP4)
+              </label>
+              <select
+                id="nvr-segment-seconds"
+                className="select"
+                value={settings.continuousSegmentSeconds}
+                onChange={(e) =>
+                  void onUpdateSettings({
+                    continuousSegmentSeconds: Number(e.target.value),
+                  })
+                }
+              >
+                <option value={60}>60 seconds (Fastest timeline appearance)</option>
+                <option value={120}>120 seconds (Recommended — 2 min segments)</option>
+                <option value={180}>180 seconds (3 min segments)</option>
+                <option value={300}>300 seconds (5 min segments)</option>
+              </select>
+            </div>
+
+            <div className="toggle-row">
+              <div>
+                <div className="toggle-label-main">
+                  Auto-Start All-Camera Recording on Launch
+                </div>
+                <div className="toggle-label-sub">
+                  Automatically start continuous NVR across cameras as soon as Ring connects
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={settings.continuousAutoStart}
+                className={`switch ${settings.continuousAutoStart ? 'on' : ''}`}
+                onClick={() =>
+                  void onUpdateSettings({
+                    continuousAutoStart: !settings.continuousAutoStart,
+                  })
+                }
+              />
+            </div>
+
+            <div className="toggle-row">
+              <div>
+                <div className="toggle-label-main">
+                  Skip Battery-Only Cameras in &ldquo;Record All&rdquo;
+                </div>
+                <div className="toggle-label-sub">
+                  Continuous live streaming drains battery cameras quickly. Leave off to record all cameras (wired &amp; battery).
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={settings.continuousSkipBatteryCams}
+                className={`switch ${settings.continuousSkipBatteryCams ? 'on' : ''}`}
+                onClick={() =>
+                  void onUpdateSettings({
+                    continuousSkipBatteryCams: !settings.continuousSkipBatteryCams,
+                  })
+                }
+              />
+            </div>
+
+            {cameras.length > 0 && (
+              <div className="field">
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                  }}
+                >
+                  <label>
+                    Cameras Included in &ldquo;Record All&rdquo; (
+                    {settings.continuousCameraIds.length === 0
+                      ? `All ${cameras.length}`
+                      : `${settings.continuousCameraIds.length} of ${cameras.length}`}
+                    )
+                  </label>
+                  {settings.continuousCameraIds.length > 0 && (
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      style={{ padding: '2px 8px', fontSize: 11.5 }}
+                      onClick={() =>
+                        void onUpdateSettings({ continuousCameraIds: [] })
+                      }
+                    >
+                      Select All
+                    </button>
+                  )}
+                </div>
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 6,
+                    marginTop: 4,
+                  }}
+                >
+                  {cameras.map((cam) => {
+                    const allSelected = settings.continuousCameraIds.length === 0
+                    const checked =
+                      allSelected || settings.continuousCameraIds.includes(cam.id)
+                    return (
+                      <label
+                        key={cam.id}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: 8,
+                          padding: '6px 10px',
+                          borderRadius: 6,
+                          background: 'var(--bg-elevated)',
+                          border: '1px solid var(--border-subtle)',
+                          cursor: 'pointer',
+                          fontSize: 12.5,
+                        }}
+                      >
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              const currentSet = new Set(
+                                allSelected
+                                  ? cameras.map((c) => c.id)
+                                  : settings.continuousCameraIds,
+                              )
+                              if (e.target.checked) {
+                                currentSet.add(cam.id)
+                              } else {
+                                currentSet.delete(cam.id)
+                              }
+                              const nextIds =
+                                currentSet.size === cameras.length
+                                  ? []
+                                  : Array.from(currentSet)
+                              void onUpdateSettings({ continuousCameraIds: nextIds })
+                            }}
+                          />
+                          <span>{cam.name}</span>
+                        </span>
+                        <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                          {cam.batteryPercent !== null
+                            ? `Battery ${cam.batteryPercent}%`
+                            : 'Wired'}
+                        </span>
+                      </label>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </section>
 

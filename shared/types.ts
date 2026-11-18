@@ -114,11 +114,37 @@ export interface LocalRecordingItem {
   createdAt: string
   durationSeconds: number
   sizeBytes: number
-  trigger: 'manual' | 'motion' | 'ding' | 'package' | 'cloud-download' | 'imported'
+  trigger:
+    | 'manual'
+    | 'motion'
+    | 'ding'
+    | 'package'
+    | 'continuous'
+    | 'cloud-download'
+    | 'imported'
   starred?: boolean
   notes?: string
   thumbnailDataUrl?: string
   playbackUrl?: string
+}
+
+export interface NvrCameraStatus {
+  cameraId: string
+  cameraName: string
+  state: 'connecting' | 'recording' | 'reconnecting' | 'stopped' | 'error'
+  startedAt?: string
+  currentSegmentStartedAt?: string
+  segmentsCaptured: number
+  lastError?: string
+}
+
+export interface NvrStatus {
+  active: boolean
+  startedAt?: string
+  segmentSeconds: number
+  totalSegmentsCaptured: number
+  activeCameraCount: number
+  cameras: Record<string, NvrCameraStatus>
 }
 
 export interface StorageStats {
@@ -211,6 +237,10 @@ export interface AppSettings {
   autoRecordOnMotion: boolean
   autoRecordOnDoorbell: boolean
   autoRecordOnPackage: boolean
+  continuousSegmentSeconds: number
+  continuousSkipBatteryCams: boolean
+  continuousAutoStart: boolean
+  continuousCameraIds: string[]
   maxStorageGb: number
   retentionDays: number
   ffmpegPath: string
@@ -227,6 +257,10 @@ export interface AppSettingsPatch {
   autoRecordOnMotion?: boolean
   autoRecordOnDoorbell?: boolean
   autoRecordOnPackage?: boolean
+  continuousSegmentSeconds?: number
+  continuousSkipBatteryCams?: boolean
+  continuousAutoStart?: boolean
+  continuousCameraIds?: string[]
   maxStorageGb?: number
   retentionDays?: number
   ffmpegPath?: string
@@ -261,6 +295,7 @@ export interface RingWatchBootstrap {
   connection: ConnectionStatus
   settings: AppSettings
   storageStats: StorageStats
+  nvrStatus: NvrStatus
   locations: RingLocationInfo[]
   cameras: RingCameraInfo[]
   sensors: RingSensorInfo[]
@@ -292,6 +327,18 @@ export interface RingWatchApi {
   toggleCameraLight: (cameraId: string, on: boolean) => Promise<RingCameraInfo>
   toggleCameraSiren: (cameraId: string, on: boolean) => Promise<RingCameraInfo>
   setAlarmMode: (locationId: string, mode: 'none' | 'some' | 'all') => Promise<RingLocationInfo>
+
+  getNvrStatus: () => Promise<NvrStatus>
+  startAllCameraRecording: (cameraIds?: string[]) => Promise<NvrStatus>
+  stopAllCameraRecording: () => Promise<NvrStatus>
+  toggleCameraContinuousRecording: (
+    cameraId: string,
+    enable: boolean,
+  ) => Promise<NvrStatus>
+  syncCloudEventsToTimeline: () => Promise<{
+    addedCount: number
+    events: SecurityEvent[]
+  }>
 
   captureRecording: (params: {
     cameraId: string
@@ -340,6 +387,8 @@ export interface RingWatchApi {
   onSensorsUpdated: (cb: (sensors: RingSensorInfo[]) => void) => () => void
   onLocationsUpdated: (cb: (locations: RingLocationInfo[]) => void) => () => void
   onSecurityEvent: (cb: (event: SecurityEvent) => void) => () => void
+  onEventsUpdated: (cb: (events: SecurityEvent[]) => void) => () => void
+  onNvrStatusUpdated: (cb: (status: NvrStatus) => void) => () => void
   onRecordingsUpdated: (cb: (recordings: LocalRecordingItem[]) => void) => () => void
   onStorageStatsUpdated: (cb: (stats: StorageStats) => void) => () => void
   onPackageDetection: (cb: (record: PackageDetectionRecord) => void) => () => void

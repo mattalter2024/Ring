@@ -5,6 +5,7 @@ import type {
   AppSettingsPatch,
   ConnectionStatus,
   LocalRecordingItem,
+  NvrStatus,
   PackageDetectionRecord,
   RingCameraInfo,
   RingLocationInfo,
@@ -44,6 +45,14 @@ const api: RingWatchApi = {
     ipcRenderer.invoke('ringwatch:toggle-siren', { cameraId, on }),
   setAlarmMode: (locationId: string, mode: 'none' | 'some' | 'all') =>
     ipcRenderer.invoke('ringwatch:set-alarm-mode', { locationId, mode }),
+
+  getNvrStatus: () => ipcRenderer.invoke('ringwatch:get-nvr-status'),
+  startAllCameraRecording: (cameraIds?: string[]) =>
+    ipcRenderer.invoke('ringwatch:start-all-recording', cameraIds),
+  stopAllCameraRecording: () => ipcRenderer.invoke('ringwatch:stop-all-recording'),
+  toggleCameraContinuousRecording: (cameraId: string, enable: boolean) =>
+    ipcRenderer.invoke('ringwatch:toggle-camera-continuous', { cameraId, enable }),
+  syncCloudEventsToTimeline: () => ipcRenderer.invoke('ringwatch:sync-cloud-events'),
 
   captureRecording: (params) =>
     ipcRenderer.invoke('ringwatch:capture-recording', params),
@@ -96,6 +105,10 @@ const api: RingWatchApi = {
     subscribe('ringwatch:locations-updated', cb),
   onSecurityEvent: (cb: (event: SecurityEvent) => void) =>
     subscribe('ringwatch:security-event', cb),
+  onEventsUpdated: (cb: (events: SecurityEvent[]) => void) =>
+    subscribe('ringwatch:events-updated', cb),
+  onNvrStatusUpdated: (cb: (status: NvrStatus) => void) =>
+    subscribe('ringwatch:nvr-status-updated', cb),
   onRecordingsUpdated: (cb: (recordings: LocalRecordingItem[]) => void) =>
     subscribe('ringwatch:recordings-updated', cb),
   onStorageStatsUpdated: (cb: (stats: StorageStats) => void) =>

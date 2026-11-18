@@ -22,6 +22,7 @@ export function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('cameras')
   const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null)
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [nvrBusy, setNvrBusy] = useState(false)
 
   const handleFocusFromNotification = useCallback((cameraId: string) => {
     setActiveTab('cameras')
@@ -36,6 +37,8 @@ export function App() {
     settings,
     setSettings,
     storageStats,
+    nvrStatus,
+    setNvrStatus,
     locations,
     setLocations,
     cameras,
@@ -492,6 +495,106 @@ export function App() {
     await api.testPackageAlert()
   }
 
+  const handleToggleAllRecording = async () => {
+    if (!api) {
+      pushToast(
+        'Desktop App Required',
+        'Continuous all-camera MP4 recording runs in the Electron Windows desktop process.',
+        'warn',
+      )
+      return
+    }
+    setNvrBusy(true)
+    try {
+      if (nvrStatus.active) {
+        const status = await api.stopAllCameraRecording()
+        setNvrStatus(status)
+        pushToast(
+          'Continuous NVR Stopped',
+          'Flushed active segments to your Timeline & Local Recordings folder.',
+          'info',
+        )
+      } else {
+        const status = await api.startAllCameraRecording()
+        setNvrStatus(status)
+        const targetCount = Object.values(status.cameras).filter(
+          (c) => c.state !== 'stopped',
+        ).length
+        pushToast(
+          'All-Camera NVR Started',
+          targetCount > 0
+            ? `Recording live streams across ${targetCount} camera(s) in ${settings.continuousSegmentSeconds}s Timeline segments.`
+            : 'No eligible cameras found to record. Check Settings -> Continuous NVR.',
+          targetCount > 0 ? 'ok' : 'warn',
+        )
+      }
+    } catch (err) {
+      pushToast(
+        'NVR Recording Error',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    } finally {
+      setNvrBusy(false)
+    }
+  }
+
+  const handleToggleCameraContinuous = async (
+    cameraId: string,
+    enable: boolean,
+  ) => {
+    if (!api) {
+      pushToast(
+        'Desktop App Required',
+        'Continuous MP4 recording runs in the Electron Windows desktop process.',
+        'warn',
+      )
+      return
+    }
+    const cam = cameras.find((c) => c.id === cameraId)
+    try {
+      const status = await api.toggleCameraContinuousRecording(cameraId, enable)
+      setNvrStatus(status)
+      pushToast(
+        enable ? 'Camera NVR Started' : 'Camera NVR Stopped',
+        enable
+          ? `Continuously recording ${cam?.name ?? 'camera'} to your Timeline.`
+          : `Stopped continuous recording for ${cam?.name ?? 'camera'}.`,
+        enable ? 'ok' : 'info',
+      )
+    } catch (err) {
+      pushToast(
+        'Camera NVR Error',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
+  }
+
+  const handleSyncCloudEvents = async () => {
+    if (!api) {
+      pushToast('Demo Mode', 'Simulated events are already shown on the Timeline.', 'info')
+      return
+    }
+    try {
+      const res = await api.syncCloudEventsToTimeline()
+      setEvents(res.events)
+      pushToast(
+        'Ring Events Synced',
+        res.addedCount > 0
+          ? `Added ${res.addedCount} Ring Cloud motion/doorbell event(s) to your Timeline (${res.events.length} total).`
+          : `Timeline events are up to date (${res.events.length} total events).`,
+        'ok',
+      )
+    } catch (err) {
+      pushToast(
+        'Event Sync Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
+  }
+
   const faultedSensorCount = sensors.filter((s) => s.faulted).length
   const detectedPackagesCount = packageDetections.filter(
     (d) => d.packageDetected,
@@ -514,7 +617,11 @@ export function App() {
           activeTab={activeTab}
           connection={connection}
           primaryLocation={locations[0]}
+          nvrStatus={nvrStatus}
+          cameraCount={cameras.length}
+          nvrBusy={nvrBusy}
           isRefreshing={isRefreshing}
+          onToggleAllRecording={() => void handleToggleAllRecording()}
           onRefresh={() => void handleRefresh()}
           onSimulateDemoEvent={(kind) => void handleSimulateDemoEvent(kind)}
         />
@@ -528,6 +635,8 @@ export function App() {
             <CamerasView
               cameras={cameras}
               streamsByCamera={streamsByCamera}
+              nvrStatus={nvrStatus}
+              nvrBusy={nvrBusy}
               recordingsCount={recordings.length}
               packageDetections={packageDetections}
               defaultCaptureSeconds={settings.defaultCaptureSeconds}
@@ -536,6 +645,9 @@ export function App() {
               onStartStream={handleStartStream}
               onStopStream={handleStopStream}
               onCaptureRecording={handleCaptureRecording}
+              onToggleAllRecording={handleToggleAllRecording}
+              onToggleCameraContinuous={handleToggleCameraContinuous}
+              onOpenTimeline={() => setActiveTab('timeline')}
               onCaptureSnapshot={handleCaptureSnapshot}
               onScanPackages={handleScanPackages}
               onToggleLight={handleToggleLight}
@@ -547,7 +659,11 @@ export function App() {
               recordings={recordings}
               events={events}
               packageDetections={packageDetections}
+              nvrStatus={nvrStatus}
+              nvrBusy={nvrBusy}
               defaultCaptureSeconds={settings.defaultCaptureSeconds}
+              onToggleAllRecording={handleToggleAllRecording}
+              onSyncCloudEvents={handleSyncCloudEvents}
               onCaptureRecording={handleCaptureRecording}
               onToggleStar={handleToggleStar}
               onExportRecording={handleExportRecording}
@@ -604,6 +720,7 @@ export function App() {
             <SettingsView
               connection={connection}
               settings={settings}
+              cameras={cameras}
               onSwitchMode={handleSwitchMode}
               onLoginCredentials={handleLoginCredentials}
               onConnectToken={handleConnectToken}

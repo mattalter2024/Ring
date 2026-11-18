@@ -5,6 +5,7 @@ import type {
   ConnectionStatus,
   LiveStreamSession,
   LocalRecordingItem,
+  NvrStatus,
   PackageDetectionRecord,
   RingCameraInfo,
   RingLocationInfo,
@@ -35,6 +36,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoRecordOnMotion: true,
   autoRecordOnDoorbell: true,
   autoRecordOnPackage: true,
+  continuousSegmentSeconds: 120,
+  continuousSkipBatteryCams: false,
+  continuousAutoStart: false,
+  continuousCameraIds: [],
   maxStorageGb: 25,
   retentionDays: 30,
   ffmpegPath: '',
@@ -69,6 +74,14 @@ const DEFAULT_STORAGE_STATS: StorageStats = {
   maxStorageGb: DEFAULT_SETTINGS.maxStorageGb,
   retentionDays: DEFAULT_SETTINGS.retentionDays,
   freeDiskBytes: null,
+}
+
+const DEFAULT_NVR_STATUS: NvrStatus = {
+  active: false,
+  segmentSeconds: DEFAULT_SETTINGS.continuousSegmentSeconds,
+  totalSegmentsCaptured: 0,
+  activeCameraCount: 0,
+  cameras: {},
 }
 
 function createBrowserPreviewFallback(): {
@@ -264,6 +277,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
   })
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS)
   const [storageStats, setStorageStats] = useState<StorageStats>(DEFAULT_STORAGE_STATS)
+  const [nvrStatus, setNvrStatus] = useState<NvrStatus>(DEFAULT_NVR_STATUS)
   const [locations, setLocations] = useState<RingLocationInfo[]>([])
   const [cameras, setCameras] = useState<RingCameraInfo[]>([])
   const [sensors, setSensors] = useState<RingSensorInfo[]>([])
@@ -308,6 +322,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
         setConnection(boot.connection)
         setSettings(boot.settings)
         setStorageStats(boot.storageStats)
+        setNvrStatus(boot.nvrStatus ?? DEFAULT_NVR_STATUS)
         setLocations(boot.locations)
         setCameras(boot.cameras)
         setSensors(boot.sensors)
@@ -335,7 +350,13 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
       api.onLocationsUpdated((locs) => setLocations(locs)),
       api.onCamerasUpdated((cams) => setCameras(cams)),
       api.onSensorsUpdated((sens) => setSensors(sens)),
-      api.onSecurityEvent((ev) => setEvents((prev) => [ev, ...prev].slice(0, 200))),
+      api.onSecurityEvent((ev) =>
+        setEvents((prev) =>
+          prev.some((e) => e.id === ev.id) ? prev : [ev, ...prev].slice(0, 500),
+        ),
+      ),
+      api.onEventsUpdated((nextEvents) => setEvents(nextEvents)),
+      api.onNvrStatusUpdated((nextNvr) => setNvrStatus(nextNvr)),
       api.onRecordingsUpdated((recs) => setRecordings(recs)),
       api.onStorageStatsUpdated((stats) => setStorageStats(stats)),
       api.onPackageDetection((rec) =>
@@ -366,6 +387,8 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     setSettings,
     storageStats,
     setStorageStats,
+    nvrStatus,
+    setNvrStatus,
     locations,
     setLocations,
     cameras,

@@ -1,20 +1,26 @@
 import {
   BellRing,
+  Circle,
   DoorOpen,
   PackageCheck,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  Square,
   Zap,
 } from 'lucide-react'
-import type { ConnectionStatus, RingLocationInfo } from '@shared/types'
+import type { ConnectionStatus, NvrStatus, RingLocationInfo } from '@shared/types'
 import type { NavTab } from './Sidebar'
 
 interface TopBarProps {
   activeTab: NavTab
   connection: ConnectionStatus
   primaryLocation?: RingLocationInfo
+  nvrStatus: NvrStatus
+  cameraCount: number
+  nvrBusy: boolean
   isRefreshing: boolean
+  onToggleAllRecording: () => void
   onRefresh: () => void
   onSimulateDemoEvent: (
     kind: 'doorbell' | 'motion' | 'contact-open' | 'package-delivery',
@@ -24,11 +30,11 @@ interface TopBarProps {
 const TAB_COPY: Record<NavTab, { title: string; subtitle: string }> = {
   cameras: {
     title: 'Live Cameras',
-    subtitle: 'Real-time HLS video streams, instant snapshots, and local MP4 capture',
+    subtitle: 'Real-time HLS video streams, continuous all-camera NVR recording, and instant snapshots',
   },
   timeline: {
     title: 'Video & Event Timeline',
-    subtitle: 'Scrub across local recordings, camera motion, doorbell rings, AI packages, and sensor events',
+    subtitle: 'Scrub across continuous recordings, camera motion, doorbell rings, AI packages, and sensor events',
   },
   recordings: {
     title: 'Local Video Storage & Cloud Vault',
@@ -44,7 +50,7 @@ const TAB_COPY: Record<NavTab, { title: string; subtitle: string }> = {
   },
   settings: {
     title: 'Settings & Connections',
-    subtitle: 'Ring 2FA / Refresh Token auth, OpenAI & Gemini Vision keys, and Windows preferences',
+    subtitle: 'Ring 2FA / Refresh Token auth, continuous NVR rules, Vision keys, and Windows preferences',
   },
 }
 
@@ -52,7 +58,11 @@ export function TopBar({
   activeTab,
   connection,
   primaryLocation,
+  nvrStatus,
+  cameraCount,
+  nvrBusy,
   isRefreshing,
+  onToggleAllRecording,
   onRefresh,
   onSimulateDemoEvent,
 }: TopBarProps) {
@@ -75,6 +85,35 @@ export function TopBar({
       </div>
 
       <div className="topbar-actions">
+        {cameraCount > 0 && (
+          <button
+            id="btn-topbar-nvr-toggle"
+            type="button"
+            className={`btn btn-sm ${nvrStatus.active ? 'btn-danger' : 'btn-primary'}`}
+            disabled={nvrBusy}
+            onClick={onToggleAllRecording}
+            title={
+              nvrStatus.active
+                ? `Stop continuous live-stream recording (${nvrStatus.activeCameraCount} camera(s), ${nvrStatus.totalSegmentsCaptured} segments saved)`
+                : 'Continuously record live streams from all cameras into local MP4 segments for the Timeline'
+            }
+          >
+            {nvrStatus.active ? (
+              <>
+                <Square size={12} fill="currentColor" />
+                {nvrBusy
+                  ? 'Stopping…'
+                  : `Stop NVR (${nvrStatus.activeCameraCount}/${cameraCount})`}
+              </>
+            ) : (
+              <>
+                <Circle size={11} fill="#ef4444" color="#ef4444" />
+                {nvrBusy ? 'Starting…' : 'Record All Cameras'}
+              </>
+            )}
+          </button>
+        )}
+
         {connection.mode === 'demo' && (
           <>
             <button

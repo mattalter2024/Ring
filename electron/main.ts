@@ -92,6 +92,7 @@ function createTray(): void {
 function rebuildTrayMenu(): void {
   if (!tray) return
   const aiEnabled = configStore.getPublicSettings().packageAi.enabled
+  const nvrActive = ringService?.getNvrStatus().active ?? false
   const menu = Menu.buildFromTemplate([
     {
       label: 'Open RingWatch',
@@ -104,6 +105,16 @@ function rebuildTrayMenu(): void {
       },
     },
     { type: 'separator' },
+    {
+      label: nvrActive ? 'Stop All-Camera Recording (NVR)' : 'Record All Cameras (NVR)',
+      click: () => {
+        if (nvrActive) {
+          void ringService.stopAllCameraRecording().finally(() => rebuildTrayMenu())
+        } else {
+          void ringService.startAllCameraRecording().finally(() => rebuildTrayMenu())
+        }
+      },
+    },
     {
       label: aiEnabled ? 'Pause AI Package Detection' : 'Resume AI Package Detection',
       click: () => {
@@ -178,6 +189,7 @@ function registerIpcHandlers(): void {
     connection: ringService.getConnection(),
     settings: configStore.getPublicSettings(),
     storageStats: recordingService.getStorageStats(),
+    nvrStatus: ringService.getNvrStatus(),
     locations: ringService.getLocations(),
     cameras: ringService.getCameras(),
     sensors: ringService.getSensors(),
@@ -233,6 +245,26 @@ function registerIpcHandlers(): void {
     'ringwatch:set-alarm-mode',
     (_e, params: { locationId: string; mode: 'none' | 'some' | 'all' }) =>
       ringService.setAlarmMode(params.locationId, params.mode),
+  )
+
+  ipcMain.handle('ringwatch:get-nvr-status', () => ringService.getNvrStatus())
+
+  ipcMain.handle('ringwatch:start-all-recording', (_e, cameraIds?: string[]) =>
+    ringService.startAllCameraRecording(cameraIds),
+  )
+
+  ipcMain.handle('ringwatch:stop-all-recording', () =>
+    ringService.stopAllCameraRecording(),
+  )
+
+  ipcMain.handle(
+    'ringwatch:toggle-camera-continuous',
+    (_e, params: { cameraId: string; enable: boolean }) =>
+      ringService.toggleCameraContinuousRecording(params.cameraId, params.enable),
+  )
+
+  ipcMain.handle('ringwatch:sync-cloud-events', () =>
+    ringService.syncCloudEventsToTimeline(),
   )
 
   ipcMain.handle(
@@ -435,11 +467,17 @@ if (!singleInstanceLock) {
           void ringService?.autoCaptureIfEnabled(record.cameraId, 'package')
         }
       },
-      onSecurityEvent: (event) =>
-        sendToRenderer('ringwatch:security-event', event),
+      onSecurityEvent: (event) => {
+        if (ringService) {
+          ringService.recordExternalEvent(event)
+        } else {
+          sendToRenderer('ringwatch:security-event', event)
+        }
+      },
     })
 
     ringService = new RingService({
+      userDataDir,
       configStore,
       streamService,
       recordingService,
@@ -458,6 +496,12 @@ if (!singleInstanceLock) {
           sendToRenderer('ringwatch:locations-updated', locations),
         onSecurityEvent: (event) =>
           sendToRenderer('ringwatch:security-event', event),
+        onEventsUpdated: (events) =>
+          sendToRenderer('ringwatch:events-updated', events),
+        onNvrStatusUpdated: (status) => {
+          sendToRenderer('ringwatch:nvr-status-updated', status)
+          rebuildTrayMenu()
+        },
         onRecordingsUpdated: (recordings) =>
           sendToRenderer('ringwatch:recordings-updated', recordings),
         onStorageStatsUpdated: (stats) =>

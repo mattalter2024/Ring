@@ -21,6 +21,10 @@ interface PersistedConfigFile {
   autoRecordOnMotion: boolean
   autoRecordOnDoorbell: boolean
   autoRecordOnPackage: boolean
+  continuousSegmentSeconds: number
+  continuousSkipBatteryCams: boolean
+  continuousAutoStart: boolean
+  continuousCameraIds: string[]
   maxStorageGb: number
   retentionDays: number
   ffmpegPath: string
@@ -81,6 +85,10 @@ export class ConfigStore {
       autoRecordOnMotion: true,
       autoRecordOnDoorbell: true,
       autoRecordOnPackage: true,
+      continuousSegmentSeconds: 120,
+      continuousSkipBatteryCams: false,
+      continuousAutoStart: false,
+      continuousCameraIds: [],
       maxStorageGb: 25,
       retentionDays: 30,
       ffmpegPath: '',
@@ -101,6 +109,9 @@ export class ConfigStore {
       const merged: PersistedConfigFile = {
         ...defaults,
         ...parsed,
+        continuousCameraIds: Array.isArray(parsed.continuousCameraIds)
+          ? parsed.continuousCameraIds
+          : [],
         packageAi: {
           ...DEFAULT_PACKAGE_AI,
           ...(parsed.packageAi ?? {}),
@@ -150,6 +161,10 @@ export class ConfigStore {
       autoRecordOnMotion: this.data.autoRecordOnMotion,
       autoRecordOnDoorbell: this.data.autoRecordOnDoorbell,
       autoRecordOnPackage: this.data.autoRecordOnPackage,
+      continuousSegmentSeconds: this.data.continuousSegmentSeconds,
+      continuousSkipBatteryCams: this.data.continuousSkipBatteryCams,
+      continuousAutoStart: this.data.continuousAutoStart,
+      continuousCameraIds: [...this.data.continuousCameraIds],
       maxStorageGb: this.data.maxStorageGb,
       retentionDays: this.data.retentionDays,
       ffmpegPath: this.data.ffmpegPath,
@@ -186,6 +201,10 @@ export class ConfigStore {
       autoRecordOnMotion: this.data.autoRecordOnMotion,
       autoRecordOnDoorbell: this.data.autoRecordOnDoorbell,
       autoRecordOnPackage: this.data.autoRecordOnPackage,
+      continuousSegmentSeconds: this.data.continuousSegmentSeconds,
+      continuousSkipBatteryCams: this.data.continuousSkipBatteryCams,
+      continuousAutoStart: this.data.continuousAutoStart,
+      continuousCameraIds: [...this.data.continuousCameraIds],
       maxStorageGb: this.data.maxStorageGb,
       retentionDays: this.data.retentionDays,
       ffmpegPath: this.data.ffmpegPath,
@@ -219,6 +238,21 @@ export class ConfigStore {
     }
     if (patch.autoRecordOnPackage !== undefined) {
       this.data.autoRecordOnPackage = patch.autoRecordOnPackage
+    }
+    if (patch.continuousSegmentSeconds !== undefined) {
+      this.data.continuousSegmentSeconds = Math.max(
+        30,
+        Math.min(600, Math.round(patch.continuousSegmentSeconds)),
+      )
+    }
+    if (patch.continuousSkipBatteryCams !== undefined) {
+      this.data.continuousSkipBatteryCams = patch.continuousSkipBatteryCams
+    }
+    if (patch.continuousAutoStart !== undefined) {
+      this.data.continuousAutoStart = patch.continuousAutoStart
+    }
+    if (patch.continuousCameraIds !== undefined) {
+      this.data.continuousCameraIds = [...patch.continuousCameraIds]
     }
     if (patch.maxStorageGb !== undefined) {
       this.data.maxStorageGb = Math.max(0, Math.min(2000, patch.maxStorageGb))

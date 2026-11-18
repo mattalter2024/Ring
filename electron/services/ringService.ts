@@ -11,6 +11,8 @@ import type {
   ConnectionStatus,
   LiveStreamSession,
   LocalRecordingItem,
+  NvrCameraStatus,
+  NvrStatus,
   RingAuthStepResult,
   RingCameraInfo,
   RingLocationInfo,
@@ -91,8 +93,24 @@ export interface RingServiceCallbacks {
   onSensorsUpdated: (sensors: RingSensorInfo[]) => void
   onLocationsUpdated: (locations: RingLocationInfo[]) => void
   onSecurityEvent: (event: SecurityEvent) => void
+  onEventsUpdated?: (events: SecurityEvent[]) => void
+  onNvrStatusUpdated?: (status: NvrStatus) => void
   onRecordingsUpdated: (recordings: LocalRecordingItem[]) => void
   onStorageStatsUpdated: (stats: import('../../shared/types').StorageStats) => void
+}
+
+interface NvrWorker {
+  cameraId: string
+  cameraName: string
+  stopped: boolean
+  state: NvrCameraStatus['state']
+  startedAt: string
+  currentSegmentStartedAt?: string
+  segmentsCaptured: number
+  lastError?: string
+  activeCall?: { stop(): void }
+  cancelWait?: () => void
+  promise?: Promise<void>
 }
 
 export class RingService implements SnapshotSource {
@@ -102,6 +120,7 @@ export class RingService implements SnapshotSource {
   private readonly aiPackageService: AiPackageService
   private readonly callbacks: RingServiceCallbacks
   private readonly demoAssetsDir: string
+  private readonly eventsLogPath: string | null
 
   private ringApi: RingApiInstance | null = null
   private pendingAuthClient: RingRestClientInstance | null = null
@@ -110,6 +129,9 @@ export class RingService implements SnapshotSource {
   private liveLocationsById = new Map<string, RingLocationInstance>()
   private boundSensorZids = new Set<string>()
   private recordingCameraIds = new Set<string>()
+  private nvrWorkers = new Map<string, NvrWorker>()
+  private nvrStartedAt: string | undefined
+  private nvrTotalSegmentsCaptured = 0
   private snapshotCache = new Map<string, { dataUrl: string; capturedAt: string }>()
 
   private connection: ConnectionStatus = {
@@ -128,6 +150,7 @@ export class RingService implements SnapshotSource {
   private events: SecurityEvent[] = []
 
   constructor(params: {
+    userDataDir?: string
     configStore: ConfigStore
     streamService: StreamService
     recordingService: RecordingService
@@ -141,6 +164,38 @@ export class RingService implements SnapshotSource {
     this.aiPackageService = params.aiPackageService
     this.demoAssetsDir = params.demoAssetsDir
     this.callbacks = params.callbacks
+    this.eventsLogPath = params.userDataDir
+      ? path.join(params.userDataDir, 'events-log.json')
+      : null
+    this.events = this.loadEventsFromDisk()
+  }
+
+  private loadEventsFromDisk(): SecurityEvent[] {
+    if (!this.eventsLogPath || !fs.existsSync(this.eventsLogPath)) return []
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.eventsLogPath, 'utf-8'))
+      if (!Array.isArray(parsed)) return []
+      return parsed.slice(0, 500)
+    } catch {
+      return []
+    }
+  }
+
+  private saveEventsToDisk(): void {
+    if (!this.eventsLogPath) return
+    try {
+      // Omit large inline base64 snapshots when persisting to keep events-log.json fast and compact
+      const slim = this.events.slice(0, 500).map((ev) => {
+        if (ev.snapshotDataUrl && ev.snapshotDataUrl.startsWith('data:')) {
+          const { snapshotDataUrl: _drop, ...rest } = ev
+          return rest
+        }
+        return ev
+      })
+      fs.writeFileSync(this.eventsLogPath, JSON.stringify(slim, null, 2), 'utf-8')
+    } catch {
+      // Ignore write failures
+    }
   }
 
   async initialize(): Promise<void> {
@@ -165,11 +220,19 @@ export class RingService implements SnapshotSource {
     return [...this.locations]
   }
 
+  private isCameraNvrActive(cameraId: string): boolean {
+    const w = this.nvrWorkers.get(cameraId)
+    return Boolean(
+      w && !w.stopped && (w.state === 'recording' || w.state === 'connecting' || w.state === 'reconnecting'),
+    )
+  }
+
   getCameras(): RingCameraInfo[] {
     return this.cameras.map((cam) => ({
       ...cam,
       isStreaming: this.streamService.isStreaming(cam.id),
-      isRecording: this.recordingCameraIds.has(cam.id),
+      isRecording:
+        this.recordingCameraIds.has(cam.id) || this.isCameraNvrActive(cam.id),
     }))
   }
 
@@ -181,6 +244,36 @@ export class RingService implements SnapshotSource {
     return [...this.events]
   }
 
+  getNvrStatus(): NvrStatus {
+    const camerasStatus: Record<string, NvrCameraStatus> = {}
+    let activeCameraCount = 0
+    for (const [camId, w] of this.nvrWorkers.entries()) {
+      if (!w.stopped) activeCameraCount++
+      camerasStatus[camId] = {
+        cameraId: w.cameraId,
+        cameraName: w.cameraName,
+        state: w.state,
+        startedAt: w.startedAt,
+        currentSegmentStartedAt: w.currentSegmentStartedAt,
+        segmentsCaptured: w.segmentsCaptured,
+        lastError: w.lastError,
+      }
+    }
+    return {
+      active: activeCameraCount > 0,
+      startedAt: activeCameraCount > 0 ? this.nvrStartedAt : undefined,
+      segmentSeconds: this.configStore.getPublicSettings().continuousSegmentSeconds,
+      totalSegmentsCaptured: this.nvrTotalSegmentsCaptured,
+      activeCameraCount,
+      cameras: camerasStatus,
+    }
+  }
+
+  private emitNvrStatus(): void {
+    this.callbacks.onNvrStatusUpdated?.(this.getNvrStatus())
+    this.callbacks.onCamerasUpdated(this.getCameras())
+  }
+
   getCameraMeta(cameraId: string): { id: string; name: string } | undefined {
     const cam = this.cameras.find((c) => c.id === cameraId)
     return cam ? { id: cam.id, name: cam.name } : undefined
@@ -190,13 +283,35 @@ export class RingService implements SnapshotSource {
     return this.cameras.map((c) => c.id)
   }
 
+  recordExternalEvent(event: SecurityEvent): void {
+    this.pushEvent(event)
+  }
+
   private pushEvent(event: SecurityEvent): void {
+    if (this.events.some((e) => e.id === event.id)) return
     this.events.unshift(event)
-    this.events = this.events.slice(0, 200)
+    this.events = this.events.slice(0, 500)
+    this.saveEventsToDisk()
     this.callbacks.onSecurityEvent(event)
   }
 
+  private stopAllNvrWorkersSync(): void {
+    for (const worker of this.nvrWorkers.values()) {
+      worker.stopped = true
+      worker.state = 'stopped'
+      worker.cancelWait?.()
+      try {
+        worker.activeCall?.stop()
+      } catch {
+        // ignore
+      }
+    }
+    this.nvrWorkers.clear()
+    this.nvrStartedAt = undefined
+  }
+
   private clearLiveSubscriptions(): void {
+    this.stopAllNvrWorkersSync()
     for (const sub of this.subscriptions) {
       try {
         sub.unsubscribe()
@@ -217,6 +332,7 @@ export class RingService implements SnapshotSource {
     this.liveCamerasById.clear()
     this.liveLocationsById.clear()
     this.boundSensorZids.clear()
+    this.callbacks.onNvrStatusUpdated?.(this.getNvrStatus())
   }
 
   private readDemoImageDataUrl(filename: string): string {
@@ -483,6 +599,10 @@ export class RingService implements SnapshotSource {
         this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
       })
       .catch(() => {})
+
+    if (this.configStore.getPublicSettings().continuousAutoStart) {
+      void this.startAllCameraRecording().catch(() => {})
+    }
 
     return this.getConnection()
   }
@@ -802,6 +922,17 @@ export class RingService implements SnapshotSource {
     for (const cam of this.cameras) {
       void this.captureSnapshot(cam.id).catch(() => {})
     }
+
+    // Pull recent Ring Cloud camera events onto the Timeline lazily
+    void this.syncCloudEventsToTimeline().catch(() => {})
+
+    // Auto-start all-camera continuous NVR recording if enabled in Settings
+    if (
+      this.configStore.getPublicSettings().continuousAutoStart &&
+      this.cameras.length > 0
+    ) {
+      void this.startAllCameraRecording().catch(() => {})
+    }
   }
 
   private mapLiveCamera(
@@ -835,7 +966,8 @@ export class RingService implements SnapshotSource {
       sirenOn: Number(sirenStatus.seconds_remaining ?? 0) > 0,
       isDoorbell: cam.isDoorbot,
       isStreaming: this.streamService.isStreaming(camId),
-      isRecording: this.recordingCameraIds.has(camId),
+      isRecording:
+        this.recordingCameraIds.has(camId) || this.isCameraNvrActive(camId),
       lastSnapshotDataUrl: cached?.dataUrl,
       lastSnapshotAt: cached?.capturedAt,
     }
@@ -939,7 +1071,9 @@ export class RingService implements SnapshotSource {
     cameraId: string,
     trigger: 'motion' | 'ding' | 'package',
   ): Promise<void> {
-    if (this.recordingCameraIds.has(cameraId)) return
+    if (this.recordingCameraIds.has(cameraId) || this.isCameraNvrActive(cameraId)) {
+      return
+    }
     const settings = this.configStore.getPublicSettings()
     if (trigger === 'motion' && !settings.autoRecordOnMotion) return
     if (trigger === 'ding' && !settings.autoRecordOnDoorbell) return
@@ -1437,12 +1571,637 @@ export class RingService implements SnapshotSource {
     }
   }
 
+  private cancellableDelay(worker: NvrWorker, ms: number): Promise<boolean> {
+    if (worker.stopped || ms <= 0) return Promise.resolve(!worker.stopped)
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        worker.cancelWait = undefined
+        resolve(!worker.stopped)
+      }, ms)
+      worker.cancelWait = () => {
+        clearTimeout(timer)
+        worker.cancelWait = undefined
+        resolve(false)
+      }
+    })
+  }
+
+  private resolveTargetNvrCameras(explicitCameraIds?: string[]): RingCameraInfo[] {
+    if (explicitCameraIds && explicitCameraIds.length > 0) {
+      const set = new Set(explicitCameraIds)
+      return this.cameras.filter((c) => set.has(c.id))
+    }
+    const settings = this.configStore.getPublicSettings()
+    if (settings.continuousCameraIds.length > 0) {
+      const set = new Set(settings.continuousCameraIds)
+      return this.cameras.filter((c) => set.has(c.id))
+    }
+    if (settings.continuousSkipBatteryCams) {
+      return this.cameras.filter((c) => c.batteryPercent === null)
+    }
+    return [...this.cameras]
+  }
+
+  async startAllCameraRecording(cameraIds?: string[]): Promise<NvrStatus> {
+    const targets = this.resolveTargetNvrCameras(cameraIds)
+    if (targets.length === 0) {
+      throw new Error(
+        'No eligible cameras found to record. Check your camera list or Continuous Recording settings.',
+      )
+    }
+
+    if (!this.nvrStartedAt) {
+      this.nvrStartedAt = new Date().toISOString()
+    }
+
+    let staggerIndex = 0
+    for (const cam of targets) {
+      const existing = this.nvrWorkers.get(cam.id)
+      if (existing && !existing.stopped) continue
+
+      const staggerMs =
+        this.connection.mode === 'live' ? staggerIndex * 1200 : staggerIndex * 200
+      staggerIndex++
+
+      const worker: NvrWorker = {
+        cameraId: cam.id,
+        cameraName: cam.name,
+        stopped: false,
+        state: 'connecting',
+        startedAt: new Date().toISOString(),
+        segmentsCaptured: 0,
+      }
+      this.nvrWorkers.set(cam.id, worker)
+
+      worker.promise =
+        this.connection.mode === 'live'
+          ? this.runLiveNvrWorker(worker, staggerMs)
+          : this.runDemoNvrWorker(worker, staggerMs)
+    }
+
+    this.emitNvrStatus()
+    this.pushEvent({
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      sourceType: 'recording',
+      deviceName: 'RingWatch NVR',
+      kind: 'info',
+      title: `Continuous Recording Started (${targets.length} camera${targets.length === 1 ? '' : 's'})`,
+      detail: `Recording rolling ${this.configStore.getPublicSettings().continuousSegmentSeconds}s local MP4 segments for the Timeline.`,
+      severity: 'success',
+    })
+
+    return this.getNvrStatus()
+  }
+
+  async stopAllCameraRecording(): Promise<NvrStatus> {
+    const activeWorkers = Array.from(this.nvrWorkers.values())
+    if (activeWorkers.length === 0) {
+      this.nvrStartedAt = undefined
+      this.emitNvrStatus()
+      return this.getNvrStatus()
+    }
+
+    for (const worker of activeWorkers) {
+      worker.stopped = true
+      worker.state = 'stopped'
+      worker.cancelWait?.()
+      try {
+        worker.activeCall?.stop()
+      } catch {
+        // ignore
+      }
+    }
+
+    const pending = activeWorkers
+      .map((w) => w.promise)
+      .filter((p): p is Promise<void> => Boolean(p))
+    if (pending.length > 0) {
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise((r) => setTimeout(r, 3500)),
+      ])
+    }
+
+    this.nvrWorkers.clear()
+    this.nvrStartedAt = undefined
+    this.emitNvrStatus()
+    this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
+    this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
+
+    this.pushEvent({
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      sourceType: 'recording',
+      deviceName: 'RingWatch NVR',
+      kind: 'info',
+      title: 'Continuous Recording Stopped',
+      detail: 'Finalized all active camera segments and saved to local vault.',
+      severity: 'info',
+    })
+
+    return this.getNvrStatus()
+  }
+
+  async toggleCameraContinuousRecording(
+    cameraId: string,
+    enable: boolean,
+  ): Promise<NvrStatus> {
+    const cam = this.cameras.find((c) => c.id === cameraId)
+    if (!cam) throw new Error(`Camera ${cameraId} not found`)
+
+    if (enable) {
+      return this.startAllCameraRecording([cameraId])
+    }
+
+    const worker = this.nvrWorkers.get(cameraId)
+    if (worker) {
+      worker.stopped = true
+      worker.state = 'stopped'
+      worker.cancelWait?.()
+      try {
+        worker.activeCall?.stop()
+      } catch {
+        // ignore
+      }
+      if (worker.promise) {
+        await Promise.race([
+          worker.promise.catch(() => {}),
+          new Promise((r) => setTimeout(r, 2500)),
+        ])
+      }
+      this.nvrWorkers.delete(cameraId)
+    }
+
+    if (this.nvrWorkers.size === 0) {
+      this.nvrStartedAt = undefined
+    }
+    this.emitNvrStatus()
+    this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
+    this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
+    return this.getNvrStatus()
+  }
+
+  private async runLiveNvrWorker(worker: NvrWorker, initialDelayMs: number): Promise<void> {
+    if (initialDelayMs > 0) {
+      const ok = await this.cancellableDelay(worker, initialDelayMs)
+      if (!ok) return
+    }
+
+    let consecutiveFailures = 0
+
+    while (!worker.stopped) {
+      const liveCam = this.liveCamerasById.get(worker.cameraId)
+      const camInfo = this.cameras.find((c) => c.id === worker.cameraId)
+      if (!liveCam || !camInfo) {
+        worker.state = 'error'
+        worker.lastError = 'Camera disconnected from Ring'
+        this.emitNvrStatus()
+        break
+      }
+
+      const segmentSeconds = this.configStore.getPublicSettings().continuousSegmentSeconds
+      const sessionDate = new Date()
+      const target = this.recordingService.createNvrSegmentTarget(
+        camInfo.name,
+        sessionDate,
+      )
+      const hlsOutput = await this.streamService.prepareNvrHlsOutput(worker.cameraId)
+      const indexedFiles = new Set<string>()
+      let lastIndexedEndSec = 0
+      let sessionStartMs = Date.now()
+      let pollTimer: NodeJS.Timeout | null = null
+
+      const syncCompletedSegments = () => {
+        if (!fs.existsSync(target.segmentListPath)) return
+        let raw = ''
+        try {
+          raw = fs.readFileSync(target.segmentListPath, 'utf-8')
+        } catch {
+          return
+        }
+        const lines = raw
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean)
+
+        let addedAny = false
+        for (const line of lines) {
+          const parts = line.split(',')
+          if (parts.length < 3) continue
+          const rawFile = parts[0].trim()
+          const startSec = Number.parseFloat(parts[1])
+          const endSec = Number.parseFloat(parts[2])
+          if (!rawFile || !Number.isFinite(startSec) || !Number.isFinite(endSec)) {
+            continue
+          }
+          const fullPath = path.isAbsolute(rawFile)
+            ? rawFile
+            : path.join(target.dir, path.basename(rawFile))
+          const key = path.resolve(fullPath).toLowerCase()
+          if (indexedFiles.has(key)) continue
+
+          const createdAt = new Date(
+            sessionStartMs + Math.max(0, startSec) * 1000,
+          ).toISOString()
+          const duration = Math.max(1, Math.round(endSec - startSec))
+          const thumb =
+            this.snapshotCache.get(worker.cameraId)?.dataUrl ??
+            camInfo.lastSnapshotDataUrl
+
+          const saved = this.recordingService.registerRecordedSegment({
+            cameraId: worker.cameraId,
+            cameraName: camInfo.name,
+            filePath: fullPath,
+            createdAt,
+            durationSeconds: duration,
+            trigger: 'continuous',
+            thumbnailDataUrl: thumb,
+          })
+
+          indexedFiles.add(key)
+          if (endSec > lastIndexedEndSec) {
+            lastIndexedEndSec = endSec
+          }
+
+          if (saved) {
+            addedAny = true
+            worker.segmentsCaptured++
+            this.nvrTotalSegmentsCaptured++
+            worker.currentSegmentStartedAt = new Date(
+              sessionStartMs + Math.max(0, endSec) * 1000,
+            ).toISOString()
+          }
+        }
+
+        if (addedAny) {
+          this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
+          this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
+          this.emitNvrStatus()
+        }
+      }
+
+      const flushTrailingPartialSegment = () => {
+        try {
+          const entries = fs.readdirSync(target.dir)
+          const matching = entries
+            .filter(
+              (name) =>
+                name.startsWith(`${target.prefix}_`) &&
+                name.toLowerCase().endsWith('.mp4'),
+            )
+            .sort()
+
+          let addedAny = false
+          for (const name of matching) {
+            const fullPath = path.join(target.dir, name)
+            const key = path.resolve(fullPath).toLowerCase()
+            if (indexedFiles.has(key)) continue
+            const stat = fs.statSync(fullPath)
+            if (stat.size < 4096) continue
+
+            const estStartMs = sessionStartMs + Math.max(0, lastIndexedEndSec) * 1000
+            const estDur = Math.max(
+              2,
+              Math.min(segmentSeconds, Math.round((Date.now() - estStartMs) / 1000)),
+            )
+            const thumb =
+              this.snapshotCache.get(worker.cameraId)?.dataUrl ??
+              camInfo.lastSnapshotDataUrl
+
+            const saved = this.recordingService.registerRecordedSegment({
+              cameraId: worker.cameraId,
+              cameraName: camInfo.name,
+              filePath: fullPath,
+              createdAt: new Date(estStartMs).toISOString(),
+              durationSeconds: estDur,
+              trigger: 'continuous',
+              thumbnailDataUrl: thumb,
+            })
+            indexedFiles.add(key)
+            if (saved) {
+              addedAny = true
+              worker.segmentsCaptured++
+              this.nvrTotalSegmentsCaptured++
+            }
+          }
+
+          if (addedAny) {
+            this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
+            this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
+          }
+        } catch {
+          // Ignore directory scan failures during shutdown
+        }
+      }
+
+      try {
+        worker.state = consecutiveFailures > 0 ? 'reconnecting' : 'connecting'
+        this.emitNvrStatus()
+
+        const call = await liveCam.streamVideo({
+          video: ['-vcodec', 'copy'],
+          audio: ['-acodec', 'aac', '-b:a', '96k'],
+          output: [
+            // Output 0: Rolling fragmented MP4 segments for Timeline & Local Vault
+            '-f',
+            'segment',
+            '-segment_time',
+            String(segmentSeconds),
+            '-reset_timestamps',
+            '1',
+            '-segment_format',
+            'mp4',
+            '-segment_format_options',
+            'movflags=+frag_keyframe+empty_moov+default_base_moof',
+            '-segment_list',
+            target.ffmpegSegmentListPath,
+            '-segment_list_type',
+            'csv',
+            target.ffmpegSegmentPattern,
+            // Output 1: Live HLS playlist sharing the SAME Ring WebRTC stream
+            '-vcodec',
+            'copy',
+            '-acodec',
+            'aac',
+            '-b:a',
+            '96k',
+            '-f',
+            'hls',
+            '-hls_time',
+            '2',
+            '-hls_list_size',
+            '6',
+            '-hls_flags',
+            'delete_segments+append_list+temp_file',
+            '-hls_segment_filename',
+            hlsOutput.ffmpegSegmentPattern,
+            hlsOutput.ffmpegPlaylistPath,
+          ],
+        })
+
+        sessionStartMs = Date.now()
+        worker.activeCall = call
+        worker.state = 'recording'
+        worker.lastError = undefined
+        worker.currentSegmentStartedAt = new Date(sessionStartMs).toISOString()
+        this.streamService.registerNvrHlsFeed(worker.cameraId, hlsOutput)
+        this.emitNvrStatus()
+
+        if (worker.stopped) {
+          try {
+            call.stop()
+          } catch {
+            // ignore
+          }
+        }
+
+        pollTimer = setInterval(syncCompletedSegments, 2500)
+
+        await new Promise<void>((resolve) => {
+          call.onCallEnded.subscribe(() => resolve())
+        })
+
+        if (pollTimer) {
+          clearInterval(pollTimer)
+          pollTimer = null
+        }
+
+        // Brief settle window for Windows file handles before flushing final segments
+        await new Promise((r) => setTimeout(r, 450))
+        syncCompletedSegments()
+        flushTrailingPartialSegment()
+
+        worker.activeCall = undefined
+        this.streamService.unregisterNvrHlsFeed(worker.cameraId)
+        try {
+          fs.rmSync(target.segmentListPath, { force: true })
+        } catch {
+          // ignore
+        }
+
+        if (worker.stopped) break
+
+        // Normal Ring ~10-minute WebRTC session rotation -> quick seamless reconnect
+        const ranMs = Date.now() - sessionStartMs
+        if (ranMs >= 25000) {
+          consecutiveFailures = 0
+          worker.state = 'reconnecting'
+          this.emitNvrStatus()
+          const keepGoing = await this.cancellableDelay(worker, 2500)
+          if (!keepGoing) break
+        } else {
+          consecutiveFailures++
+          const backoffMs = Math.min(60000, 5000 * 2 ** (consecutiveFailures - 1))
+          worker.state = 'reconnecting'
+          worker.lastError = `Stream closed after ${Math.round(ranMs / 1000)}s; retrying in ${Math.round(backoffMs / 1000)}s`
+          this.emitNvrStatus()
+          const keepGoing = await this.cancellableDelay(worker, backoffMs)
+          if (!keepGoing) break
+        }
+      } catch (err) {
+        if (pollTimer) {
+          clearInterval(pollTimer)
+          pollTimer = null
+        }
+        worker.activeCall = undefined
+        this.streamService.unregisterNvrHlsFeed(worker.cameraId)
+        try {
+          fs.rmSync(target.segmentListPath, { force: true })
+        } catch {
+          // ignore
+        }
+
+        if (worker.stopped) break
+
+        consecutiveFailures++
+        const backoffMs = Math.min(60000, 5000 * 2 ** (consecutiveFailures - 1))
+        const message = err instanceof Error ? err.message : String(err)
+        worker.state = 'reconnecting'
+        worker.lastError = `${message} (retrying in ${Math.round(backoffMs / 1000)}s)`
+        this.emitNvrStatus()
+
+        const keepGoing = await this.cancellableDelay(worker, backoffMs)
+        if (!keepGoing) break
+      }
+    }
+
+    worker.state = 'stopped'
+    worker.currentSegmentStartedAt = undefined
+    this.emitNvrStatus()
+  }
+
+  private async runDemoNvrWorker(worker: NvrWorker, initialDelayMs: number): Promise<void> {
+    if (initialDelayMs > 0) {
+      const ok = await this.cancellableDelay(worker, initialDelayMs)
+      if (!ok) return
+    }
+
+    const demoCadenceSeconds = Math.min(
+      this.configStore.getPublicSettings().continuousSegmentSeconds,
+      20,
+    )
+
+    while (!worker.stopped) {
+      const cam = this.cameras.find((c) => c.id === worker.cameraId)
+      if (!cam) break
+
+      const segStart = new Date()
+      worker.state = 'recording'
+      worker.currentSegmentStartedAt = segStart.toISOString()
+      worker.lastError = undefined
+      this.emitNvrStatus()
+
+      const waitMs = worker.segmentsCaptured === 0 ? 3000 : demoCadenceSeconds * 1000
+      const ok = await this.cancellableDelay(worker, waitMs)
+      if (!ok) break
+
+      try {
+        const sourceImagePath = path.join(
+          this.demoAssetsDir,
+          cam.demoImage || 'front_porch.jpg',
+        )
+        const { dataUrl } = await this.captureSnapshotBase64(cam.id)
+        await this.recordingService.captureDemoRecording({
+          cameraId: cam.id,
+          cameraName: cam.name,
+          durationSeconds: Math.max(6, Math.round(waitMs / 1000)),
+          trigger: 'continuous',
+          sourceImagePath,
+          thumbnailDataUrl: dataUrl,
+          createdAtOverride: segStart.toISOString(),
+        })
+        worker.segmentsCaptured++
+        this.nvrTotalSegmentsCaptured++
+        this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
+        this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
+        this.emitNvrStatus()
+      } catch (err) {
+        worker.lastError = err instanceof Error ? err.message : String(err)
+        this.emitNvrStatus()
+        const retry = await this.cancellableDelay(worker, 8000)
+        if (!retry) break
+      }
+    }
+
+    worker.state = 'stopped'
+    worker.currentSegmentStartedAt = undefined
+    this.emitNvrStatus()
+  }
+
+  async syncCloudEventsToTimeline(): Promise<{
+    addedCount: number
+    events: SecurityEvent[]
+  }> {
+    let addedCount = 0
+    const existingIds = new Set(this.events.map((e) => e.id))
+
+    if (this.connection.mode === 'demo') {
+      const recs = this.recordingService.listRecordings()
+      for (const rec of recs) {
+        const id = `demo-sync-${rec.id}`
+        if (existingIds.has(id)) continue
+        const kind: SecurityEvent['kind'] =
+          rec.trigger === 'ding'
+            ? 'ding'
+            : rec.trigger === 'package'
+              ? 'package-detected'
+              : 'motion'
+        this.events.push({
+          id,
+          timestamp: rec.createdAt,
+          sourceType: rec.trigger === 'package' ? 'ai-package' : 'camera',
+          deviceId: rec.cameraId,
+          deviceName: rec.cameraName,
+          kind,
+          title:
+            kind === 'ding'
+              ? `Doorbell Pressed — ${rec.cameraName}`
+              : kind === 'package-detected'
+                ? `Package Detected — ${rec.cameraName}`
+                : `Motion Detected — ${rec.cameraName}`,
+          detail: `Synced timeline event aligned with ${rec.fileName}.`,
+          severity: kind === 'ding' ? 'alert' : 'warning',
+        })
+        existingIds.add(id)
+        addedCount++
+      }
+    } else {
+      const results = await Promise.allSettled(
+        this.cameras.map(async (cam) => {
+          const liveCam = this.liveCamerasById.get(cam.id)
+          if (!liveCam) return [] as SecurityEvent[]
+          const res = await liveCam.getEvents({ limit: 35 })
+          const rawEvents = (res.events ?? []) as unknown as Array<
+            Record<string, unknown>
+          >
+          return rawEvents.map((ev): SecurityEvent => {
+            const dingId = String(ev.ding_id_str ?? ev.ding_id ?? crypto.randomUUID())
+            const rawKind = String(ev.kind ?? 'motion').toLowerCase()
+            const cvType = String(
+              (ev.cv_properties as Record<string, unknown> | undefined)
+                ?.detection_type ?? '',
+            ).toLowerCase()
+
+            const kind: SecurityEvent['kind'] =
+              cvType === 'package'
+                ? 'package-detected'
+                : rawKind === 'ding'
+                  ? 'ding'
+                  : 'motion'
+
+            return {
+              id: `ring-cloud-${cam.id}-${dingId}`,
+              timestamp: String(ev.created_at ?? new Date().toISOString()),
+              sourceType: kind === 'package-detected' ? 'ai-package' : 'camera',
+              deviceId: cam.id,
+              deviceName: cam.name,
+              kind,
+              title:
+                kind === 'ding'
+                  ? `Doorbell Pressed — ${cam.name}`
+                  : kind === 'package-detected'
+                    ? `Package Activity — ${cam.name}`
+                    : `Motion Detected — ${cam.name}`,
+              detail: `Ring Cloud ${rawKind} event (${Number(ev.duration ?? 30)}s).`,
+              severity: kind === 'ding' ? 'alert' : 'warning',
+            }
+          })
+        }),
+      )
+
+      for (const r of results) {
+        if (r.status !== 'fulfilled') continue
+        for (const ev of r.value) {
+          if (existingIds.has(ev.id)) continue
+          this.events.push(ev)
+          existingIds.add(ev.id)
+          addedCount++
+        }
+      }
+    }
+
+    if (addedCount > 0) {
+      this.events.sort(
+        (a, b) =>
+          new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+      )
+      this.events = this.events.slice(0, 500)
+      this.saveEventsToDisk()
+      this.callbacks.onEventsUpdated?.(this.getEvents())
+    }
+
+    return { addedCount, events: this.getEvents() }
+  }
+
   private emitAllState(): void {
     this.callbacks.onConnectionChanged(this.getConnection())
     this.callbacks.onSettingsUpdated?.(this.configStore.getPublicSettings())
     this.callbacks.onLocationsUpdated(this.getLocations())
     this.callbacks.onCamerasUpdated(this.getCameras())
     this.callbacks.onSensorsUpdated(this.getSensors())
+    this.callbacks.onNvrStatusUpdated?.(this.getNvrStatus())
+    this.callbacks.onEventsUpdated?.(this.getEvents())
   }
 
   shutdown(): void {

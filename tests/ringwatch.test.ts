@@ -345,3 +345,150 @@ describe('Timeline Tool scrubbing helpers', async () => {
     expect(nextStop).toBe(clipStart)
   })
 })
+
+describe('Continuous All-Camera NVR Recording', () => {
+  let tmpDir: string
+  let streamService: StreamService
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    streamService?.stopAll()
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('persists and clamps Continuous NVR settings across reloads', () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    const defaults = store.getPublicSettings()
+    expect(defaults.continuousSegmentSeconds).toBe(120)
+    expect(defaults.continuousSkipBatteryCams).toBe(false)
+    expect(defaults.continuousAutoStart).toBe(false)
+    expect(defaults.continuousCameraIds).toEqual([])
+
+    store.updateSettings({
+      continuousSegmentSeconds: 10, // clamped to 30
+      continuousSkipBatteryCams: true,
+      continuousAutoStart: true,
+      continuousCameraIds: ['cam-a', 'cam-b'],
+    })
+
+    const reloaded = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    const pub = reloaded.getPublicSettings()
+    expect(pub.continuousSegmentSeconds).toBe(30)
+    expect(pub.continuousSkipBatteryCams).toBe(true)
+    expect(pub.continuousAutoStart).toBe(true)
+    expect(pub.continuousCameraIds).toEqual(['cam-a', 'cam-b'])
+  })
+
+  it('registers NVR segments with deduplication, skips tiny/corrupt files, and infers continuous trigger on rescan', async () => {
+    const recDir = path.join(tmpDir, 'nvr')
+    const store = new ConfigStore(tmpDir, recDir)
+    streamService = new StreamService(() => store.getPublicSettings().recordingsDir)
+    await streamService.startServer()
+
+    const recService = new RecordingService(tmpDir, store, streamService)
+    const target = recService.createNvrSegmentTarget('Front Porch')
+    expect(target.dir).toBe(recDir)
+    expect(target.segmentPattern).toContain('_continuous_')
+    expect(target.segmentListPath).toContain('.csv')
+
+    const tinyPath = path.join(recDir, `${target.prefix}_0000.mp4`)
+    fs.writeFileSync(tinyPath, Buffer.alloc(512, 0))
+    const skipped = recService.registerRecordedSegment({
+      cameraId: 'cam-1',
+      cameraName: 'Front Porch',
+      filePath: tinyPath,
+      createdAt: new Date().toISOString(),
+      durationSeconds: 120,
+      trigger: 'continuous',
+    })
+    expect(skipped).toBeNull()
+
+    const validPath = path.join(recDir, `${target.prefix}_0001.mp4`)
+    fs.writeFileSync(validPath, Buffer.alloc(8192, 7))
+    const startedIso = new Date(Date.now() - 120_000).toISOString()
+
+    const reg1 = recService.registerRecordedSegment({
+      cameraId: 'cam-1',
+      cameraName: 'Front Porch',
+      filePath: validPath,
+      createdAt: startedIso,
+      durationSeconds: 120,
+      trigger: 'continuous',
+    })
+    expect(reg1).not.toBeNull()
+    expect(reg1!.trigger).toBe('continuous')
+    expect(reg1!.createdAt).toBe(startedIso)
+
+    // Duplicate registration of same path must return existing item without duplicating
+    const reg2 = recService.registerRecordedSegment({
+      cameraId: 'cam-1',
+      cameraName: 'Front Porch',
+      filePath: validPath,
+      createdAt: startedIso,
+      durationSeconds: 120,
+      trigger: 'continuous',
+    })
+    expect(reg2?.id).toBe(reg1?.id)
+    expect(recService.listRecordings()).toHaveLength(1)
+
+    // Rescanning disk on a fresh RecordingService infers 'continuous' trigger & skips tiny files
+    const freshService = new RecordingService(
+      path.join(tmpDir, 'fresh-index'),
+      store,
+      streamService,
+    )
+    const rescanned = freshService.rescanDirectory()
+    expect(rescanned.recordings).toHaveLength(1)
+    expect(rescanned.recordings[0].trigger).toBe('continuous')
+  })
+
+  it('reuses active NVR HLS feed for Live View without opening a second Ring WebRTC call', async () => {
+    const recDir = path.join(tmpDir, 'nvr-hls')
+    const store = new ConfigStore(tmpDir, recDir)
+    streamService = new StreamService(() => store.getPublicSettings().recordingsDir)
+    await streamService.startServer()
+
+    const prepared = await streamService.prepareNvrHlsOutput('cam-99')
+    expect(fs.existsSync(prepared.dirPath)).toBe(true)
+
+    // Simulate FFmpeg writing an HLS playlist with a segment
+    fs.writeFileSync(
+      prepared.playlistPath,
+      '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\nseg_00000.ts\n',
+    )
+    streamService.registerNvrHlsFeed('cam-99', prepared)
+
+    const mockStreamVideo = vi.fn()
+    const session = await streamService.startRingHlsStream('cam-99', {
+      streamVideo: mockStreamVideo,
+    })
+
+    expect(mockStreamVideo).not.toHaveBeenCalled()
+    expect(session.cameraId).toBe('cam-99')
+    expect(session.streamUrl).toBe(prepared.streamUrl)
+    expect(streamService.isStreaming('cam-99')).toBe(true)
+
+    // Closing Live View stops the viewer session without tearing down the underlying NVR feed
+    streamService.stopStream('cam-99')
+    expect(streamService.isStreaming('cam-99')).toBe(false)
+
+    // Reopening Live View still reuses the NVR feed with zero extra Ring call
+    const session2 = await streamService.startRingHlsStream('cam-99', {
+      streamVideo: mockStreamVideo,
+    })
+    expect(mockStreamVideo).not.toHaveBeenCalled()
+    expect(session2.streamUrl).toBe(prepared.streamUrl)
+
+    // Unregistering NVR feed ends the live viewer session cleanly
+    const onEnded = vi.fn()
+    streamService.stopStream('cam-99')
+    await streamService.startRingHlsStream('cam-99', { streamVideo: mockStreamVideo }, onEnded)
+    streamService.unregisterNvrHlsFeed('cam-99')
+    expect(streamService.isStreaming('cam-99')).toBe(false)
+    expect(onEnded).toHaveBeenCalledTimes(1)
+  })
+})
+

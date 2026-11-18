@@ -1,18 +1,29 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { LocalRecordingItem, StorageStats } from '../../shared/types'
 import type { ConfigStore } from './configStore'
-import type { StreamService } from './streamService'
+import type { StreamService, StreamableRingCamera } from './streamService'
 
 const execFileAsync = promisify(execFile)
 
 export interface RecordableRingCamera {
   recordToFile(outputPath: string, duration?: number): Promise<void>
+  streamVideo?: StreamableRingCamera['streamVideo']
   getSnapshot(): Promise<Buffer>
   getRecordingUrl(dingIdStr: string): Promise<string>
+}
+
+export interface NvrSegmentTarget {
+  dir: string
+  prefix: string
+  segmentPattern: string
+  ffmpegSegmentPattern: string
+  segmentListPath: string
+  ffmpegSegmentListPath: string
 }
 
 export class RecordingService {
@@ -209,8 +220,20 @@ export class RecordingService {
 
       const fullPath = path.join(dir, entry.name)
       const stat = fs.statSync(fullPath)
-      const guessedCam = entry.name.split('_')[0]?.replace(/-/g, ' ') || 'Local Camera'
+      if (stat.size < 2048) continue
+      const parts = entry.name.split('_')
+      const guessedCam = parts[0]?.replace(/-/g, ' ') || 'Local Camera'
       const titleCam = guessedCam.replace(/\b\w/g, (m) => m.toUpperCase())
+      const inferredTrigger: LocalRecordingItem['trigger'] =
+        parts[1] === 'continuous'
+          ? 'continuous'
+          : parts[1] === 'motion'
+            ? 'motion'
+            : parts[1] === 'ding'
+              ? 'ding'
+              : parts[1] === 'package'
+                ? 'package'
+                : 'imported'
 
       this.recordings.push({
         id: crypto.randomUUID(),
@@ -219,9 +242,12 @@ export class RecordingService {
         filePath: fullPath,
         fileName: entry.name,
         createdAt: stat.mtime.toISOString(),
-        durationSeconds: 30,
+        durationSeconds:
+          inferredTrigger === 'continuous'
+            ? this.configStore.getPublicSettings().continuousSegmentSeconds
+            : 30,
         sizeBytes: stat.size,
-        trigger: 'imported',
+        trigger: inferredTrigger,
         starred: false,
       })
     }
@@ -321,13 +347,90 @@ export class RecordingService {
     }
   }
 
+  private buildSlug(cameraName: string): string {
+    return (
+      cameraName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '') || 'camera'
+    )
+  }
+
   private buildFileName(cameraName: string, trigger: string, date = new Date()): string {
-    const slug = cameraName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '')
+    const slug = this.buildSlug(cameraName)
     const stamp = date.toISOString().replace(/[:.]/g, '-').slice(0, 19)
-    return `${slug || 'camera'}_${trigger}_${stamp}.mp4`
+    return `${slug}_${trigger}_${stamp}.mp4`
+  }
+
+  createNvrSegmentTarget(cameraName: string, sessionDate = new Date()): NvrSegmentTarget {
+    const dir = this.ensureRecordingsDir()
+    const slug = this.buildSlug(cameraName)
+    const stamp = sessionDate.toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    const suffix = crypto.randomBytes(2).toString('hex')
+    const prefix = `${slug}_continuous_${stamp}_${suffix}`
+    const segmentPattern = path.join(dir, `${prefix}_%04d.mp4`)
+
+    const listDir = path.join(os.tmpdir(), 'ringwatch-nvr')
+    fs.mkdirSync(listDir, { recursive: true })
+    const segmentListPath = path.join(listDir, `${prefix}.csv`)
+
+    return {
+      dir,
+      prefix,
+      segmentPattern,
+      ffmpegSegmentPattern: segmentPattern.replace(/\\/g, '/'),
+      segmentListPath,
+      ffmpegSegmentListPath: segmentListPath.replace(/\\/g, '/'),
+    }
+  }
+
+  registerRecordedSegment(params: {
+    cameraId: string
+    cameraName: string
+    filePath: string
+    createdAt: string
+    durationSeconds: number
+    trigger: LocalRecordingItem['trigger']
+    thumbnailDataUrl?: string
+  }): LocalRecordingItem | null {
+    if (!fs.existsSync(params.filePath)) return null
+    const stat = fs.statSync(params.filePath)
+    if (stat.size < 2048) return null
+
+    const normalizedPath = path.resolve(params.filePath).toLowerCase()
+    const existing = this.recordings.find(
+      (r) => path.resolve(r.filePath).toLowerCase() === normalizedPath,
+    )
+    if (existing) {
+      return {
+        ...existing,
+        playbackUrl: this.streamService.getRecordingPlaybackUrl(existing.fileName),
+      }
+    }
+
+    const fileName = path.basename(params.filePath)
+    const item: LocalRecordingItem = {
+      id: crypto.randomUUID(),
+      cameraId: params.cameraId,
+      cameraName: params.cameraName,
+      filePath: params.filePath,
+      fileName,
+      createdAt: params.createdAt,
+      durationSeconds: Math.max(1, Math.round(params.durationSeconds)),
+      sizeBytes: stat.size,
+      trigger: params.trigger,
+      starred: false,
+      thumbnailDataUrl: params.thumbnailDataUrl,
+      playbackUrl: this.streamService.getRecordingPlaybackUrl(fileName),
+    }
+
+    this.recordings.unshift(item)
+    this.recordings.sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    )
+    this.saveIndex()
+    this.enforceRetentionAndQuota()
+    return item
   }
 
   async captureFromRingCamera(params: {
@@ -338,7 +441,8 @@ export class RecordingService {
     trigger: LocalRecordingItem['trigger']
   }): Promise<LocalRecordingItem> {
     const dir = this.ensureRecordingsDir()
-    const fileName = this.buildFileName(params.cameraName, params.trigger)
+    const startedAt = new Date()
+    const fileName = this.buildFileName(params.cameraName, params.trigger, startedAt)
     const filePath = path.join(dir, fileName)
 
     let thumbnailDataUrl: string | undefined
@@ -349,17 +453,43 @@ export class RecordingService {
       // Battery cameras may block snapshots while recording
     }
 
-    await params.camera.recordToFile(filePath, params.durationSeconds)
-    const stat = fs.statSync(filePath)
+    if (typeof params.camera.streamVideo === 'function') {
+      const ffmpegPath = filePath.replace(/\\/g, '/')
+      const liveCall = await params.camera.streamVideo({
+        video: ['-vcodec', 'copy'],
+        audio: ['-acodec', 'aac', '-b:a', '96k'],
+        output: [
+          '-t',
+          String(params.durationSeconds),
+          '-movflags',
+          '+frag_keyframe+empty_moov+default_base_moof',
+          ffmpegPath,
+        ],
+      })
+      await new Promise<void>((resolve) => {
+        liveCall.onCallEnded.subscribe(() => resolve())
+      })
+    } else {
+      await params.camera.recordToFile(filePath, params.durationSeconds)
+    }
 
+    const elapsedSeconds = Math.max(
+      1,
+      Math.min(
+        params.durationSeconds,
+        Math.round((Date.now() - startedAt.getTime()) / 1000),
+      ),
+    )
+
+    const stat = fs.statSync(filePath)
     const item: LocalRecordingItem = {
       id: crypto.randomUUID(),
       cameraId: params.cameraId,
       cameraName: params.cameraName,
       filePath,
       fileName,
-      createdAt: new Date().toISOString(),
-      durationSeconds: params.durationSeconds,
+      createdAt: startedAt.toISOString(),
+      durationSeconds: elapsedSeconds,
       sizeBytes: stat.size,
       trigger: params.trigger,
       starred: false,
@@ -368,6 +498,9 @@ export class RecordingService {
     }
 
     this.recordings.unshift(item)
+    this.recordings.sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    )
     this.saveIndex()
     this.enforceRetentionAndQuota()
     return item

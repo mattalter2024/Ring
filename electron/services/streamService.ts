@@ -8,7 +8,18 @@ interface ActiveRingStream {
   cameraId: string
   session: LiveStreamSession
   dirPath: string
+  nvrBacked?: boolean
   stopFn: () => void
+  onEnded?: () => void
+}
+
+export interface PreparedHlsOutput {
+  safeId: string
+  dirPath: string
+  playlistPath: string
+  ffmpegPlaylistPath: string
+  ffmpegSegmentPattern: string
+  streamUrl: string
 }
 
 export interface StreamableRingCamera {
@@ -28,6 +39,10 @@ export class StreamService {
   private port = 0
   private readonly hlsRoot: string
   private readonly activeStreams = new Map<string, ActiveRingStream>()
+  private readonly nvrHlsFeeds = new Map<
+    string,
+    { dirPath: string; playlistPath: string; streamUrl: string; startedAt: string }
+  >()
   private readonly getRecordingsDir: () => string
 
   constructor(getRecordingsDir: () => string) {
@@ -183,6 +198,85 @@ export class StreamService {
     return this.activeStreams.has(cameraId)
   }
 
+  async prepareNvrHlsOutput(cameraId: string): Promise<PreparedHlsOutput> {
+    await this.startServer()
+
+    // Stop any standalone HLS live view on this camera so Ring only gets ONE WebRTC call
+    const existing = this.activeStreams.get(cameraId)
+    if (existing && !existing.nvrBacked) {
+      existing.stopFn()
+    }
+
+    const safeId = cameraId.replace(/[^a-zA-Z0-9_-]/g, '_')
+    const dirPath = path.join(this.hlsRoot, `nvr_${safeId}`)
+    fs.rmSync(dirPath, { recursive: true, force: true })
+    fs.mkdirSync(dirPath, { recursive: true })
+
+    const playlistPath = path.join(dirPath, 'index.m3u8')
+    const ffmpegPlaylistPath = playlistPath.replace(/\\/g, '/')
+    const ffmpegSegmentPattern = path.join(dirPath, 'seg_%05d.ts').replace(/\\/g, '/')
+
+    return {
+      safeId: `nvr_${safeId}`,
+      dirPath,
+      playlistPath,
+      ffmpegPlaylistPath,
+      ffmpegSegmentPattern,
+      streamUrl: `http://127.0.0.1:${this.port}/hls/nvr_${safeId}/index.m3u8`,
+    }
+  }
+
+  registerNvrHlsFeed(cameraId: string, prepared: PreparedHlsOutput): void {
+    this.nvrHlsFeeds.set(cameraId, {
+      dirPath: prepared.dirPath,
+      playlistPath: prepared.playlistPath,
+      streamUrl: prepared.streamUrl,
+      startedAt: new Date().toISOString(),
+    })
+  }
+
+  unregisterNvrHlsFeed(cameraId: string): void {
+    const feed = this.nvrHlsFeeds.get(cameraId)
+    this.nvrHlsFeeds.delete(cameraId)
+
+    const active = this.activeStreams.get(cameraId)
+    if (active?.nvrBacked) {
+      this.activeStreams.delete(cameraId)
+      active.onEnded?.()
+    }
+
+    if (feed?.dirPath) {
+      setTimeout(() => {
+        fs.rmSync(feed.dirPath, { recursive: true, force: true })
+      }, 1500)
+    }
+  }
+
+  private async waitForHlsPlaylist(
+    playlistPath: string,
+    isStillValid: () => boolean,
+    timeoutMs = 18000,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (fs.existsSync(playlistPath)) {
+        try {
+          const manifest = fs.readFileSync(playlistPath, 'utf-8')
+          if (manifest.includes('.ts')) {
+            return true
+          }
+        } catch {
+          // Playlist mid-rename; retry on next tick
+        }
+      }
+      if (!isStillValid()) {
+        return false
+      }
+      await new Promise((r) => setTimeout(r, 250))
+    }
+    return false
+  }
+
   async startRingHlsStream(
     cameraId: string,
     camera: StreamableRingCamera,
@@ -192,6 +286,38 @@ export class StreamService {
     if (existing) return existing.session
 
     await this.startServer()
+
+    // If Continuous NVR is already streaming this camera, reuse its live HLS feed instantly (zero extra Ring call!)
+    const nvrFeed = this.nvrHlsFeeds.get(cameraId)
+    if (nvrFeed) {
+      const ready = await this.waitForHlsPlaylist(
+        nvrFeed.playlistPath,
+        () => this.nvrHlsFeeds.has(cameraId),
+        18000,
+      )
+      if (ready && this.nvrHlsFeeds.has(cameraId)) {
+        const session: LiveStreamSession = {
+          cameraId,
+          mode: 'hls',
+          streamUrl: nvrFeed.streamUrl,
+          startedAt: nvrFeed.startedAt,
+          audioEnabled: true,
+        }
+        this.activeStreams.set(cameraId, {
+          cameraId,
+          session,
+          dirPath: nvrFeed.dirPath,
+          nvrBacked: true,
+          onEnded,
+          stopFn: () => {
+            if (!this.activeStreams.has(cameraId)) return
+            this.activeStreams.delete(cameraId)
+            onEnded?.()
+          },
+        })
+        return session
+      }
+    }
 
     const safeId = cameraId.replace(/[^a-zA-Z0-9_-]/g, '_')
     const dirPath = path.join(this.hlsRoot, safeId)
@@ -247,6 +373,7 @@ export class StreamService {
       cameraId,
       session,
       dirPath,
+      onEnded,
       stopFn: cleanup,
     })
 
@@ -255,30 +382,19 @@ export class StreamService {
     })
 
     // Wait up to 18s for FFmpeg to produce an HLS manifest containing at least one .ts segment
-    const deadline = Date.now() + 18000
-    let ready = false
-    while (Date.now() < deadline) {
-      if (fs.existsSync(playlistPath)) {
-        try {
-          const manifest = fs.readFileSync(playlistPath, 'utf-8')
-          if (manifest.includes('.ts')) {
-            ready = true
-            break
-          }
-        } catch {
-          // Playlist mid-rename; retry on next tick
-        }
-      }
-      if (!this.activeStreams.has(cameraId)) {
-        throw new Error('Live stream ended before video frames were received from Ring')
-      }
-      await new Promise((r) => setTimeout(r, 250))
-    }
+    const ready = await this.waitForHlsPlaylist(
+      playlistPath,
+      () => this.activeStreams.has(cameraId),
+      18000,
+    )
 
     if (!ready) {
+      const stillActive = this.activeStreams.has(cameraId)
       cleanup()
       throw new Error(
-        'Timed out waiting for Ring video frames (18s). Check camera signal or Ring Live View settings.',
+        stillActive
+          ? 'Timed out waiting for Ring video frames (18s). Check camera signal or Ring Live View settings.'
+          : 'Live stream ended before video frames were received from Ring',
       )
     }
 
@@ -320,6 +436,7 @@ export class StreamService {
     for (const id of Array.from(this.activeStreams.keys())) {
       this.stopStream(id)
     }
+    this.nvrHlsFeeds.clear()
     if (this.server) {
       this.server.close()
       this.server = null

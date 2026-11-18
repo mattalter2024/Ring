@@ -3,6 +3,7 @@ import {
   Calendar,
   ChevronLeft,
   ChevronRight,
+  Circle,
   Download,
   FastForward,
   Film,
@@ -11,15 +12,18 @@ import {
   Pause,
   Play,
   Radio,
+  RefreshCw,
   Rewind,
   SkipBack,
   SkipForward,
+  Square,
   Star,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
 import type {
   LocalRecordingItem,
+  NvrStatus,
   PackageDetectionRecord,
   RingCameraInfo,
   SecurityEvent,
@@ -43,7 +47,11 @@ interface TimelineViewProps {
   recordings: LocalRecordingItem[]
   events: SecurityEvent[]
   packageDetections: PackageDetectionRecord[]
+  nvrStatus: NvrStatus
+  nvrBusy: boolean
   defaultCaptureSeconds: number
+  onToggleAllRecording: () => Promise<void>
+  onSyncCloudEvents: () => Promise<void>
   onCaptureRecording: (cameraId: string, durationSeconds: number) => Promise<void>
   onToggleStar: (recordingId: string) => Promise<void>
   onExportRecording: (recordingId: string) => Promise<void>
@@ -57,7 +65,11 @@ export function TimelineView({
   recordings,
   events,
   packageDetections,
+  nvrStatus,
+  nvrBusy,
   defaultCaptureSeconds,
+  onToggleAllRecording,
+  onSyncCloudEvents,
   onCaptureRecording,
   onToggleStar,
   onExportRecording,
@@ -85,9 +97,23 @@ export function TimelineView({
   )
   const [dragging, setDragging] = useState(false)
   const [capturing, setCapturing] = useState(false)
+  const [syncingEvents, setSyncingEvents] = useState(false)
+  const [quickCameraId, setQuickCameraId] = useState<string>('')
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const tracksContainerRef = useRef<HTMLDivElement | null>(null)
+  const pendingSeekRef = useRef<{
+    clipId: string
+    offsetSeconds: number
+    autoPlay: boolean
+  } | null>(null)
+
+  useEffect(() => {
+    if (!nvrStatus.active) return
+    const timer = setInterval(() => setNowMs(Date.now()), 5000)
+    return () => clearInterval(timer)
+  }, [nvrStatus.active])
 
   const { startMs: dayStartMs, endMs: dayEndMs } = useMemo(
     () => getDayRangeMs(dateKey),
@@ -160,30 +186,58 @@ export function TimelineView({
     }
   }, [playbackRate, activeClip?.id])
 
-  const seekToTimestamp = (tsMs: number, preferCameraId?: string) => {
+  const applySeekIfSameClip = (
+    clipId: string,
+    offsetSeconds: number,
+    autoPlay: boolean,
+  ) => {
+    pendingSeekRef.current = { clipId, offsetSeconds, autoPlay }
+    if (activeClip?.id === clipId && videoRef.current && videoRef.current.readyState >= 1) {
+      const video = videoRef.current
+      const clamped = Math.max(
+        0,
+        Math.min(
+          offsetSeconds,
+          Number.isFinite(video.duration) && video.duration > 0
+            ? Math.max(0, video.duration - 0.5)
+            : offsetSeconds,
+        ),
+      )
+      try {
+        video.currentTime = clamped
+      } catch {
+        // Metadata still settling
+      }
+      if (autoPlay) {
+        void video.play().then(() => setIsPlaying(true)).catch(() => {})
+      }
+      pendingSeekRef.current = null
+    }
+  }
+
+  const seekToTimestamp = (
+    tsMs: number,
+    preferCameraId?: string,
+    options?: { keepEventId?: string | null; preRollSeconds?: number; autoPlay?: boolean },
+  ) => {
     const clamped = Math.max(dayStartMs, Math.min(dayEndMs - 1, tsMs))
     setPlayheadMs(clamped)
 
-    const match = findClipAtTimestamp(dayRecordings, clamped, preferCameraId)
-    if (match) {
-      setActiveClipId(match.clip.id)
+    const match =
+      findClipAtTimestamp(dayRecordings, clamped, preferCameraId) ??
+      (preferCameraId ? findClipAtTimestamp(dayRecordings, clamped) : null)
+
+    if (options?.keepEventId !== undefined) {
+      setSelectedEventId(options.keepEventId)
+    } else if (match) {
       setSelectedEventId(null)
-      requestAnimationFrame(() => {
-        const video = videoRef.current
-        if (video && Number.isFinite(match.offsetSeconds)) {
-          const target = Math.min(
-            match.offsetSeconds,
-            Number.isFinite(video.duration) && video.duration > 0
-              ? video.duration
-              : match.offsetSeconds,
-          )
-          try {
-            video.currentTime = target
-          } catch {
-            // Video metadata still loading
-          }
-        }
-      })
+    }
+
+    if (match) {
+      const preRoll = options?.preRollSeconds ?? 0
+      const targetOffset = Math.max(0, match.offsetSeconds - preRoll)
+      setActiveClipId(match.clip.id)
+      applySeekIfSameClip(match.clip.id, targetOffset, Boolean(options?.autoPlay))
     }
   }
 
@@ -192,12 +246,15 @@ export function TimelineView({
     setActiveClipId(clip.id)
     setSelectedEventId(null)
     setPlayheadMs(clipStart)
-    requestAnimationFrame(() => {
-      const video = videoRef.current
-      if (video) {
-        video.currentTime = 0
-        void video.play().then(() => setIsPlaying(true)).catch(() => {})
-      }
+    applySeekIfSameClip(clip.id, 0, true)
+  }
+
+  const selectEventPin = (ev: SecurityEvent, preferCameraId?: string) => {
+    const ts = new Date(ev.timestamp).getTime()
+    seekToTimestamp(ts, preferCameraId ?? activeClip?.cameraId, {
+      keepEventId: ev.id,
+      preRollSeconds: 3,
+      autoPlay: true,
     })
   }
 
@@ -209,17 +266,17 @@ export function TimelineView({
       direction,
     )
     if (target !== null) {
-      seekToTimestamp(target)
+      seekToTimestamp(target, activeClip?.cameraId)
     }
   }
 
-  const handleTrackPointer = (clientX: number) => {
+  const handleTrackPointer = (clientX: number, laneCameraId?: string) => {
     const el = tracksContainerRef.current
     if (!el) return
     const rect = el.getBoundingClientRect()
     const pct = ((clientX - rect.left) / Math.max(1, rect.width)) * 100
     const tsMs = percentToMs(pct, windowStartMs, windowEndMs)
-    seekToTimestamp(tsMs)
+    seekToTimestamp(tsMs, laneCameraId ?? activeClip?.cameraId)
   }
 
   useEffect(() => {
@@ -268,6 +325,7 @@ export function TimelineView({
   }, [cameras, dayRecordings])
 
   const sensorEvents = dayEvents.filter((e) => e.sourceType === 'sensor')
+  const selectedQuickCameraId = quickCameraId || cameras[0]?.id || ''
 
   return (
     <div className="timeline-page">
@@ -302,6 +360,31 @@ export function TimelineView({
                   key={activeClip.id}
                   src={activeClip.playbackUrl}
                   poster={activeClip.thumbnailDataUrl}
+                  onLoadedMetadata={(e) => {
+                    const video = e.currentTarget
+                    video.playbackRate = playbackRate
+                    const pending = pendingSeekRef.current
+                    if (pending && pending.clipId === activeClip.id) {
+                      const target = Math.max(
+                        0,
+                        Math.min(
+                          pending.offsetSeconds,
+                          Number.isFinite(video.duration) && video.duration > 0
+                            ? Math.max(0, video.duration - 0.5)
+                            : pending.offsetSeconds,
+                        ),
+                      )
+                      try {
+                        video.currentTime = target
+                      } catch {
+                        // ignore
+                      }
+                      if (pending.autoPlay) {
+                        void video.play().then(() => setIsPlaying(true)).catch(() => {})
+                      }
+                      pendingSeekRef.current = null
+                    }
+                  }}
                   onPlay={() => setIsPlaying(true)}
                   onPause={() => setIsPlaying(false)}
                   onTimeUpdate={(e) => {
@@ -312,11 +395,14 @@ export function TimelineView({
                   onEnded={() => {
                     setIsPlaying(false)
                     if (autoAdvance) {
-                      const idx = dayRecordings.findIndex(
+                      const sameCamClips = dayRecordings.filter(
+                        (r) => r.cameraId === activeClip.cameraId,
+                      )
+                      const idx = sameCamClips.findIndex(
                         (r) => r.id === activeClip.id,
                       )
-                      if (idx >= 0 && idx + 1 < dayRecordings.length) {
-                        selectClip(dayRecordings[idx + 1])
+                      if (idx >= 0 && idx + 1 < sameCamClips.length) {
+                        selectClip(sameCamClips[idx + 1])
                       }
                     }
                   }}
@@ -332,8 +418,8 @@ export function TimelineView({
                   <Film size={28} />
                   <strong>No local video clip selected for {dateKey}</strong>
                   <span>
-                    Click any recording bar on the timeline below or capture a new
-                    local clip.
+                    Start <strong>Record All Cameras</strong> to continuously record every
+                    live stream onto the timeline, or click any clip bar below.
                   </span>
                 </div>
               )}
@@ -563,24 +649,82 @@ export function TimelineView({
               </div>
             </div>
 
-            {cameras[0] && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <button
                 type="button"
-                className="btn btn-primary btn-sm"
-                disabled={capturing}
+                className={`btn btn-sm ${nvrStatus.active ? 'btn-danger' : 'btn-primary'}`}
+                disabled={nvrBusy}
+                onClick={() => void onToggleAllRecording()}
+              >
+                {nvrStatus.active ? (
+                  <>
+                    <Square size={12} fill="currentColor" />
+                    Stop All-Camera NVR ({nvrStatus.activeCameraCount}/{cameras.length})
+                  </>
+                ) : (
+                  <>
+                    <Circle size={12} fill="currentColor" />
+                    Record All Cameras Continuously
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={syncingEvents}
                 onClick={async () => {
-                  setCapturing(true)
+                  setSyncingEvents(true)
                   try {
-                    await onCaptureRecording(cameras[0].id, defaultCaptureSeconds)
+                    await onSyncCloudEvents()
                   } finally {
-                    setCapturing(false)
+                    setSyncingEvents(false)
                   }
                 }}
               >
-                <Film size={13} />
-                {capturing ? 'Capturing MP4…' : `Record ${cameras[0].name}`}
+                <RefreshCw size={13} className={syncingEvents ? 'spin' : ''} />
+                {syncingEvents ? 'Syncing Ring Events…' : 'Sync Ring Cloud Events'}
               </button>
-            )}
+
+              {cameras.length > 0 && (
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <select
+                    aria-label="Camera for quick clip"
+                    className="select"
+                    style={{ fontSize: 12, padding: '5px 8px' }}
+                    value={selectedQuickCameraId}
+                    onChange={(e) => setQuickCameraId(e.target.value)}
+                  >
+                    {cameras.map((cam) => (
+                      <option key={cam.id} value={cam.id}>
+                        {cam.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    style={{ whiteSpace: 'nowrap' }}
+                    disabled={capturing || !selectedQuickCameraId}
+                    onClick={async () => {
+                      if (!selectedQuickCameraId) return
+                      setCapturing(true)
+                      try {
+                        await onCaptureRecording(
+                          selectedQuickCameraId,
+                          defaultCaptureSeconds,
+                        )
+                      } finally {
+                        setCapturing(false)
+                      }
+                    }}
+                  >
+                    <Film size={13} />
+                    {capturing ? 'Saving…' : `${defaultCaptureSeconds}s Clip`}
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </aside>
       </div>
@@ -588,7 +732,7 @@ export function TimelineView({
       {/* Interactive Multi-Track Scrubber */}
       <section className="panel" aria-label="Interactive multi-camera timeline">
         <div className="timeline-controls-bar">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
             <button
               type="button"
               className="btn btn-icon"
@@ -645,6 +789,14 @@ export function TimelineView({
             >
               Today
             </button>
+
+            {nvrStatus.active && (
+              <span className="chip alert">
+                <span className="timeline-rec-dot" />
+                NVR Live ({nvrStatus.activeCameraCount}/{cameras.length}) ·{' '}
+                {nvrStatus.totalSegmentsCaptured} segs
+              </span>
+            )}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
@@ -722,11 +874,29 @@ export function TimelineView({
         <div className="timeline-grid">
           <div className="timeline-labels-col">
             <div className="timeline-ruler-corner mono">TRACKS</div>
-            {cameraTracks.map((cam) => (
-              <div key={cam.id} className="timeline-track-label" title={cam.name}>
-                <span>{cam.name}</span>
-              </div>
-            ))}
+            {cameraTracks.map((cam) => {
+              const camNvr = nvrStatus.cameras[cam.id]
+              const isCamRecording = camNvr?.state === 'recording'
+              const isCamConnecting =
+                camNvr?.state === 'connecting' || camNvr?.state === 'reconnecting'
+              return (
+                <div key={cam.id} className="timeline-track-label" title={cam.name}>
+                  {isCamRecording && (
+                    <span
+                      className="timeline-rec-dot"
+                      title="Continuously recording live stream"
+                    />
+                  )}
+                  {isCamConnecting && (
+                    <span
+                      className="timeline-rec-dot connecting"
+                      title={`NVR ${camNvr.state}`}
+                    />
+                  )}
+                  <span>{cam.name}</span>
+                </div>
+              )
+            })}
             {showSensors && (
               <div className="timeline-track-label">
                 <span>Ring Sensors</span>
@@ -769,9 +939,26 @@ export function TimelineView({
               const camClips = dayRecordings.filter((r) => r.cameraId === cam.id)
               const camEvents = dayEvents.filter((e) => e.deviceId === cam.id)
               const camPackages = dayPackageHits.filter((p) => p.cameraId === cam.id)
+              const camNvr = nvrStatus.cameras[cam.id]
+              const liveStartMs =
+                camNvr?.state === 'recording' && camNvr.currentSegmentStartedAt
+                  ? new Date(camNvr.currentSegmentStartedAt).getTime()
+                  : null
+              const showLiveBar =
+                liveStartMs !== null &&
+                nowMs >= windowStartMs &&
+                liveStartMs <= windowEndMs
 
               return (
-                <div key={cam.id} className="timeline-lane">
+                <div
+                  key={cam.id}
+                  className="timeline-lane"
+                  onMouseDown={(e) => {
+                    e.stopPropagation()
+                    setDragging(true)
+                    handleTrackPointer(e.clientX, cam.id)
+                  }}
+                >
                   {camClips.map((clip) => {
                     const start = new Date(clip.createdAt).getTime()
                     const end = start + Math.max(15, clip.durationSeconds) * 1000
@@ -807,6 +994,21 @@ export function TimelineView({
                     )
                   })}
 
+                  {showLiveBar && liveStartMs !== null && (
+                    <div
+                      className="timeline-live-recording-bar"
+                      style={{
+                        left: `${Math.max(0, msToPercent(liveStartMs, windowStartMs, windowEndMs))}%`,
+                        width: `${Math.max(
+                          0.8,
+                          Math.min(100, msToPercent(nowMs, windowStartMs, windowEndMs)) -
+                            Math.max(0, msToPercent(liveStartMs, windowStartMs, windowEndMs)),
+                        )}%`,
+                      }}
+                      title={`${cam.name} — Recording live segment now (will appear for playback once segment rotates or stops)`}
+                    />
+                  )}
+
                   {camEvents.map((ev) => {
                     const ts = new Date(ev.timestamp).getTime()
                     if (ts < windowStartMs || ts > windowEndMs) return null
@@ -817,12 +1019,11 @@ export function TimelineView({
                         type="button"
                         className={`timeline-pin pin-${ev.kind}`}
                         style={{ left: `${pct}%` }}
-                        title={`${ev.title} (${formatTimestamp(ev.timestamp)})`}
+                        title={`${ev.title} (${formatTimestamp(ev.timestamp)}) — Click to jump & play`}
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation()
-                          setSelectedEventId(ev.id)
-                          setPlayheadMs(ts)
+                          selectEventPin(ev, cam.id)
                         }}
                       />
                     )
@@ -838,11 +1039,14 @@ export function TimelineView({
                         type="button"
                         className="timeline-pin pin-package-detected"
                         style={{ left: `${pct}%` }}
-                        title={`AI Package (${Math.round(pkg.confidence * 100)}%): ${pkg.summary}`}
+                        title={`AI Package (${Math.round(pkg.confidence * 100)}%): ${pkg.summary} — Click to jump & play`}
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation()
-                          seekToTimestamp(ts, cam.id)
+                          seekToTimestamp(ts, cam.id, {
+                            preRollSeconds: 3,
+                            autoPlay: true,
+                          })
                         }}
                       />
                     )
@@ -864,12 +1068,11 @@ export function TimelineView({
                       type="button"
                       className="timeline-pin pin-sensor"
                       style={{ left: `${pct}%` }}
-                      title={`${ev.title} (${formatTimestamp(ev.timestamp)})`}
+                      title={`${ev.title} (${formatTimestamp(ev.timestamp)}) — Click to jump & play`}
                       onMouseDown={(e) => e.stopPropagation()}
                       onClick={(e) => {
                         e.stopPropagation()
-                        setSelectedEventId(ev.id)
-                        setPlayheadMs(ts)
+                        selectEventPin(ev)
                       }}
                     />
                   )
