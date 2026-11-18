@@ -193,6 +193,117 @@ describe('AiPackageService automation & Vision providers', () => {
 
     service.stop()
   })
+
+  it('auto-migrates retired Gemini 2.5 models, skips thinking parts, and recovers from 404 suggestions', async () => {
+    // Seed a legacy config file with deprecated gemini-2.5-pro
+    fs.writeFileSync(
+      path.join(tmpDir, 'ringwatch-config.json'),
+      JSON.stringify({
+        mode: 'live',
+        packageAi: {
+          enabled: true,
+          provider: 'gemini',
+          geminiModel: 'gemini-2.5-pro',
+        },
+        secretsPlain: { geminiApiKey: 'AIza-mock-gemini' },
+      }),
+      'utf-8',
+    )
+
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    // Automatically migrated on load
+    expect(store.getPublicSettings().packageAi.geminiModel).toBe(
+      'gemini-3.1-pro-preview',
+    )
+
+    // Test runtime 404 self-healing if a future model gets retired
+    store.updateSettings({
+      packageAi: { geminiModel: 'gemini-9.9-retired-preview' },
+    })
+
+    const mockNotifications = {
+      notifyPackageAlert: vi.fn(),
+    } as unknown as NotificationService
+    const service = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: mockNotifications,
+      onDetection: vi.fn(),
+      onSecurityEvent: vi.fn(),
+    })
+    service.attachSnapshotSource({
+      getCameraMeta: (id) => ({ id, name: 'Front Door' }),
+      listCameraIds: () => ['cam-front'],
+      captureSnapshotBase64: async () => ({
+        base64: Buffer.from('fake-jpeg').toString('base64'),
+        dataUrl: 'data:image/jpeg;base64,ZmFrZS1qcGVn',
+      }),
+    })
+
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>
+      expect(headers['x-goog-api-key']).toBe('AIza-mock-gemini')
+      const body = JSON.parse(String(init?.body ?? '{}')) as {
+        generationConfig?: Record<string, unknown>
+      }
+      // Deprecated temperature must not be sent on Gemini 3.x / 4 requests
+      expect(body.generationConfig?.temperature).toBeUndefined()
+
+      if (url.includes('gemini-9.9-retired-preview')) {
+        return {
+          ok: false,
+          status: 404,
+          text: async () =>
+            JSON.stringify({
+              error: {
+                code: 404,
+                message:
+                  'This model models/gemini-9.9-retired-preview is no longer available. Please update your code to use models/gemini-3.1-pro-preview.',
+              },
+            }),
+        }
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { thought: true, text: 'Let me check the welcome mat carefully...' },
+                  {
+                    text: JSON.stringify({
+                      packageDetected: true,
+                      confidence: 0.91,
+                      packageCount: 1,
+                      carrierHint: 'UPS',
+                      placement: 'Front doorstep',
+                      personPresent: false,
+                      summary: 'One UPS parcel visible on the front doorstep.',
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await service.scanCamera('cam-front', 'manual')
+    expect(result.rawError).toBeUndefined()
+    expect(result.packageDetected).toBe(true)
+    expect(result.carrierHint).toBe('UPS')
+    expect(result.model).toBe('gemini-3.1-pro-preview')
+    // Persisted fallback model to configStore
+    expect(store.getPublicSettings().packageAi.geminiModel).toBe(
+      'gemini-3.1-pro-preview',
+    )
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    service.stop()
+  })
 })
 
 describe('RecordingService & StreamService HTTP range playback', () => {

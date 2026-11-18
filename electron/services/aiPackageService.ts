@@ -6,7 +6,7 @@ import type {
   PackageDetectionRecord,
   SecurityEvent,
 } from '../../shared/types'
-import type { ConfigStore } from './configStore'
+import { normalizeGeminiModel, type ConfigStore } from './configStore'
 import type { NotificationService } from './notificationService'
 
 export interface ParsedPackageVisionResult {
@@ -251,23 +251,28 @@ export class AiPackageService {
       let parsed: ParsedPackageVisionResult
       let usedProvider: AiProvider | 'demo-vision' = provider
       let usedModel =
-        provider === 'openai' ? aiCfg.openaiModel : aiCfg.geminiModel
+        provider === 'openai'
+          ? aiCfg.openaiModel
+          : normalizeGeminiModel(aiCfg.geminiModel)
 
       if (apiKey) {
-        parsed =
-          provider === 'openai'
-            ? await this.analyzeWithOpenAI(
-                apiKey,
-                aiCfg.openaiModel,
-                base64,
-                aiCfg.customPromptHint,
-              )
-            : await this.analyzeWithGemini(
-                apiKey,
-                aiCfg.geminiModel,
-                base64,
-                aiCfg.customPromptHint,
-              )
+        if (provider === 'openai') {
+          parsed = await this.analyzeWithOpenAI(
+            apiKey,
+            aiCfg.openaiModel,
+            base64,
+            aiCfg.customPromptHint,
+          )
+        } else {
+          const geminiRes = await this.analyzeWithGemini(
+            apiKey,
+            aiCfg.geminiModel,
+            base64,
+            aiCfg.customPromptHint,
+          )
+          parsed = geminiRes.parsed
+          usedModel = geminiRes.modelUsed
+        }
       } else if (settings.mode === 'demo') {
         usedProvider = 'demo-vision'
         usedModel = 'demo-simulator'
@@ -413,19 +418,19 @@ export class AiPackageService {
           latencyMs: Date.now() - started,
         }
       } else {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(aiCfg.geminiModel)}?key=${encodeURIComponent(apiKey)}`,
+        const res = await this.invokeGeminiGenerateContent(
+          apiKey,
+          aiCfg.geminiModel,
+          {
+            contents: [{ parts: [{ text: 'Reply with OK' }] }],
+          },
         )
-        if (!res.ok) {
-          const text = await res.text()
-          return {
-            ok: false,
-            message: `Gemini API returned HTTP ${res.status}: ${text.slice(0, 160)}`,
-          }
-        }
         return {
           ok: true,
-          message: `Google Gemini Vision ready (${aiCfg.geminiModel})`,
+          message:
+            res.modelUsed !== aiCfg.geminiModel
+              ? `Google Gemini Vision ready (auto-upgraded to ${res.modelUsed})`
+              : `Google Gemini Vision ready (${res.modelUsed})`,
           latencyMs: Date.now() - started,
         }
       }
@@ -503,21 +508,133 @@ export class AiPackageService {
     return parseVisionResponse(content)
   }
 
+  private extractSuggestedGeminiModel(errText: string, failedModel: string): string | null {
+    const matches = errText.matchAll(/models\/([a-z0-9][a-z0-9._-]+)/gi)
+    const failedLower = failedModel.toLowerCase()
+    for (const match of matches) {
+      const candidate = match[1]?.trim().replace(/[.,;:]+$/, '')
+      if (candidate && candidate.toLowerCase() !== failedLower) {
+        return candidate
+      }
+    }
+    return null
+  }
+
+  private extractGeminiText(json: {
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{ text?: string; thought?: boolean }>
+      }
+    }>
+  }): string | null {
+    const parts = json.candidates?.[0]?.content?.parts
+    if (!Array.isArray(parts) || parts.length === 0) return null
+
+    // Gemini 3.x / 4 thinking models may emit thought parts before the JSON answer
+    const answerParts = parts
+      .filter((p) => !p.thought && typeof p.text === 'string' && p.text.trim())
+      .map((p) => p.text!.trim())
+    if (answerParts.length > 0) {
+      return answerParts.join('\n')
+    }
+
+    // Fallback: last text part if all parts lacked a non-thought text block
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (typeof parts[i]?.text === 'string' && parts[i].text!.trim()) {
+        return parts[i].text!.trim()
+      }
+    }
+    return null
+  }
+
+  private async invokeGeminiGenerateContent(
+    apiKey: string,
+    requestedModel: string,
+    payload: Record<string, unknown>,
+  ): Promise<{
+    json: {
+      candidates?: Array<{
+        content?: {
+          parts?: Array<{ text?: string; thought?: boolean }>
+        }
+      }>
+    }
+    modelUsed: string
+  }> {
+    const normalized = normalizeGeminiModel(requestedModel)
+    const fallbackQueue: string[] = [
+      normalized,
+      'gemini-3.5-flash-lite',
+      'gemini-3-flash-preview',
+      'gemini-3.1-pro-preview',
+    ]
+    const tried = new Set<string>()
+    let lastError = 'Gemini API request failed'
+
+    while (fallbackQueue.length > 0) {
+      const candidateModel = fallbackQueue.shift()!
+      if (tried.has(candidateModel.toLowerCase())) continue
+      tried.add(candidateModel.toLowerCase())
+
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(candidateModel)}:generateContent`
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify(payload),
+      })
+
+      if (response.ok) {
+        const json = (await response.json()) as {
+          candidates?: Array<{
+            content?: {
+              parts?: Array<{ text?: string; thought?: boolean }>
+            }
+          }>
+        }
+        // Persist migrated / fallback model so future scans succeed on the first attempt
+        if (candidateModel !== requestedModel) {
+          this.configStore.updateSettings({
+            packageAi: { geminiModel: candidateModel },
+          })
+        }
+        return { json, modelUsed: candidateModel }
+      }
+
+      const errText = await response.text()
+      lastError = `Gemini HTTP ${response.status} (${candidateModel}): ${errText.slice(0, 220)}`
+
+      if (response.status === 404) {
+        const suggested = this.extractSuggestedGeminiModel(errText, candidateModel)
+        if (suggested && !tried.has(suggested.toLowerCase())) {
+          fallbackQueue.unshift(suggested)
+        }
+        continue
+      }
+
+      // Non-404 errors (e.g., 401/403 invalid key, 429 quota) should fail fast
+      throw new Error(lastError)
+    }
+
+    throw new Error(lastError)
+  }
+
   private async analyzeWithGemini(
     apiKey: string,
     model: string,
     jpegBase64: string,
     customHint: string,
-  ): Promise<ParsedPackageVisionResult> {
+  ): Promise<{ parsed: ParsedPackageVisionResult; modelUsed: string }> {
     const userPrompt = customHint.trim()
       ? `${SYSTEM_PROMPT}\n\nAdditional context: ${customHint.trim()}`
       : SYSTEM_PROMPT
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const { json, modelUsed } = await this.invokeGeminiGenerateContent(
+      apiKey,
+      model,
+      {
         contents: [
           {
             parts: [
@@ -532,27 +649,16 @@ export class AiPackageService {
           },
         ],
         generationConfig: {
-          temperature: 0.1,
           responseMimeType: 'application/json',
         },
-      }),
-    })
+      },
+    )
 
-    if (!response.ok) {
-      const errText = await response.text()
-      throw new Error(`Gemini HTTP ${response.status}: ${errText.slice(0, 220)}`)
-    }
-
-    const json = (await response.json()) as {
-      candidates?: Array<{
-        content?: { parts?: Array<{ text?: string }> }
-      }>
-    }
-    const content = json.candidates?.[0]?.content?.parts?.[0]?.text
+    const content = this.extractGeminiText(json)
     if (!content) {
-      throw new Error('Gemini returned an empty vision response')
+      throw new Error(`Gemini (${modelUsed}) returned an empty vision response`)
     }
-    return parseVisionResponse(content)
+    return { parsed: parseVisionResponse(content), modelUsed }
   }
 
   private simulateDemoVision(

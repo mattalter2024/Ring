@@ -311,7 +311,7 @@ export function SettingsView({
                 }
               >
                 <option value="openai">OpenAI Vision (GPT-4o / 4.1)</option>
-                <option value="gemini">Google Gemini Vision (2.5 / 2.0 Flash)</option>
+                <option value="gemini">Google Gemini Vision (Gemini 3 / 4)</option>
               </select>
             </div>
 
@@ -389,13 +389,30 @@ export function SettingsView({
                       })
                     }
                   >
-                    <option value="gemini-2.5-flash">
-                      gemini-2.5-flash (Recommended)
+                    <option value="gemini-3.5-flash-lite">
+                      gemini-3.5-flash-lite (Recommended — Fast &amp; low cost)
                     </option>
-                    <option value="gemini-2.0-flash">gemini-2.0-flash</option>
-                    <option value="gemini-2.5-pro">
-                      gemini-2.5-pro (Highest precision)
+                    <option value="gemini-3-flash-preview">
+                      gemini-3-flash-preview (Balanced speed &amp; accuracy)
                     </option>
+                    <option value="gemini-3.8-flash">
+                      gemini-3.8-flash (High-intelligence Flash)
+                    </option>
+                    <option value="gemini-3.1-pro-preview">
+                      gemini-3.1-pro-preview (Highest precision)
+                    </option>
+                    <option value="gemini-4-hydrogen">
+                      gemini-4-hydrogen (Next-gen fast multimodal)
+                    </option>
+                    {![
+                      'gemini-3.5-flash-lite',
+                      'gemini-3-flash-preview',
+                      'gemini-3.8-flash',
+                      'gemini-3.1-pro-preview',
+                      'gemini-4-hydrogen',
+                    ].includes(ai.geminiModel) && (
+                      <option value={ai.geminiModel}>{ai.geminiModel}</option>
+                    )}
                   </select>
                 </div>
 

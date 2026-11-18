@@ -41,11 +41,33 @@ export interface SecretCryptoAdapter {
   decryptString(value: Buffer): string
 }
 
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite'
+
+const DEPRECATED_GEMINI_MODELS: Record<string, string> = {
+  'gemini-2.5-pro': 'gemini-3.1-pro-preview',
+  'gemini-2.5-pro-preview-06-05': 'gemini-3.1-pro-preview',
+  'gemini-2.5-pro-preview-05-06': 'gemini-3.1-pro-preview',
+  'gemini-2.5-flash': 'gemini-3.5-flash-lite',
+  'gemini-2.5-flash-preview-09-2025': 'gemini-3.5-flash-lite',
+  'gemini-2.0-flash': 'gemini-3.5-flash-lite',
+  'gemini-2.0-flash-exp': 'gemini-3.5-flash-lite',
+  'gemini-1.5-pro': 'gemini-3.1-pro-preview',
+  'gemini-1.5-flash': 'gemini-3.5-flash-lite',
+  'gemini-3-pro-preview': 'gemini-3.1-pro-preview',
+  'gemini-3.1-flash-lite-preview': 'gemini-3.5-flash-lite',
+}
+
+export function normalizeGeminiModel(model?: string): string {
+  const cleaned = (model ?? '').trim().replace(/^models\//i, '')
+  if (!cleaned) return DEFAULT_GEMINI_MODEL
+  return DEPRECATED_GEMINI_MODELS[cleaned.toLowerCase()] ?? cleaned
+}
+
 const DEFAULT_PACKAGE_AI: Omit<PackageAiConfig, 'hasOpenaiKey' | 'hasGeminiKey'> = {
   enabled: true,
   provider: 'openai',
   openaiModel: 'gpt-4o-mini',
-  geminiModel: 'gemini-2.5-flash',
+  geminiModel: DEFAULT_GEMINI_MODEL,
   monitoredCameraIds: [],
   triggerOnMotion: true,
   triggerOnDoorbell: true,
@@ -115,6 +137,7 @@ export class ConfigStore {
         packageAi: {
           ...DEFAULT_PACKAGE_AI,
           ...(parsed.packageAi ?? {}),
+          geminiModel: normalizeGeminiModel(parsed.packageAi?.geminiModel),
         },
       }
       this.secrets = this.readSecrets(parsed)
@@ -269,7 +292,9 @@ export class ConfigStore {
       if (ai.enabled !== undefined) this.data.packageAi.enabled = ai.enabled
       if (ai.provider !== undefined) this.data.packageAi.provider = ai.provider
       if (ai.openaiModel !== undefined) this.data.packageAi.openaiModel = ai.openaiModel
-      if (ai.geminiModel !== undefined) this.data.packageAi.geminiModel = ai.geminiModel
+      if (ai.geminiModel !== undefined) {
+        this.data.packageAi.geminiModel = normalizeGeminiModel(ai.geminiModel)
+      }
       if (ai.monitoredCameraIds !== undefined) {
         this.data.packageAi.monitoredCameraIds = [...ai.monitoredCameraIds]
       }

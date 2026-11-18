@@ -50,7 +50,7 @@ const DEFAULT_SETTINGS: AppSettings = {
     enabled: true,
     provider: 'openai',
     openaiModel: 'gpt-4o-mini',
-    geminiModel: 'gemini-2.5-flash',
+    geminiModel: 'gemini-3.5-flash-lite',
     hasOpenaiKey: false,
     hasGeminiKey: false,
     monitoredCameraIds: [],
