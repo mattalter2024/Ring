@@ -59,6 +59,12 @@ describe('ConfigStore', () => {
     expect(reloaded.getOpenaiApiKey()).toBe('sk-test-openai')
     expect(reloaded.getGeminiApiKey()).toBe('AIza-test-gemini')
     expect(reloaded.getPublicSettings().packageAi.provider).toBe('gemini')
+
+    // Confirm ringSystemId is generated once and persisted across restarts
+    const sysId1 = reloaded.getRingSystemId()
+    expect(sysId1).toMatch(/^[0-9a-f-]{36}$/i)
+    const reloadedAgain = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'), mockDpapi)
+    expect(reloadedAgain.getRingSystemId()).toBe(sysId1)
   })
 })
 

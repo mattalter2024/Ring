@@ -335,6 +335,7 @@ export interface RingWatchApi {
   chooseRecordingsFolder: () => Promise<string | null>
 
   onConnectionChanged: (cb: (status: ConnectionStatus) => void) => () => void
+  onSettingsUpdated: (cb: (settings: AppSettings) => void) => () => void
   onCamerasUpdated: (cb: (cameras: RingCameraInfo[]) => void) => () => void
   onSensorsUpdated: (cb: (sensors: RingSensorInfo[]) => void) => () => void
   onLocationsUpdated: (cb: (locations: RingLocationInfo[]) => void) => () => void

@@ -132,12 +132,29 @@ export function SettingsView({
             }}
           >
             <div>
-              <div style={{ fontWeight: 600, fontSize: 13 }}>
-                {connection.mode === 'live' && connection.connected
-                  ? connection.accountLabel ?? 'Ring Account Active'
+              <div
+                style={{
+                  fontWeight: 600,
+                  fontSize: 13,
+                  color:
+                    connection.mode === 'live' && !connection.connected
+                      ? '#fca5a5'
+                      : undefined,
+                }}
+              >
+                {connection.mode === 'live'
+                  ? connection.connected
+                    ? `${connection.accountLabel ?? 'Ring Account Active'} (${connection.cameraCount} camera(s), ${connection.sensorCount} sensor(s))`
+                    : 'Live Ring Disconnected — Action Needed'
                   : 'Demo Mode Active (3 simulated cameras, 5 sensors)'}
               </div>
-              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              <div
+                style={{
+                  fontSize: 12,
+                  color: connection.error ? '#fca5a5' : 'var(--text-muted)',
+                  wordBreak: 'break-word',
+                }}
+              >
                 {connection.error
                   ? connection.error
                   : 'Refresh tokens are encrypted locally via Windows DPAPI safeStorage and auto-rotated.'}

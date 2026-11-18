@@ -27,20 +27,33 @@ export function LiveVideoPlayer({ camera, session }: LiveVideoPlayerProps) {
     let hls: Hls | null = null
 
     if (Hls.isSupported()) {
+      let recoveryAttempts = 0
       hls = new Hls({
-        lowLatencyMode: true,
+        lowLatencyMode: false,
         liveSyncDurationCount: 2,
-        enableWorker: true,
+        liveMaxLatencyDurationCount: 5,
+        enableWorker: false,
       })
       hls.loadSource(session.streamUrl)
       hls.attachMedia(video)
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        recoveryAttempts = 0
         void video.play().catch(() => {})
       })
       hls.on(Hls.Events.ERROR, (_ev, data) => {
-        if (data.fatal) {
-          setStreamError(`HLS playback interrupted (${data.details})`)
+        if (!data.fatal || !hls) return
+        if (recoveryAttempts < 3) {
+          recoveryAttempts += 1
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            hls.startLoad()
+            return
+          }
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError()
+            return
+          }
         }
+        setStreamError(`HLS playback interrupted (${data.details})`)
       })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = session.streamUrl

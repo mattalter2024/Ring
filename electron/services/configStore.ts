@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import type {
   AppSettings,
   AppSettingsPatch,
@@ -14,6 +15,7 @@ interface StoredSecrets {
 
 interface PersistedConfigFile {
   mode: AppSettings['mode']
+  ringSystemId?: string
   recordingsDir: string
   defaultCaptureSeconds: number
   autoRecordOnMotion: boolean
@@ -142,6 +144,7 @@ export class ConfigStore {
   private persist(): void {
     const payload: PersistedConfigFile = {
       mode: this.data.mode,
+      ringSystemId: this.data.ringSystemId,
       recordingsDir: this.data.recordingsDir,
       defaultCaptureSeconds: this.data.defaultCaptureSeconds,
       autoRecordOnMotion: this.data.autoRecordOnMotion,
@@ -275,6 +278,14 @@ export class ConfigStore {
 
     this.persist()
     return this.getPublicSettings()
+  }
+
+  getRingSystemId(): string {
+    if (!this.data.ringSystemId) {
+      this.data.ringSystemId = crypto.randomUUID()
+      this.persist()
+    }
+    return this.data.ringSystemId
   }
 
   getRingRefreshToken(): string | undefined {

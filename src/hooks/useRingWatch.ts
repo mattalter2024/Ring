@@ -331,6 +331,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
 
     const unsubs = [
       api.onConnectionChanged((status) => setConnection(status)),
+      api.onSettingsUpdated((nextSettings) => setSettings(nextSettings)),
       api.onLocationsUpdated((locs) => setLocations(locs)),
       api.onCamerasUpdated((cams) => setCameras(cams)),
       api.onSensorsUpdated((sens) => setSensors(sens)),

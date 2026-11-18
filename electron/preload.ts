@@ -86,6 +86,8 @@ const api: RingWatchApi = {
 
   onConnectionChanged: (cb: (status: ConnectionStatus) => void) =>
     subscribe('ringwatch:connection-changed', cb),
+  onSettingsUpdated: (cb: (settings: import('../shared/types').AppSettings) => void) =>
+    subscribe('ringwatch:settings-updated', cb),
   onCamerasUpdated: (cb: (cameras: RingCameraInfo[]) => void) =>
     subscribe('ringwatch:cameras-updated', cb),
   onSensorsUpdated: (cb: (sensors: RingSensorInfo[]) => void) =>

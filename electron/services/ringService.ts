@@ -1,10 +1,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { pathToFileURL } from 'node:url'
 import type { Subscription } from 'rxjs'
 import type {
   AlarmMode,
   AppMode,
+  AppSettings,
   CloudRecordingItem,
   ConnectionStatus,
   LiveStreamSession,
@@ -29,14 +31,29 @@ type RingCameraInstance = Awaited<ReturnType<RingApiInstance['getCameras']>>[num
 type RingLocationInstance = Awaited<ReturnType<RingApiInstance['getLocations']>>[number]
 type RingDeviceInstance = Awaited<ReturnType<RingLocationInstance['getDevices']>>[number]
 
-// Load ESM-only ring-client-api cleanly from CommonJS Electron main
-const importRingClientApi = (): Promise<RingClientApiModule> =>
-  (Function('return import("ring-client-api")')() as Promise<RingClientApiModule>)
+// Load ESM-only ring-client-api reliably from CommonJS Electron main & app.asar
+const dynamicImport = new Function(
+  'specifier',
+  'return import(specifier)',
+) as (specifier: string) => Promise<unknown>
 
-const importRingRestClient = (): Promise<RingRestClientModule> =>
-  (Function(
-    'return import("ring-client-api/rest-client")',
-  )() as Promise<RingRestClientModule>)
+const importRingClientApi = async (): Promise<RingClientApiModule> => {
+  try {
+    const resolved = require.resolve('ring-client-api')
+    return (await dynamicImport(pathToFileURL(resolved).href)) as RingClientApiModule
+  } catch {
+    return (await dynamicImport('ring-client-api')) as RingClientApiModule
+  }
+}
+
+const importRingRestClient = async (): Promise<RingRestClientModule> => {
+  try {
+    const resolved = require.resolve('ring-client-api/rest-client')
+    return (await dynamicImport(pathToFileURL(resolved).href)) as RingRestClientModule
+  } catch {
+    return (await dynamicImport('ring-client-api/rest-client')) as RingRestClientModule
+  }
+}
 
 function classifySensorCategory(deviceType: string): SensorCategory {
   const dt = deviceType.toLowerCase()
@@ -69,6 +86,7 @@ function deriveSensorStatusLabel(
 
 export interface RingServiceCallbacks {
   onConnectionChanged: (status: ConnectionStatus) => void
+  onSettingsUpdated?: (settings: AppSettings) => void
   onCamerasUpdated: (cameras: RingCameraInfo[]) => void
   onSensorsUpdated: (sensors: RingSensorInfo[]) => void
   onLocationsUpdated: (locations: RingLocationInfo[]) => void
@@ -90,6 +108,7 @@ export class RingService implements SnapshotSource {
   private subscriptions: Subscription[] = []
   private liveCamerasById = new Map<string, RingCameraInstance>()
   private liveLocationsById = new Map<string, RingLocationInstance>()
+  private boundSensorZids = new Set<string>()
   private recordingCameraIds = new Set<string>()
   private snapshotCache = new Map<string, { dataUrl: string; capturedAt: string }>()
 
@@ -197,6 +216,7 @@ export class RingService implements SnapshotSource {
     }
     this.liveCamerasById.clear()
     this.liveLocationsById.clear()
+    this.boundSensorZids.clear()
   }
 
   private readDemoImageDataUrl(filename: string): string {
@@ -473,6 +493,10 @@ export class RingService implements SnapshotSource {
     }
     const token = this.configStore.getRingRefreshToken()
     if (!token) {
+      this.clearLiveSubscriptions()
+      this.locations = []
+      this.cameras = []
+      this.sensors = []
       this.connection = {
         connected: false,
         mode: 'live',
@@ -482,7 +506,7 @@ export class RingService implements SnapshotSource {
         error: 'Sign in with your Ring account or paste a Ring refresh token in Settings.',
       }
       this.configStore.updateSettings({ mode: 'live' })
-      this.callbacks.onConnectionChanged(this.getConnection())
+      this.emitAllState()
       return this.getConnection()
     }
     return this.connectWithToken(token)
@@ -500,6 +524,7 @@ export class RingService implements SnapshotSource {
         this.pendingAuthClient = new RingRestClient({
           email: params.email.trim(),
           password: params.password,
+          systemId: this.configStore.getRingSystemId(),
           controlCenterDisplayName: 'RingWatch Windows',
         })
       }
@@ -511,6 +536,15 @@ export class RingService implements SnapshotSource {
         if (auth.refresh_token) {
           this.pendingAuthClient = null
           const connection = await this.connectWithToken(auth.refresh_token)
+          if (!connection.connected) {
+            return {
+              status: 'error',
+              error:
+                connection.error ??
+                'Signed in to Ring, but failed to load your cameras and devices.',
+              connection,
+            }
+          }
           return { status: 'authenticated', connection }
         }
         return {
@@ -546,20 +580,28 @@ export class RingService implements SnapshotSource {
       throw new Error('Refresh token cannot be empty')
     }
 
+    // Clear any Demo Mode devices immediately so stale demo cards never persist in Live Mode
+    this.locations = []
+    this.cameras = []
+    this.sensors = []
+
     try {
       const { RingApi } = await importRingClientApi()
-      const settings = this.configStore.getPublicSettings()
+      const ffmpegPath = this.recordingService.resolveFfmpegBinary()
+      const systemId = this.configStore.getRingSystemId()
       const api = new RingApi({
         refreshToken: trimmed,
+        systemId,
         controlCenterDisplayName: 'RingWatch Windows',
         cameraStatusPollingSeconds: 20,
         locationModePollingSeconds: 30,
-        ffmpegPath: settings.ffmpegPath || undefined,
+        ffmpegPath,
       })
 
       this.ringApi = api
       this.configStore.setRingRefreshToken(trimmed)
       this.configStore.updateSettings({ mode: 'live' })
+      this.callbacks.onSettingsUpdated?.(this.configStore.getPublicSettings())
 
       const tokenSub = api.onRefreshTokenUpdated.subscribe(({ newRefreshToken }) => {
         if (newRefreshToken) {
@@ -572,6 +614,9 @@ export class RingService implements SnapshotSource {
       return this.getConnection()
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      this.locations = []
+      this.cameras = []
+      this.sensors = []
       this.connection = {
         connected: false,
         mode: 'live',
@@ -580,7 +625,17 @@ export class RingService implements SnapshotSource {
         sensorCount: 0,
         error: message,
       }
-      this.callbacks.onConnectionChanged(this.getConnection())
+      this.pushEvent({
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        sourceType: 'system',
+        deviceName: 'Ring Cloud',
+        kind: 'info',
+        title: 'Ring Connection Error',
+        detail: message,
+        severity: 'alert',
+      })
+      this.emitAllState()
       return this.getConnection()
     }
   }
@@ -588,6 +643,51 @@ export class RingService implements SnapshotSource {
   async disconnectRing(): Promise<ConnectionStatus> {
     this.configStore.setRingRefreshToken(null)
     return this.activateDemoMode()
+  }
+
+  private upsertLocationSensors(
+    loc: RingLocationInstance,
+    devices: RingDeviceInstance[],
+  ): void {
+    const mappedForLoc: RingSensorInfo[] = []
+    let detectedAlarmMode: AlarmMode | null = null
+
+    for (const dev of devices) {
+      const mapped = this.mapLiveSensor(dev, loc.id, loc.name)
+      mappedForLoc.push(mapped)
+
+      const rawData = dev.data as unknown as Record<string, unknown>
+      if (
+        String(dev.deviceType) === 'security-panel' &&
+        typeof rawData.mode === 'string' &&
+        (rawData.mode === 'none' || rawData.mode === 'some' || rawData.mode === 'all')
+      ) {
+        detectedAlarmMode = rawData.mode
+      }
+
+      if (!this.boundSensorZids.has(dev.zid)) {
+        this.boundSensorZids.add(dev.zid)
+        this.bindSensorSubscription(dev, loc.id, loc.name)
+      }
+    }
+
+    const otherLocSensors = this.sensors.filter((s) => s.locationId !== loc.id)
+    this.sensors = [...otherLocSensors, ...mappedForLoc]
+
+    if (detectedAlarmMode) {
+      this.locations = this.locations.map((l) =>
+        l.id === loc.id ? { ...l, alarmMode: detectedAlarmMode! } : l,
+      )
+      this.callbacks.onLocationsUpdated(this.getLocations())
+    }
+
+    this.connection = {
+      ...this.connection,
+      sensorCount: this.sensors.length,
+      lastSyncAt: new Date().toISOString(),
+    }
+    this.callbacks.onSensorsUpdated(this.getSensors())
+    this.callbacks.onConnectionChanged(this.getConnection())
   }
 
   private async syncLiveRingAccount(api: RingApiInstance): Promise<void> {
@@ -603,28 +703,20 @@ export class RingService implements SnapshotSource {
     const rawLocations = await api.getLocations()
     this.liveLocationsById.clear()
     this.liveCamerasById.clear()
+    this.boundSensorZids.clear()
 
     const nextLocations: RingLocationInfo[] = []
     const nextCameras: RingCameraInfo[] = []
-    const nextSensors: RingSensorInfo[] = []
+    const hubLocations: RingLocationInstance[] = []
 
     for (const loc of rawLocations) {
       this.liveLocationsById.set(loc.id, loc)
-
-      let alarmMode: AlarmMode = 'unknown'
-      if (loc.hasAlarmBaseStation) {
-        try {
-          alarmMode = (await loc.getAlarmMode()) as AlarmMode
-        } catch {
-          alarmMode = 'unknown'
-        }
-      }
 
       nextLocations.push({
         id: loc.id,
         name: loc.name,
         hasAlarm: loc.hasAlarmBaseStation,
-        alarmMode,
+        alarmMode: 'unknown',
       })
 
       for (const cam of loc.cameras) {
@@ -635,30 +727,62 @@ export class RingService implements SnapshotSource {
       }
 
       if (loc.hasHubs || loc.hasAlarmBaseStation) {
-        try {
-          const devices = await loc.getDevices()
-          for (const dev of devices) {
-            const mapped = this.mapLiveSensor(dev, loc.id, loc.name)
-            nextSensors.push(mapped)
-            this.bindSensorSubscription(dev, loc.id, loc.name)
-          }
-        } catch {
-          // Location may not expose websocket alarm devices
-        }
+        hubLocations.push(loc)
       }
     }
 
+    // Publish locations & cameras immediately so UI is responsive even if an Alarm hub WebSocket is slow
     this.locations = nextLocations
     this.cameras = nextCameras
-    this.sensors = nextSensors
+    this.sensors = []
     this.connection = {
       connected: true,
       mode: 'live',
       accountLabel,
       locationCount: nextLocations.length,
       cameraCount: nextCameras.length,
-      sensorCount: nextSensors.length,
+      sensorCount: 0,
       lastSyncAt: new Date().toISOString(),
+    }
+    this.emitAllState()
+
+    // Subscribe reactively to hub/alarm sensor device lists and wait up to 12s for initial load
+    if (hubLocations.length > 0) {
+      await Promise.allSettled(
+        hubLocations.map(async (loc) => {
+          this.subscriptions.push(
+            loc.onDevices.subscribe((devices) => {
+              this.upsertLocationSensors(loc, devices)
+            }),
+          )
+
+          try {
+            const devices = await Promise.race([
+              loc.getDevices(),
+              new Promise<RingDeviceInstance[]>((_, reject) =>
+                setTimeout(
+                  () => reject(new Error(`Timed out loading sensors for ${loc.name}`)),
+                  12000,
+                ),
+              ),
+            ])
+            this.upsertLocationSensors(loc, devices)
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            this.pushEvent({
+              id: crypto.randomUUID(),
+              timestamp: new Date().toISOString(),
+              sourceType: 'sensor',
+              deviceId: loc.id,
+              deviceName: loc.name,
+              kind: 'info',
+              title: `Hub Sensor Sync Pending — ${loc.name}`,
+              detail: `${msg}. RingWatch will continue listening in the background.`,
+              severity: 'warning',
+            })
+          }
+        }),
+      )
     }
 
     this.pushEvent({
@@ -668,7 +792,7 @@ export class RingService implements SnapshotSource {
       deviceName: 'Ring Cloud',
       kind: 'info',
       title: 'Connected to Ring Account',
-      detail: `Loaded ${nextCameras.length} camera(s) and ${nextSensors.length} sensor/device(s) across ${nextLocations.length} location(s).`,
+      detail: `Loaded ${this.cameras.length} camera(s) and ${this.sensors.length} sensor/device(s) across ${this.locations.length} location(s).`,
       severity: 'success',
     })
 
@@ -1315,6 +1439,7 @@ export class RingService implements SnapshotSource {
 
   private emitAllState(): void {
     this.callbacks.onConnectionChanged(this.getConnection())
+    this.callbacks.onSettingsUpdated?.(this.configStore.getPublicSettings())
     this.callbacks.onLocationsUpdated(this.getLocations())
     this.callbacks.onCamerasUpdated(this.getCameras())
     this.callbacks.onSensorsUpdated(this.getSensors())

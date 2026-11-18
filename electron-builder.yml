@@ -10,6 +10,11 @@ files:
   - build/icon.png
   - build/icon.ico
   - package.json
+  - "!node_modules/ffmpeg-for-homebridge/.build/**"
+  - from: node_modules/@shinyoshiaki/binary-data/src/node_modules
+    to: node_modules/@shinyoshiaki/binary-data/src/node_modules
+    filter:
+      - "**/*"
 asarUnpack:
   - "**/ffmpeg-for-homebridge/**"
 win:

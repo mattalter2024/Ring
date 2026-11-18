@@ -448,6 +448,8 @@ if (!singleInstanceLock) {
       callbacks: {
         onConnectionChanged: (status) =>
           sendToRenderer('ringwatch:connection-changed', status),
+        onSettingsUpdated: (settings) =>
+          sendToRenderer('ringwatch:settings-updated', settings),
         onCamerasUpdated: (cameras) =>
           sendToRenderer('ringwatch:cameras-updated', cameras),
         onSensorsUpdated: (sensors) =>

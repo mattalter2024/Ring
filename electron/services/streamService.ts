@@ -103,7 +103,12 @@ export class StreamService {
         'Content-Type': contentType,
         'Cache-Control': 'no-store, no-cache, must-revalidate',
       })
-      fs.createReadStream(fullPath).pipe(res)
+      const stream = fs.createReadStream(fullPath)
+      stream.on('error', () => {
+        if (!res.headersSent) res.writeHead(404)
+        res.end()
+      })
+      stream.pipe(res)
       return
     }
 
@@ -155,14 +160,18 @@ export class StreamService {
         'Content-Length': end - start + 1,
         'Content-Type': 'video/mp4',
       })
-      fs.createReadStream(filePath, { start, end }).pipe(res)
+      const stream = fs.createReadStream(filePath, { start, end })
+      stream.on('error', () => res.end())
+      stream.pipe(res)
     } else {
       res.writeHead(200, {
         'Content-Length': fileSize,
         'Content-Type': 'video/mp4',
         'Accept-Ranges': 'bytes',
       })
-      fs.createReadStream(filePath).pipe(res)
+      const stream = fs.createReadStream(filePath)
+      stream.on('error', () => res.end())
+      stream.pipe(res)
     }
   }
 
@@ -190,14 +199,14 @@ export class StreamService {
     fs.mkdirSync(dirPath, { recursive: true })
 
     const playlistPath = path.join(dirPath, 'index.m3u8')
-    const segmentPattern = path.join(dirPath, 'seg_%05d.ts')
+    // Use forward slashes for FFmpeg HLS muxer on Windows so relative segment URIs stay clean
+    const ffmpegPlaylistPath = playlistPath.replace(/\\/g, '/')
+    const ffmpegSegmentPattern = path.join(dirPath, 'seg_%05d.ts').replace(/\\/g, '/')
 
     const call = await camera.streamVideo({
       video: ['-vcodec', 'copy'],
       audio: ['-acodec', 'aac', '-b:a', '96k'],
       output: [
-        '-flags',
-        '+cgop',
         '-f',
         'hls',
         '-hls_time',
@@ -205,10 +214,10 @@ export class StreamService {
         '-hls_list_size',
         '6',
         '-hls_flags',
-        'delete_segments+append_list',
+        'delete_segments+append_list+temp_file',
         '-hls_segment_filename',
-        segmentPattern,
-        playlistPath,
+        ffmpegSegmentPattern,
+        ffmpegPlaylistPath,
       ],
     })
 
@@ -245,16 +254,32 @@ export class StreamService {
       cleanup()
     })
 
-    // Wait up to 9s for FFmpeg to produce the initial HLS manifest
-    const deadline = Date.now() + 9000
+    // Wait up to 18s for FFmpeg to produce an HLS manifest containing at least one .ts segment
+    const deadline = Date.now() + 18000
+    let ready = false
     while (Date.now() < deadline) {
-      if (fs.existsSync(playlistPath) && fs.statSync(playlistPath).size > 20) {
-        break
+      if (fs.existsSync(playlistPath)) {
+        try {
+          const manifest = fs.readFileSync(playlistPath, 'utf-8')
+          if (manifest.includes('.ts')) {
+            ready = true
+            break
+          }
+        } catch {
+          // Playlist mid-rename; retry on next tick
+        }
       }
       if (!this.activeStreams.has(cameraId)) {
-        throw new Error('Live stream ended before video frames were received')
+        throw new Error('Live stream ended before video frames were received from Ring')
       }
       await new Promise((r) => setTimeout(r, 250))
+    }
+
+    if (!ready) {
+      cleanup()
+      throw new Error(
+        'Timed out waiting for Ring video frames (18s). Check camera signal or Ring Live View settings.',
+      )
     }
 
     return session

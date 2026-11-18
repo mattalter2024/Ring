@@ -422,9 +422,17 @@ export function App() {
       }
     }
     const res = await api.loginWithCredentials(params)
-    if (res.status === 'authenticated' && res.connection) {
+    if (res.connection) {
       setConnection(res.connection)
-      pushToast('Ring Connected', res.connection.accountLabel ?? 'Connected to Ring.', 'ok')
+    }
+    if (res.status === 'authenticated' && res.connection?.connected) {
+      pushToast(
+        'Ring Connected',
+        `${res.connection.accountLabel ?? 'Connected to Ring'} · ${res.connection.cameraCount} camera(s), ${res.connection.sensorCount} sensor(s).`,
+        'ok',
+      )
+    } else if (res.status === 'error' && res.error) {
+      pushToast('Ring Connection Failed', res.error, 'err')
     }
     return res
   }
@@ -434,7 +442,11 @@ export function App() {
     const status = await api.connectWithToken(token)
     setConnection(status)
     if (status.connected) {
-      pushToast('Ring Connected', status.accountLabel ?? 'Connected via token.', 'ok')
+      pushToast(
+        'Ring Connected',
+        `${status.accountLabel ?? 'Connected via token'} · ${status.cameraCount} camera(s), ${status.sensorCount} sensor(s).`,
+        'ok',
+      )
     } else if (status.error) {
       pushToast('Connection Failed', status.error, 'err')
     }

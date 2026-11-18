@@ -522,14 +522,16 @@ export class RecordingService {
     return this.listRecordings()
   }
 
-  private resolveFfmpegBinary(): string {
+  resolveFfmpegBinary(): string {
     const custom = this.configStore.getPublicSettings().ffmpegPath
     if (custom) return custom
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const bundled = require('ffmpeg-for-homebridge') as string | undefined
       if (bundled && typeof bundled === 'string') {
-        const unpacked = bundled.replace('app.asar', 'app.asar.unpacked')
+        const unpacked = bundled.includes('app.asar.unpacked')
+          ? bundled
+          : bundled.replace('app.asar', 'app.asar.unpacked')
         if (fs.existsSync(unpacked)) return unpacked
         if (fs.existsSync(bundled)) return bundled
       }
