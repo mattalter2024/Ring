@@ -21,8 +21,8 @@ win:
       arch:
         - x64
   icon: build/icon.ico
-  artifactName: "${productName}-${version}-win-${arch}.${ext}"
 nsis:
+  artifactName: "${productName}-Setup-${version}-win-${arch}.${ext}"
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
@@ -30,3 +30,5 @@ nsis:
   shortcutName: RingWatch
   installerIcon: build/icon.ico
   uninstallerIcon: build/icon.ico
+portable:
+  artifactName: "${productName}-Portable-${version}-win-${arch}.${ext}"

@@ -13,8 +13,8 @@
     "build:renderer": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "npm run build:renderer && npm run build:electron",
-    "build:win": "npm run build && electron-builder --win",
-    "build:win:portable": "npm run build && electron-builder --win portable",
+    "build:win": "npm run build && electron-builder --win --publish never",
+    "build:win:portable": "npm run build && electron-builder --win portable --publish never",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.electron.json --noEmit",
     "test": "vitest run"
   },
