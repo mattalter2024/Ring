@@ -1,0 +1,32 @@
+appId: com.ringwatch.desktop
+productName: RingWatch
+copyright: Copyright © 2026 RingWatch
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - build/icon.png
+  - build/icon.ico
+  - package.json
+asarUnpack:
+  - "**/ffmpeg-for-homebridge/**"
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  icon: build/icon.ico
+  artifactName: "${productName}-${version}-win-${arch}.${ext}"
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: RingWatch
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
