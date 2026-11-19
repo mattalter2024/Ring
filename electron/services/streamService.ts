@@ -37,12 +37,15 @@ export interface StreamableRingCamera {
 export class StreamService {
   private server: http.Server | null = null
   private port = 0
+  private sessionSeq = 0
   private readonly hlsRoot: string
   private readonly activeStreams = new Map<string, ActiveRingStream>()
   private readonly nvrHlsFeeds = new Map<
     string,
     { dirPath: string; playlistPath: string; streamUrl: string; startedAt: string }
   >()
+  private readonly pendingNvrCameras = new Set<string>()
+  private readonly wantedLiveViewers = new Map<string, { onEnded?: () => void }>()
   private readonly getRecordingsDir: () => string
   private readonly getAdditionalRecordingsDirs?: () => string[]
   private recordingPathResolver?: (id: string) => string | undefined
@@ -154,6 +157,7 @@ export class StreamService {
         res.end('Not Found')
         return
       }
+      const stat = fs.statSync(fullPath)
       const ext = path.extname(fullPath).toLowerCase()
       const contentType =
         ext === '.m3u8'
@@ -163,12 +167,23 @@ export class StreamService {
             : 'application/octet-stream'
       res.writeHead(200, {
         'Content-Type': contentType,
-        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'Content-Length': stat.size,
+        'Cache-Control':
+          ext === '.ts'
+            ? 'private, max-age=10'
+            : 'no-store, no-cache, must-revalidate',
       })
+      if (req.method === 'HEAD') {
+        res.end()
+        return
+      }
       const stream = fs.createReadStream(fullPath)
       stream.on('error', () => {
         if (!res.headersSent) res.writeHead(404)
-        res.end()
+        if (!res.writableEnded) res.end()
+      })
+      res.on('close', () => {
+        if (!stream.destroyed) stream.destroy()
       })
       stream.pipe(res)
       return
@@ -379,17 +394,26 @@ export class StreamService {
     return this.getLatestHlsSegmentPath(cameraId)
   }
 
+  clearPendingNvrCamera(cameraId: string): void {
+    this.pendingNvrCameras.delete(cameraId)
+  }
+
   async prepareNvrHlsOutput(cameraId: string): Promise<PreparedHlsOutput> {
     await this.startServer()
 
-    // Stop any standalone HLS live view on this camera so Ring only gets ONE WebRTC call
+    this.pendingNvrCameras.add(cameraId)
+
+    // Stop any standalone HLS live view on this camera so Ring only gets ONE WebRTC call,
+    // while preserving viewer intent so Live View automatically attaches to the new NVR feed!
     const existing = this.activeStreams.get(cameraId)
     if (existing && !existing.nvrBacked) {
+      this.wantedLiveViewers.set(cameraId, { onEnded: existing.onEnded })
       existing.stopFn()
     }
 
     const safeId = cameraId.replace(/[^a-zA-Z0-9_-]/g, '_')
-    const dirPath = path.join(this.hlsRoot, `nvr_${safeId}`)
+    const sessionKey = `nvr_${safeId}_${++this.sessionSeq}`
+    const dirPath = path.join(this.hlsRoot, sessionKey)
     fs.rmSync(dirPath, { recursive: true, force: true })
     fs.mkdirSync(dirPath, { recursive: true })
 
@@ -398,22 +422,73 @@ export class StreamService {
     const ffmpegSegmentPattern = path.join(dirPath, 'seg_%05d.ts').replace(/\\/g, '/')
 
     return {
-      safeId: `nvr_${safeId}`,
+      safeId: sessionKey,
       dirPath,
       playlistPath,
       ffmpegPlaylistPath,
       ffmpegSegmentPattern,
-      streamUrl: `http://127.0.0.1:${this.port}/hls/nvr_${safeId}/index.m3u8`,
+      streamUrl: `http://127.0.0.1:${this.port}/hls/${sessionKey}/index.m3u8`,
     }
   }
 
+  private attachNvrViewerSession(
+    cameraId: string,
+    nvrFeed: { dirPath: string; playlistPath: string; streamUrl: string; startedAt: string },
+    onEnded?: () => void,
+  ): LiveStreamSession {
+    const session: LiveStreamSession = {
+      cameraId,
+      mode: 'hls',
+      streamUrl: nvrFeed.streamUrl,
+      startedAt: nvrFeed.startedAt,
+      audioEnabled: true,
+    }
+    this.wantedLiveViewers.set(cameraId, { onEnded })
+    this.activeStreams.set(cameraId, {
+      cameraId,
+      session,
+      dirPath: nvrFeed.dirPath,
+      nvrBacked: true,
+      onEnded,
+      stopFn: () => {
+        if (!this.activeStreams.has(cameraId)) return
+        this.activeStreams.delete(cameraId)
+        this.notifyStreamsChanged()
+        onEnded?.()
+      },
+    })
+    this.notifyStreamsChanged()
+    return session
+  }
+
   registerNvrHlsFeed(cameraId: string, prepared: PreparedHlsOutput): void {
-    this.nvrHlsFeeds.set(cameraId, {
+    this.pendingNvrCameras.delete(cameraId)
+    const feed = {
       dirPath: prepared.dirPath,
       playlistPath: prepared.playlistPath,
       streamUrl: prepared.streamUrl,
       startedAt: new Date().toISOString(),
-    })
+    }
+    this.nvrHlsFeeds.set(cameraId, feed)
+
+    // Seamlessly re-attach live viewers after NVR session rotation without requiring user action
+    const wanted = this.wantedLiveViewers.get(cameraId)
+    if (wanted && !this.activeStreams.has(cameraId)) {
+      void this.waitForHlsPlaylist(
+        feed.playlistPath,
+        () => this.nvrHlsFeeds.get(cameraId)?.dirPath === feed.dirPath,
+        18000,
+      ).then((ready) => {
+        if (
+          ready &&
+          this.wantedLiveViewers.has(cameraId) &&
+          !this.activeStreams.has(cameraId) &&
+          this.nvrHlsFeeds.get(cameraId)?.dirPath === feed.dirPath
+        ) {
+          this.attachNvrViewerSession(cameraId, feed, wanted.onEnded)
+        }
+      })
+    }
   }
 
   unregisterNvrHlsFeed(cameraId: string): void {
@@ -428,9 +503,10 @@ export class StreamService {
     }
 
     if (feed?.dirPath) {
+      const oldDir = feed.dirPath
       setTimeout(() => {
-        fs.rmSync(feed.dirPath, { recursive: true, force: true })
-      }, 1500)
+        fs.rmSync(oldDir, { recursive: true, force: true })
+      }, 3000)
     }
   }
 
@@ -454,9 +530,24 @@ export class StreamService {
       if (!isStillValid()) {
         return false
       }
-      await new Promise((r) => setTimeout(r, 250))
+      await new Promise((r) => setTimeout(r, 150))
     }
     return false
+  }
+
+  private async waitForPendingNvrFeed(
+    cameraId: string,
+    timeoutMs = 12000,
+  ): Promise<{ dirPath: string; playlistPath: string; streamUrl: string; startedAt: string } | null> {
+    const existing = this.nvrHlsFeeds.get(cameraId)
+    if (existing) return existing
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline && this.pendingNvrCameras.has(cameraId)) {
+      const feed = this.nvrHlsFeeds.get(cameraId)
+      if (feed) return feed
+      await new Promise((r) => setTimeout(r, 150))
+    }
+    return this.nvrHlsFeeds.get(cameraId) ?? null
   }
 
   async startRingHlsStream(
@@ -469,42 +560,30 @@ export class StreamService {
 
     await this.startServer()
 
-    // If Continuous NVR is already streaming this camera, reuse its live HLS feed instantly (zero extra Ring call!)
-    const nvrFeed = this.nvrHlsFeeds.get(cameraId)
+    // If Continuous NVR is already streaming (or connecting/rotating) this camera,
+    // wait for and reuse its live HLS feed instead of opening a conflicting second Ring WebRTC call!
+    const nvrFeed =
+      this.nvrHlsFeeds.get(cameraId) ??
+      (this.pendingNvrCameras.has(cameraId)
+        ? await this.waitForPendingNvrFeed(cameraId, 12000)
+        : null)
+
     if (nvrFeed) {
       const ready = await this.waitForHlsPlaylist(
         nvrFeed.playlistPath,
-        () => this.nvrHlsFeeds.has(cameraId),
+        () => this.nvrHlsFeeds.get(cameraId)?.dirPath === nvrFeed.dirPath,
         18000,
       )
-      if (ready && this.nvrHlsFeeds.has(cameraId)) {
-        const session: LiveStreamSession = {
-          cameraId,
-          mode: 'hls',
-          streamUrl: nvrFeed.streamUrl,
-          startedAt: nvrFeed.startedAt,
-          audioEnabled: true,
-        }
-        this.activeStreams.set(cameraId, {
-          cameraId,
-          session,
-          dirPath: nvrFeed.dirPath,
-          nvrBacked: true,
-          onEnded,
-          stopFn: () => {
-            if (!this.activeStreams.has(cameraId)) return
-            this.activeStreams.delete(cameraId)
-            this.notifyStreamsChanged()
-            onEnded?.()
-          },
-        })
-        this.notifyStreamsChanged()
-        return session
+      if (ready && this.nvrHlsFeeds.get(cameraId)?.dirPath === nvrFeed.dirPath) {
+        const already = this.activeStreams.get(cameraId)
+        if (already) return already.session
+        return this.attachNvrViewerSession(cameraId, nvrFeed, onEnded)
       }
     }
 
     const safeId = cameraId.replace(/[^a-zA-Z0-9_-]/g, '_')
-    const dirPath = path.join(this.hlsRoot, safeId)
+    const sessionKey = `live_${safeId}_${++this.sessionSeq}`
+    const dirPath = path.join(this.hlsRoot, sessionKey)
     fs.rmSync(dirPath, { recursive: true, force: true })
     fs.mkdirSync(dirPath, { recursive: true })
 
@@ -520,11 +599,13 @@ export class StreamService {
         '-f',
         'hls',
         '-hls_time',
-        '2',
+        '1',
         '-hls_list_size',
-        '6',
+        '8',
+        '-hls_delete_threshold',
+        '4',
         '-hls_flags',
-        'delete_segments+append_list+temp_file',
+        'delete_segments+independent_segments+temp_file',
         '-hls_segment_filename',
         ffmpegSegmentPattern,
         ffmpegPlaylistPath,
@@ -534,7 +615,7 @@ export class StreamService {
     const session: LiveStreamSession = {
       cameraId,
       mode: 'hls',
-      streamUrl: `http://127.0.0.1:${this.port}/hls/${safeId}/index.m3u8`,
+      streamUrl: `http://127.0.0.1:${this.port}/hls/${sessionKey}/index.m3u8`,
       startedAt: new Date().toISOString(),
       audioEnabled: true,
     }
@@ -549,7 +630,7 @@ export class StreamService {
       }
       setTimeout(() => {
         fs.rmSync(dirPath, { recursive: true, force: true })
-      }, 1500)
+      }, 3000)
       this.notifyStreamsChanged()
       onEnded?.()
     }
@@ -615,6 +696,7 @@ export class StreamService {
   }
 
   stopStream(cameraId: string): void {
+    this.wantedLiveViewers.delete(cameraId)
     const active = this.activeStreams.get(cameraId)
     if (active) {
       active.stopFn()
@@ -622,6 +704,8 @@ export class StreamService {
   }
 
   stopAll(): void {
+    this.wantedLiveViewers.clear()
+    this.pendingNvrCameras.clear()
     for (const id of Array.from(this.activeStreams.keys())) {
       this.stopStream(id)
     }

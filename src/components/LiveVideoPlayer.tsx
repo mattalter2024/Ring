@@ -7,20 +7,24 @@ interface LiveVideoPlayerProps {
   camera: RingCameraInfo
   session?: LiveStreamSession
   isConnecting?: boolean
+  onStreamStalled?: (cameraId: string) => void
 }
 
 export function LiveVideoPlayer({
   camera,
   session,
   isConnecting = false,
+  onStreamStalled,
 }: LiveVideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const onStalledRef = useRef(onStreamStalled)
+  onStalledRef.current = onStreamStalled
   const [muted, setMuted] = useState(true)
   const [buffering, setBuffering] = useState(false)
   const [streamError, setStreamError] = useState<string | null>(null)
 
-  // Real Ring HLS stream via hls.js with automatic reconnection on session rotation
+  // Real Ring HLS stream via hls.js with worker demuxing, live-edge sync, and freeze watchdog
   useEffect(() => {
     if (!session || session.mode !== 'hls') {
       setStreamError(null)
@@ -35,6 +39,27 @@ export function LiveVideoPlayer({
     let hls: Hls | null = null
     let retryTimer: ReturnType<typeof setTimeout> | null = null
     let disposed = false
+    let reattachFailures = 0
+    let lastObservedTime = -1
+    let stallTicks = 0
+
+    const jumpToLiveEdge = () => {
+      if (!video || disposed) return
+      const target =
+        hls && typeof hls.liveSyncPosition === 'number' && Number.isFinite(hls.liveSyncPosition)
+          ? hls.liveSyncPosition
+          : video.buffered.length > 0
+            ? Math.max(0, video.buffered.end(video.buffered.length - 1) - 0.35)
+            : null
+      if (target !== null && Number.isFinite(target)) {
+        try {
+          video.currentTime = target
+        } catch {
+          // Ignore seek errors while media initializes
+        }
+      }
+      void video.play().catch(() => {})
+    }
 
     const attachHls = () => {
       if (disposed) return
@@ -47,9 +72,19 @@ export function LiveVideoPlayer({
         let recoveryAttempts = 0
         hls = new Hls({
           lowLatencyMode: false,
-          liveSyncDurationCount: 2,
-          liveMaxLatencyDurationCount: 5,
-          enableWorker: false,
+          enableWorker: true,
+          liveSyncDuration: 2,
+          liveMaxLatencyDuration: 6,
+          maxLiveSyncPlaybackRate: 1.35,
+          maxBufferLength: 10,
+          backBufferLength: 6,
+          maxBufferHole: 1.0,
+          fragLoadingMaxRetry: 6,
+          fragLoadingRetryDelay: 500,
+          manifestLoadingMaxRetry: 6,
+          manifestLoadingRetryDelay: 500,
+          levelLoadingMaxRetry: 6,
+          levelLoadingRetryDelay: 500,
         })
         hls.loadSource(session.streamUrl)
         hls.attachMedia(video)
@@ -60,6 +95,7 @@ export function LiveVideoPlayer({
           void video.play().catch(() => {})
         })
         hls.on(Hls.Events.FRAG_BUFFERED, () => {
+          reattachFailures = 0
           setStreamError(null)
           setBuffering(false)
         })
@@ -76,12 +112,16 @@ export function LiveVideoPlayer({
               return
             }
           }
+          reattachFailures += 1
           setStreamError('Reconnecting live stream…')
+          if (reattachFailures >= 2) {
+            onStalledRef.current?.(camera.id)
+          }
           if (!retryTimer) {
             retryTimer = setTimeout(() => {
               retryTimer = null
               attachHls()
-            }, 3000)
+            }, 2000)
           }
         })
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -92,14 +132,63 @@ export function LiveVideoPlayer({
 
     attachHls()
 
+    // Watchdog: detect silent frozen video or drift behind live edge and self-heal
+    const watchdog = setInterval(() => {
+      if (disposed || !video || document.hidden) return
+      const cur = video.currentTime
+      const advanced = lastObservedTime >= 0 && Math.abs(cur - lastObservedTime) > 0.05
+      lastObservedTime = cur
+
+      if (advanced) {
+        stallTicks = 0
+        reattachFailures = 0
+        // If playback drifted > 7s behind live edge, jump straight back to live
+        if (
+          hls &&
+          typeof hls.liveSyncPosition === 'number' &&
+          Number.isFinite(hls.liveSyncPosition) &&
+          hls.liveSyncPosition - cur > 7
+        ) {
+          jumpToLiveEdge()
+        }
+        return
+      }
+
+      stallTicks += 1
+      if (stallTicks === 1) {
+        jumpToLiveEdge()
+      } else if (stallTicks === 2 && hls) {
+        setBuffering(true)
+        hls.startLoad()
+        jumpToLiveEdge()
+      } else if (stallTicks >= 3) {
+        stallTicks = 0
+        reattachFailures += 1
+        setStreamError('Refreshing live feed…')
+        if (reattachFailures >= 2) {
+          onStalledRef.current?.(camera.id)
+        }
+        attachHls()
+      }
+    }, 3000)
+
+    const onVisibilityChange = () => {
+      if (!document.hidden && !disposed) {
+        jumpToLiveEdge()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
     return () => {
       disposed = true
+      clearInterval(watchdog)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       if (retryTimer) clearTimeout(retryTimer)
       if (hls) {
         hls.destroy()
       }
     }
-  }, [session?.streamUrl, session?.mode, session?.startedAt])
+  }, [camera.id, session?.streamUrl, session?.mode, session?.startedAt])
 
   // Animated 30fps Demo Mode live feed canvas backed by realistic generated camera still
   useEffect(() => {

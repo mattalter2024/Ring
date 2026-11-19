@@ -391,17 +391,17 @@ export function SettingsView({
                       })
                     }
                   >
-                    <option value="gemini-3.5-flash-lite">
-                      gemini-3.5-flash-lite (Recommended — Fast &amp; low cost)
-                    </option>
                     <option value="gemini-3-flash-preview">
-                      gemini-3-flash-preview (Balanced speed &amp; accuracy)
+                      gemini-3-flash-preview (Recommended — Best box &amp; parcel accuracy)
+                    </option>
+                    <option value="gemini-3.5-flash-lite">
+                      gemini-3.5-flash-lite (Fastest &amp; lowest cost)
                     </option>
                     <option value="gemini-3.8-flash">
                       gemini-3.8-flash (High-intelligence Flash)
                     </option>
                     <option value="gemini-3.1-pro-preview">
-                      gemini-3.1-pro-preview (Highest precision)
+                      gemini-3.1-pro-preview (Maximum precision)
                     </option>
                     <option value="gemini-4-hydrogen">
                       gemini-4-hydrogen (Next-gen fast multimodal)

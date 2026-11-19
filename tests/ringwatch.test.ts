@@ -1060,6 +1060,222 @@ describe('Resilient Live-Stream Snapshot & AI Scan Fallback (cocoa_camera_v3)', 
   })
 })
 
+describe('Always-Live Stream Continuity & Improved AI Box Detection', () => {
+  let tmpDir: string
+  let streamService: StreamService
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    streamService?.stopAll()
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('uses isolated per-rotation HLS folders, waits for pending NVR feed, and auto-reattaches live viewers after rotation', async () => {
+    const recDir = path.join(tmpDir, 'nvr-rot')
+    const store = new ConfigStore(tmpDir, recDir)
+    streamService = new StreamService(() => store.getPublicSettings().recordingsDir)
+    await streamService.startServer()
+
+    const emittedUrls: string[] = []
+    streamService.setOnStreamsChanged((sessions) => {
+      if (sessions[0]) emittedUrls.push(sessions[0].streamUrl)
+    })
+
+    // Rotation 1: NVR prepares output (pending), live viewer calls startRingHlsStream BEFORE registerNvrHlsFeed
+    const rot1 = await streamService.prepareNvrHlsOutput('cam-porch')
+    const mockStreamVideo = vi.fn()
+    const viewerPromise = streamService.startRingHlsStream('cam-porch', {
+      id: 'cam-porch',
+      streamVideo: mockStreamVideo,
+    })
+
+    // Simulate NVR WebRTC connecting ~120ms later and writing first segment
+    await new Promise((r) => setTimeout(r, 120))
+    fs.writeFileSync(
+      rot1.playlistPath,
+      '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:1.0,\nseg_00000.ts\n',
+    )
+    streamService.registerNvrHlsFeed('cam-porch', rot1)
+
+    const sess1 = await viewerPromise
+    expect(mockStreamVideo).not.toHaveBeenCalled()
+    expect(sess1.streamUrl).toBe(rot1.streamUrl)
+    expect(streamService.isStreaming('cam-porch')).toBe(true)
+
+    // Rotation 2 (e.g. Ring 10-minute WebRTC rotation): old feed unregisters, new feed registers with unique dirPath
+    streamService.unregisterNvrHlsFeed('cam-porch')
+    const rot2 = await streamService.prepareNvrHlsOutput('cam-porch')
+    expect(rot2.dirPath).not.toBe(rot1.dirPath)
+    expect(rot2.streamUrl).not.toBe(rot1.streamUrl)
+
+    fs.writeFileSync(
+      rot2.playlistPath,
+      '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:1.0,\nseg_00000.ts\n',
+    )
+    streamService.registerNvrHlsFeed('cam-porch', rot2)
+
+    // StreamService automatically re-attaches the live viewer to rot2 with zero manual clicks!
+    await new Promise((r) => setTimeout(r, 250))
+    expect(streamService.isStreaming('cam-porch')).toBe(true)
+    expect(emittedUrls[emittedUrls.length - 1]).toBe(rot2.streamUrl)
+  })
+
+  it('recovers from Gemini HTTP 503 high-demand spikes via retry + temporary failover without overwriting saved model, and uses OpenAI detail=high', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    store.updateSettings({
+      mode: 'live',
+      packageAi: {
+        enabled: true,
+        provider: 'gemini',
+        geminiModel: 'gemini-3.5-flash-lite',
+        geminiApiKey: 'AIza-test-503',
+        openaiApiKey: 'sk-test-high',
+        minConfidence: 0.65,
+      },
+    })
+
+    const mockNotifications = {
+      notifyPackageAlert: vi.fn(),
+    } as unknown as NotificationService
+    const service = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: mockNotifications,
+      onDetection: vi.fn(),
+      onSecurityEvent: vi.fn(),
+      retryDelayMs: 0,
+      motionFollowUpDelayMs: 50,
+    })
+    service.attachSnapshotSource({
+      getCameraMeta: (id) => ({ id, name: 'Front yard' }),
+      listCameraIds: () => ['front-yard'],
+      captureSnapshotBase64: async () => ({
+        base64: Buffer.from('fake-jpeg').toString('base64'),
+        dataUrl: 'data:image/jpeg;base64,ZmFrZS1qcGVn',
+      }),
+    })
+
+    // 1. Gemini 503 on gemini-3.5-flash-lite -> retries once, fails over temporarily to gemini-3-flash-preview
+    const calledModels: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async (url: string) => {
+        calledModels.push(url)
+        if (url.includes('gemini-3.5-flash-lite')) {
+          return {
+            ok: false,
+            status: 503,
+            text: async () =>
+              JSON.stringify({
+                error: {
+                  code: 503,
+                  message: 'This model is currently experiencing high demand.',
+                  status: 'UNAVAILABLE',
+                },
+              }),
+          }
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        sceneScan: 'Brown cardboard shipping box resting near the front steps',
+                        packageDetected: true,
+                        confidence: 0.89,
+                        packageCount: 1,
+                        carrierHint: null,
+                        placement: 'Near front steps',
+                        personPresent: false,
+                        summary: 'Plain brown cardboard box detected near the front steps.',
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        }
+      }),
+    )
+
+    const geminiRes = await service.scanCamera('front-yard', 'manual')
+    expect(geminiRes.rawError).toBeUndefined()
+    expect(geminiRes.packageDetected).toBe(true)
+    expect(geminiRes.model).toBe('gemini-3-flash-preview')
+    // Temporary 503 failover must NOT permanently overwrite user's saved model
+    expect(store.getPublicSettings().packageAi.geminiModel).toBe('gemini-3.5-flash-lite')
+    expect(calledModels.filter((u) => u.includes('gemini-3.5-flash-lite'))).toHaveLength(2)
+
+    // 2. OpenAI uses detail: 'high' and two-stage motion follow-up catches box placed seconds later
+    store.updateSettings({
+      packageAi: { provider: 'openai', openaiModel: 'gpt-4o-mini' },
+    })
+
+    let openAiCalls = 0
+    const openAiFetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      openAiCalls++
+      const body = JSON.parse(String(init?.body ?? '{}')) as {
+        messages: Array<{ content: unknown }>
+      }
+      const userParts = body.messages[1].content as Array<{
+        type: string
+        image_url?: { detail?: string }
+      }>
+      const imgPart = userParts.find((p) => p.type === 'image_url')
+      expect(imgPart?.image_url?.detail).toBe('high')
+
+      const detected = openAiCalls >= 2
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  sceneScan: detected
+                    ? 'Plain brown box now resting on porch'
+                    : 'Delivery driver walking up driveway',
+                  packageDetected: detected ? 'true' : 'false',
+                  confidence: 0.91,
+                  packageCount: detected ? 1 : 0,
+                  carrierHint: null,
+                  placement: detected ? 'Front porch' : null,
+                  personPresent: !detected,
+                  summary: detected
+                    ? 'Cardboard box delivered on front porch.'
+                    : 'Person walking up; no package placed yet.',
+                }),
+              },
+            },
+          ],
+        }),
+      }
+    })
+    vi.stubGlobal('fetch', openAiFetch)
+
+    const initialMotion = await service.handleAutoTrigger('front-yard', 'motion')
+    expect(initialMotion?.packageDetected).toBe(false)
+
+    // Wait for automatic follow-up scan (50ms in test) to catch the newly placed box
+    await new Promise((r) => setTimeout(r, 150))
+    expect(openAiCalls).toBe(2)
+    expect(service.listDetections()[0].packageDetected).toBe(true)
+
+    service.stop()
+  })
+})
+
+
 
 
 

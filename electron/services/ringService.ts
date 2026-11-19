@@ -1495,7 +1495,7 @@ export class RingService implements SnapshotSource {
       call = await Promise.race([
         liveCam.streamVideo({
           audio: ['-an'],
-          video: ['-vcodec', 'mjpeg', '-q:v', '3'],
+          video: ['-vcodec', 'mjpeg', '-q:v', '2'],
           output: ['-frames:v', '1', '-f', 'image2', ffmpegOutPath],
         }),
         new Promise<never>((_res, rej) =>
@@ -2064,7 +2064,7 @@ export class RingService implements SnapshotSource {
       if (existing && !existing.stopped) continue
 
       const staggerMs =
-        this.connection.mode === 'live' ? staggerIndex * 1200 : staggerIndex * 200
+        this.connection.mode === 'live' ? staggerIndex * 600 : staggerIndex * 150
       staggerIndex++
 
       const worker: NvrWorker = {
@@ -2438,11 +2438,13 @@ export class RingService implements SnapshotSource {
             '-f',
             'hls',
             '-hls_time',
-            '2',
+            '1',
             '-hls_list_size',
-            '6',
+            '8',
+            '-hls_delete_threshold',
+            '4',
             '-hls_flags',
-            'delete_segments+append_list+temp_file',
+            'delete_segments+independent_segments+temp_file',
             '-hls_segment_filename',
             hlsOutput.ffmpegSegmentPattern,
             hlsOutput.ffmpegPlaylistPath,
@@ -2513,7 +2515,7 @@ export class RingService implements SnapshotSource {
           worker.consecutiveFailures = 0
           worker.state = 'reconnecting'
           this.emitNvrStatus()
-          const keepGoing = await this.cancellableDelay(worker, 2500)
+          const keepGoing = await this.cancellableDelay(worker, 1000)
           if (!keepGoing) break
         } else {
           const reason = `Stream closed after ${Math.round(ranMs / 1000)}s`
@@ -2531,6 +2533,7 @@ export class RingService implements SnapshotSource {
           pollTimer = null
         }
         worker.activeCall = undefined
+        this.streamService.clearPendingNvrCamera(worker.cameraId)
         this.streamService.unregisterNvrHlsFeed(worker.cameraId)
         try {
           fs.rmSync(target.segmentListPath, { force: true })
@@ -2553,6 +2556,7 @@ export class RingService implements SnapshotSource {
       }
     }
 
+    this.streamService.clearPendingNvrCamera(worker.cameraId)
     worker.state = 'stopped'
     worker.currentSegmentStartedAt = undefined
     this.emitNvrStatus()

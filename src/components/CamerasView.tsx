@@ -39,6 +39,7 @@ interface CamerasViewProps {
   onStopAllLive: () => Promise<void>
   onStartStream: (cameraId: string) => Promise<void>
   onStopStream: (cameraId: string) => Promise<void>
+  onStreamStalled?: (cameraId: string) => void
   onCaptureRecording: (cameraId: string, durationSeconds: number) => Promise<void>
   onToggleAllRecording: () => Promise<void>
   onToggleCameraContinuous: (cameraId: string, enable: boolean) => Promise<void>
@@ -66,6 +67,7 @@ export function CamerasView({
   onStopAllLive,
   onStartStream,
   onStopStream,
+  onStreamStalled,
   onCaptureRecording,
   onToggleAllRecording,
   onToggleCameraContinuous,
@@ -241,6 +243,7 @@ export function CamerasView({
                 camera={focusedCamera}
                 session={streamsByCamera[focusedCamera.id]}
                 isConnecting={Boolean(connectingCameraIds[focusedCamera.id])}
+                onStreamStalled={onStreamStalled}
               />
               <div className="viewport-hud-top">
                 <div style={{ display: 'flex', gap: 6 }}>
@@ -478,6 +481,7 @@ export function CamerasView({
                     camera={cam}
                     session={session}
                     isConnecting={isConnecting}
+                    onStreamStalled={onStreamStalled}
                   />
                   <div className="viewport-hud-top">
                     <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>

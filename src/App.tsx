@@ -28,9 +28,12 @@ export function App() {
   const [autoLiveEnabled, setAutoLiveEnabled] = useState(true)
   const [connectingCameraIds, setConnectingCameraIds] = useState<Record<string, boolean>>({})
 
+  const [autoLiveTick, setAutoLiveTick] = useState(0)
   const connectingRef = useRef<Set<string>>(new Set())
   const manuallyStoppedRef = useRef<Set<string>>(new Set())
   const lastAutoFailRef = useRef<Record<string, number>>({})
+  const failCountRef = useRef<Record<string, number>>({})
+  const lastStallRestartRef = useRef<Record<string, number>>({})
 
   const handleFocusFromNotification = useCallback((cameraId: string) => {
     setActiveTab('cameras')
@@ -109,9 +112,11 @@ export function App() {
       try {
         const session = await api.startLiveStream(cameraId)
         delete lastAutoFailRef.current[cameraId]
+        delete failCountRef.current[cameraId]
         setStreamsByCamera((prev) => ({ ...prev, [cameraId]: session }))
       } catch (err) {
         lastAutoFailRef.current[cameraId] = Date.now()
+        failCountRef.current[cameraId] = (failCountRef.current[cameraId] ?? 0) + 1
         if (!silent) {
           pushToast('Stream Failed', err instanceof Error ? err.message : String(err), 'err')
         }
@@ -129,6 +134,8 @@ export function App() {
 
   const handleStartStream = useCallback(
     async (cameraId: string) => {
+      delete failCountRef.current[cameraId]
+      delete lastAutoFailRef.current[cameraId]
       await startStreamInternal(cameraId, false)
     },
     [startStreamInternal],
@@ -149,9 +156,30 @@ export function App() {
     [api, setStreamsByCamera],
   )
 
+  const handleStreamStalled = useCallback(
+    (cameraId: string) => {
+      if (!api || manuallyStoppedRef.current.has(cameraId)) return
+      const now = Date.now()
+      if (now - (lastStallRestartRef.current[cameraId] ?? 0) < 20_000) return
+      lastStallRestartRef.current[cameraId] = now
+      void (async () => {
+        try {
+          await api.stopLiveStream(cameraId)
+        } catch {
+          // ignore
+        }
+        delete lastAutoFailRef.current[cameraId]
+        delete failCountRef.current[cameraId]
+        await startStreamInternal(cameraId, true)
+      })()
+    },
+    [api, startStreamInternal],
+  )
+
   const handleStartAllLive = useCallback(async () => {
     manuallyStoppedRef.current.clear()
     lastAutoFailRef.current = {}
+    failCountRef.current = {}
     setAutoLiveEnabled(true)
     const targets = cameras.filter((c) => c.online && !streamsByCamera[c.id])
     await Promise.allSettled(targets.map((cam) => startStreamInternal(cam.id, true)))
@@ -180,6 +208,15 @@ export function App() {
     [streamsByCamera, startStreamInternal],
   )
 
+  // Periodic 5-second watchdog so any camera whose live stream dropped or failed retries automatically
+  useEffect(() => {
+    if (loading || activeTab !== 'cameras' || !autoLiveEnabled) return
+    const timer = setInterval(() => {
+      setAutoLiveTick((t) => t + 1)
+    }, 5000)
+    return () => clearInterval(timer)
+  }, [loading, activeTab, autoLiveEnabled])
+
   // Automatically keep all online cameras streaming live when viewing the Live Cameras tab
   useEffect(() => {
     if (loading || activeTab !== 'cameras' || !autoLiveEnabled || cameras.length === 0) {
@@ -194,8 +231,10 @@ export function App() {
       if (manuallyStoppedRef.current.has(cam.id)) return false
       const nvrRecording = nvrStatus.cameras[cam.id]?.state === 'recording'
       const lastFail = lastAutoFailRef.current[cam.id] ?? 0
-      // Attach immediately if NVR already has a live feed; otherwise respect a 20s retry cooldown
-      if (!nvrRecording && now - lastFail < 20_000) return false
+      const failCount = failCountRef.current[cam.id] ?? 0
+      const retryCooldownMs = Math.min(15_000, Math.max(5_000, failCount * 5_000))
+      // Attach immediately if NVR already has a live feed; otherwise retry after short backoff
+      if (!nvrRecording && lastFail > 0 && now - lastFail < retryCooldownMs) return false
       return true
     })
 
@@ -204,7 +243,7 @@ export function App() {
     const timers: Array<ReturnType<typeof setTimeout>> = []
     eligible.forEach((cam, idx) => {
       const nvrRecording = nvrStatus.cameras[cam.id]?.state === 'recording'
-      const delayMs = connection.mode === 'demo' || nvrRecording ? 0 : idx * 350
+      const delayMs = connection.mode === 'demo' || nvrRecording ? 0 : idx * 250
       if (delayMs === 0) {
         void startStreamInternal(cam.id, true)
       } else {
@@ -223,6 +262,7 @@ export function App() {
     loading,
     activeTab,
     autoLiveEnabled,
+    autoLiveTick,
     cameras,
     streamsByCamera,
     nvrStatus.cameras,
@@ -876,12 +916,14 @@ export function App() {
                 if (enabled) {
                   manuallyStoppedRef.current.clear()
                   lastAutoFailRef.current = {}
+                  failCountRef.current = {}
                 }
               }}
               onStartAllLive={handleStartAllLive}
               onStopAllLive={handleStopAllLive}
               onStartStream={handleStartStream}
               onStopStream={handleStopStream}
+              onStreamStalled={handleStreamStalled}
               onCaptureRecording={handleCaptureRecording}
               onToggleAllRecording={handleToggleAllRecording}
               onToggleCameraContinuous={handleToggleCameraContinuous}

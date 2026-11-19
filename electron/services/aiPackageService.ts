@@ -19,18 +19,39 @@ export interface ParsedPackageVisionResult {
   summary: string
 }
 
-const SYSTEM_PROMPT = `You are a precision home-security vision analyzer for Ring cameras.
-Inspect the camera image and determine whether one or more delivered packages, parcels, cardboard shipping boxes, padded mailers, or grocery delivery bags are visibly present on the porch, doorstep, driveway, walkway, or patio.
-Respond ONLY with a single valid JSON object matching this exact schema:
+const SYSTEM_PROMPT = `You are a precision home-security vision analyzer for wide-angle Ring cameras.
+Carefully inspect EVERY ground, porch, step, walkway, driveway, garage apron, yard edge, and patio surface in the image—including shaded areas, corners beside doors/pillars/planters/railings, and distant areas—to determine whether one or more delivered boxes or packages are present.
+
+Count ALL of these as packages:
+- Plain brown/kraft cardboard shipping boxes (even with no visible logo or small/angled/partially occluded behind a railing, column, or planter)
+- White, black, or branded shipping boxes (Amazon, UPS, FedEx, USPS, DHL, Target, Walmart, Chewy, etc.)
+- Padded bubble mailers, Amazon blue-and-white envelopes, and plastic poly mailer bags
+- Paper or plastic grocery/food delivery bags left near an entrance
+- Stacked or multiple parcels (count each distinct box/parcel)
+
+Do NOT confuse permanent fixtures (welcome mats, potted plants, patio furniture, brick/stone pavers, hoses, trash bins, or siding) with packages. However, if a rectangular cardboard box or delivery parcel is visibly resting on a porch, step, walkway, driveway, or front yard, ALWAYS report "packageDetected": true even if it is plain/unbranded, small, in shadow, or partially obscured.
+
+Respond ONLY with a single valid JSON object matching this exact schema (complete "sceneScan" FIRST before deciding "packageDetected"):
 {
+  "sceneScan": string, // brief inventory of objects resting on the porch, steps, mat, walkway, driveway, or yard
   "packageDetected": boolean,
   "confidence": number, // 0.0 to 1.0
-  "packageCount": integer, // 0 if none
-  "carrierHint": string | null, // e.g. "Amazon", "UPS", "FedEx", "USPS", "DHL", or null if unclear
-  "placement": string | null, // concise location in frame, e.g. "On welcome mat beside front door"
+  "packageCount": integer, // 0 if none, >= 1 if packageDetected is true
+  "carrierHint": string | null, // e.g. "Amazon", "UPS", "FedEx", "USPS", "DHL", or null if plain/unclear
+  "placement": string | null, // concise location in frame, e.g. "Left of front steps on walkway"
   "personPresent": boolean,
   "summary": string // concise 1-sentence description for a Windows desktop notification
 }`
+
+function parseLooseBoolean(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') {
+    const lower = value.trim().toLowerCase()
+    if (lower === 'true' || lower === 'yes' || lower === '1') return true
+    if (lower === 'false' || lower === 'no' || lower === '0' || lower === '') return false
+  }
+  return Boolean(value)
+}
 
 export function parseVisionResponse(rawText: string): ParsedPackageVisionResult {
   const trimmed = rawText.trim()
@@ -45,23 +66,27 @@ export function parseVisionResponse(rawText: string): ParsedPackageVisionResult 
 
   const parsed = JSON.parse(jsonSlice) as Record<string, unknown>
 
-  const packageDetected = Boolean(parsed.packageDetected)
-  const rawConf =
-    typeof parsed.confidence === 'number'
-      ? parsed.confidence
-      : Number(parsed.confidence ?? (packageDetected ? 0.75 : 0.9))
-  const confidence = Number.isFinite(rawConf)
-    ? Math.max(0, Math.min(1, rawConf > 1 ? rawConf / 100 : rawConf))
-    : packageDetected
-      ? 0.75
-      : 0.9
-
   const rawCount =
     typeof parsed.packageCount === 'number'
       ? parsed.packageCount
-      : Number(parsed.packageCount ?? (packageDetected ? 1 : 0))
+      : Number(parsed.packageCount ?? 0)
+  const hasExplicitFlag = parsed.packageDetected !== undefined && parsed.packageDetected !== null
+  const packageDetected = hasExplicitFlag
+    ? parseLooseBoolean(parsed.packageDetected)
+    : Number.isFinite(rawCount) && rawCount >= 1
+
+  const rawConf =
+    typeof parsed.confidence === 'number'
+      ? parsed.confidence
+      : Number(parsed.confidence ?? (packageDetected ? 0.78 : 0.9))
+  const confidence = Number.isFinite(rawConf)
+    ? Math.max(0, Math.min(1, rawConf > 1 ? rawConf / 100 : rawConf))
+    : packageDetected
+      ? 0.78
+      : 0.9
+
   const packageCount = packageDetected
-    ? Math.max(1, Number.isFinite(rawCount) ? Math.round(rawCount) : 1)
+    ? Math.max(1, Number.isFinite(rawCount) && rawCount > 0 ? Math.round(rawCount) : 1)
     : 0
 
   const carrierHint =
@@ -74,7 +99,7 @@ export function parseVisionResponse(rawText: string): ParsedPackageVisionResult 
       ? parsed.placement.trim()
       : null
 
-  const personPresent = Boolean(parsed.personPresent)
+  const personPresent = parseLooseBoolean(parsed.personPresent)
 
   const summary =
     typeof parsed.summary === 'string' && parsed.summary.trim()
@@ -106,9 +131,12 @@ export class AiPackageService {
   private readonly notifications: NotificationService
   private readonly onDetection: (record: PackageDetectionRecord) => void
   private readonly onSecurityEvent: (event: SecurityEvent) => void
+  private readonly retryDelayMs: number
+  private readonly motionFollowUpDelayMs: number
   private history: PackageDetectionRecord[] = []
   private readonly lastNotifiedAtByCamera = new Map<string, number>()
   private readonly inFlightCameras = new Set<string>()
+  private readonly followUpTimers = new Map<string, NodeJS.Timeout>()
   private schedulerTimer: NodeJS.Timeout | null = null
   private snapshotSource: SnapshotSource | null = null
 
@@ -118,12 +146,16 @@ export class AiPackageService {
     notifications: NotificationService
     onDetection: (record: PackageDetectionRecord) => void
     onSecurityEvent: (event: SecurityEvent) => void
+    retryDelayMs?: number
+    motionFollowUpDelayMs?: number
   }) {
     this.historyPath = path.join(params.userDataDir, 'package-detections.json')
     this.configStore = params.configStore
     this.notifications = params.notifications
     this.onDetection = params.onDetection
     this.onSecurityEvent = params.onSecurityEvent
+    this.retryDelayMs = params.retryDelayMs ?? 800
+    this.motionFollowUpDelayMs = params.motionFollowUpDelayMs ?? 12_000
     this.history = this.loadHistory()
   }
 
@@ -193,6 +225,10 @@ export class AiPackageService {
       clearInterval(this.schedulerTimer)
       this.schedulerTimer = null
     }
+    for (const timer of this.followUpTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.followUpTimers.clear()
   }
 
   shouldTriggerForCamera(
@@ -212,13 +248,40 @@ export class AiPackageService {
     return true
   }
 
+  private scheduleMotionFollowUp(
+    cameraId: string,
+    trigger: 'motion' | 'doorbell',
+  ): void {
+    if (this.motionFollowUpDelayMs <= 0) return
+    const existing = this.followUpTimers.get(cameraId)
+    if (existing) {
+      clearTimeout(existing)
+    }
+    const timer = setTimeout(() => {
+      this.followUpTimers.delete(cameraId)
+      if (!this.snapshotSource || this.inFlightCameras.has(cameraId)) return
+      if (!this.shouldTriggerForCamera(cameraId, trigger)) return
+      void this.scanCamera(cameraId, trigger)
+    }, this.motionFollowUpDelayMs)
+    if (typeof timer.unref === 'function') {
+      timer.unref()
+    }
+    this.followUpTimers.set(cameraId, timer)
+  }
+
   async handleAutoTrigger(
     cameraId: string,
     trigger: 'motion' | 'doorbell',
   ): Promise<PackageDetectionRecord | null> {
     if (!this.shouldTriggerForCamera(cameraId, trigger)) return null
     if (this.inFlightCameras.has(cameraId)) return null
-    return this.scanCamera(cameraId, trigger)
+    const record = await this.scanCamera(cameraId, trigger)
+    // Motion often fires while the driver is still walking up with the box.
+    // If no package was detected yet, automatically re-check once after the driver leaves.
+    if (!record.packageDetected && !record.rawError) {
+      this.scheduleMotionFollowUp(cameraId, trigger)
+    }
+    return record
   }
 
   async scanCamera(
@@ -262,6 +325,7 @@ export class AiPackageService {
             aiCfg.openaiModel,
             base64,
             aiCfg.customPromptHint,
+            meta.name,
           )
         } else {
           const geminiRes = await this.analyzeWithGemini(
@@ -269,6 +333,7 @@ export class AiPackageService {
             aiCfg.geminiModel,
             base64,
             aiCfg.customPromptHint,
+            meta.name,
           )
           parsed = geminiRes.parsed
           usedModel = geminiRes.modelUsed
@@ -453,59 +518,82 @@ export class AiPackageService {
     })
   }
 
+  private isTransientHttpStatus(status: number): boolean {
+    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    if (ms <= 0) return
+    await new Promise((r) => setTimeout(r, ms))
+  }
+
   private async analyzeWithOpenAI(
     apiKey: string,
     model: string,
     jpegBase64: string,
     customHint: string,
+    cameraName?: string,
   ): Promise<ParsedPackageVisionResult> {
+    const camContext = cameraName ? `Camera: "${cameraName}". ` : ''
     const userPrompt = customHint.trim()
-      ? `Analyze this Ring camera frame for delivered packages. Additional context: ${customHint.trim()}`
-      : 'Analyze this Ring camera frame for delivered packages.'
+      ? `${camContext}Carefully inspect this full-resolution Ring camera frame for any delivered boxes, cardboard parcels, mailers, or bags on the porch, steps, walkway, driveway, or yard. Additional context: ${customHint.trim()}`
+      : `${camContext}Carefully inspect this full-resolution Ring camera frame for any delivered boxes, cardboard parcels, mailers, or bags on the porch, steps, walkway, driveway, or yard.`
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.1,
-        max_tokens: 320,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: userPrompt },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:image/jpeg;base64,${jpegBase64}`,
-                  detail: 'low',
-                },
+    const body = JSON.stringify({
+      model,
+      temperature: 0.1,
+      max_tokens: 450,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: userPrompt },
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:image/jpeg;base64,${jpegBase64}`,
+                detail: 'high',
               },
-            ],
-          },
-        ],
-      }),
+            },
+          ],
+        },
+      ],
     })
 
-    if (!response.ok) {
+    let lastError = 'OpenAI API request failed'
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body,
+      })
+
+      if (response.ok) {
+        const json = (await response.json()) as {
+          choices?: Array<{ message?: { content?: string } }>
+        }
+        const content = json.choices?.[0]?.message?.content
+        if (!content) {
+          throw new Error('OpenAI returned an empty vision response')
+        }
+        return parseVisionResponse(content)
+      }
+
       const errText = await response.text()
-      throw new Error(`OpenAI HTTP ${response.status}: ${errText.slice(0, 220)}`)
+      lastError = `OpenAI HTTP ${response.status}: ${errText.slice(0, 220)}`
+      if (this.isTransientHttpStatus(response.status) && attempt === 0) {
+        await this.sleep(this.retryDelayMs)
+        continue
+      }
+      throw new Error(lastError)
     }
 
-    const json = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>
-    }
-    const content = json.choices?.[0]?.message?.content
-    if (!content) {
-      throw new Error('OpenAI returned an empty vision response')
-    }
-    return parseVisionResponse(content)
+    throw new Error(lastError)
   }
 
   private extractSuggestedGeminiModel(errText: string, failedModel: string): string | null {
@@ -564,12 +652,13 @@ export class AiPackageService {
     const normalized = normalizeGeminiModel(requestedModel)
     const fallbackQueue: string[] = [
       normalized,
-      'gemini-3.5-flash-lite',
       'gemini-3-flash-preview',
       'gemini-3.1-pro-preview',
+      'gemini-3.5-flash-lite',
     ]
     const tried = new Set<string>()
     let lastError = 'Gemini API request failed'
+    let requestedModelRetired = normalized !== requestedModel
 
     while (fallbackQueue.length > 0) {
       const candidateModel = fallbackQueue.shift()!
@@ -577,45 +666,61 @@ export class AiPackageService {
       tried.add(candidateModel.toLowerCase())
 
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(candidateModel)}:generateContent`
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify(payload),
-      })
 
-      if (response.ok) {
-        const json = (await response.json()) as {
-          candidates?: Array<{
-            content?: {
-              parts?: Array<{ text?: string; thought?: boolean }>
-            }
-          }>
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': apiKey,
+          },
+          body: JSON.stringify(payload),
+        })
+
+        if (response.ok) {
+          const json = (await response.json()) as {
+            candidates?: Array<{
+              content?: {
+                parts?: Array<{ text?: string; thought?: boolean }>
+              }
+            }>
+          }
+          // Persist migrated model only when the requested model was permanently retired (404/deprecated),
+          // NOT on a temporary 503 capacity failover
+          if (requestedModelRetired && candidateModel !== requestedModel) {
+            this.configStore.updateSettings({
+              packageAi: { geminiModel: candidateModel },
+            })
+          }
+          return { json, modelUsed: candidateModel }
         }
-        // Persist migrated / fallback model so future scans succeed on the first attempt
-        if (candidateModel !== requestedModel) {
-          this.configStore.updateSettings({
-            packageAi: { geminiModel: candidateModel },
-          })
+
+        const errText = await response.text()
+        lastError = `Gemini HTTP ${response.status} (${candidateModel}): ${errText.slice(0, 220)}`
+
+        if (response.status === 404) {
+          if (candidateModel.toLowerCase() === normalized.toLowerCase()) {
+            requestedModelRetired = true
+          }
+          const suggested = this.extractSuggestedGeminiModel(errText, candidateModel)
+          if (suggested && !tried.has(suggested.toLowerCase())) {
+            fallbackQueue.unshift(suggested)
+          }
+          break
         }
-        return { json, modelUsed: candidateModel }
+
+        if (this.isTransientHttpStatus(response.status)) {
+          if (attempt === 0) {
+            await this.sleep(this.retryDelayMs)
+            continue
+          }
+          // Still overloaded (503/429/5xx) -> temporarily fail over to the next Gemini model
+          break
+        }
+
+        // Auth/bad-request errors (400/401/403) should fail fast
+        throw new Error(lastError)
       }
-
-      const errText = await response.text()
-      lastError = `Gemini HTTP ${response.status} (${candidateModel}): ${errText.slice(0, 220)}`
-
-      if (response.status === 404) {
-        const suggested = this.extractSuggestedGeminiModel(errText, candidateModel)
-        if (suggested && !tried.has(suggested.toLowerCase())) {
-          fallbackQueue.unshift(suggested)
-        }
-        continue
-      }
-
-      // Non-404 errors (e.g., 401/403 invalid key, 429 quota) should fail fast
-      throw new Error(lastError)
     }
 
     throw new Error(lastError)
@@ -626,10 +731,11 @@ export class AiPackageService {
     model: string,
     jpegBase64: string,
     customHint: string,
+    cameraName?: string,
   ): Promise<{ parsed: ParsedPackageVisionResult; modelUsed: string }> {
-    const userPrompt = customHint.trim()
-      ? `${SYSTEM_PROMPT}\n\nAdditional context: ${customHint.trim()}`
-      : SYSTEM_PROMPT
+    const camLine = cameraName ? `\nCamera vantage point: "${cameraName}".` : ''
+    const hintLine = customHint.trim() ? `\nAdditional context: ${customHint.trim()}` : ''
+    const userPrompt = `${SYSTEM_PROMPT}${camLine}${hintLine}`
 
     const { json, modelUsed } = await this.invokeGeminiGenerateContent(
       apiKey,
