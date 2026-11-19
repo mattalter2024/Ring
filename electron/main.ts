@@ -6,6 +6,7 @@ import {
   dialog,
   ipcMain,
   nativeImage,
+  powerSaveBlocker,
   safeStorage,
   shell,
 } from 'electron'
@@ -33,6 +34,7 @@ if (process.platform === 'win32') {
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let isQuitting = false
+let powerSaveBlockerId: number | null = null
 
 let configStore: ConfigStore
 let streamService: StreamService
@@ -71,6 +73,33 @@ function sendToRenderer(channel: string, payload: unknown): void {
   }
 }
 
+function setPowerSaveBlock(shouldBlock: boolean): void {
+  if (shouldBlock) {
+    if (powerSaveBlockerId === null || !powerSaveBlocker.isStarted(powerSaveBlockerId)) {
+      powerSaveBlockerId = powerSaveBlocker.start('prevent-app-suspension')
+    }
+  } else if (powerSaveBlockerId !== null) {
+    if (powerSaveBlocker.isStarted(powerSaveBlockerId)) {
+      powerSaveBlocker.stop(powerSaveBlockerId)
+    }
+    powerSaveBlockerId = null
+  }
+}
+
+function syncLoginItemSettings(): void {
+  if (!app.isPackaged) return
+  if (process.platform !== 'win32' && process.platform !== 'darwin') return
+  try {
+    const settings = configStore.getPublicSettings()
+    app.setLoginItemSettings({
+      openAtLogin: settings.launchAtLogin,
+      args: ['--minimized'],
+    })
+  } catch {
+    // Ignore login item errors in restricted environments
+  }
+}
+
 function createTray(): void {
   const iconPath = resolveIconPath()
   const icon = fs.existsSync(iconPath)
@@ -78,7 +107,7 @@ function createTray(): void {
     : nativeImage.createEmpty()
 
   tray = new Tray(icon)
-  tray.setToolTip('RingWatch — Ring Cameras & AI Package Monitor')
+  tray.setToolTip('RingWatch — 24/7 NVR & AI Package Monitor')
   tray.on('double-click', () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore()
@@ -92,7 +121,26 @@ function createTray(): void {
 function rebuildTrayMenu(): void {
   if (!tray) return
   const aiEnabled = configStore.getPublicSettings().packageAi.enabled
-  const nvrActive = ringService?.getNvrStatus().active ?? false
+  const nvr = ringService?.getNvrStatus()
+  const nvrActive = nvr?.active ?? false
+  const stats = recordingService?.getStorageStats()
+  const freeGb =
+    stats?.freeDiskBytes !== null && stats?.freeDiskBytes !== undefined
+      ? `${(stats.freeDiskBytes / (1024 * 1024 * 1024)).toFixed(1)} GB free`
+      : ''
+
+  if (nvrActive) {
+    const totalCams = ringService?.getCameras().length ?? nvr?.activeCameraCount ?? 0
+    const failoverTag = stats?.usingFailover ? ' [FAILOVER]' : ''
+    tray.setToolTip(
+      `RingWatch 24/7 NVR — ${nvr?.activeCameraCount ?? 0}/${totalCams} cams${freeGb ? ` · ${freeGb}` : ''}${failoverTag}`,
+    )
+  } else {
+    tray.setToolTip(
+      `RingWatch NVR (Idle)${freeGb ? ` · ${freeGb}` : ''}`,
+    )
+  }
+
   const menu = Menu.buildFromTemplate([
     {
       label: 'Open RingWatch',
@@ -106,7 +154,7 @@ function rebuildTrayMenu(): void {
     },
     { type: 'separator' },
     {
-      label: nvrActive ? 'Stop All-Camera Recording (NVR)' : 'Record All Cameras (NVR)',
+      label: nvrActive ? 'Stop 24/7 NVR Recording' : 'Start 24/7 NVR Recording',
       click: () => {
         if (nvrActive) {
           void ringService.stopAllCameraRecording().finally(() => rebuildTrayMenu())
@@ -144,16 +192,18 @@ function rebuildTrayMenu(): void {
 function createMainWindow(): void {
   const iconPath = resolveIconPath()
   const settings = configStore.getPublicSettings()
+  const launchedMinimized =
+    settings.startMinimized || process.argv.includes('--minimized')
 
   mainWindow = new BrowserWindow({
     width: 1380,
     height: 880,
     minWidth: 1020,
     minHeight: 680,
-    title: 'RingWatch — Ring Cameras, Sensors & AI Package Hub',
+    title: 'RingWatch — 24/7 NVR, Cameras, Sensors & AI Package Hub',
     backgroundColor: '#0b0e13',
     autoHideMenuBar: true,
-    show: !settings.startMinimized,
+    show: !launchedMinimized,
     icon: fs.existsSync(iconPath) ? iconPath : undefined,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -309,6 +359,19 @@ function registerIpcHandlers(): void {
     return recordingService.exportRecording(recordingId, result.filePath)
   })
 
+  ipcMain.handle('ringwatch:export-evidence-bundle', async (_e, recordingId: string) => {
+    if (!mainWindow) return null
+    const rec = recordingService.getRecordingById(recordingId)
+    if (!rec) return null
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export Evidence Bundle (MP4 + SHA-256 Manifest)',
+      defaultPath: rec.fileName,
+      filters: [{ name: 'MP4 Video', extensions: ['mp4'] }],
+    })
+    if (result.canceled || !result.filePath) return null
+    return recordingService.exportEvidenceBundle(recordingId, result.filePath)
+  })
+
   ipcMain.handle('ringwatch:import-videos', async () => {
     if (!mainWindow) return []
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -326,6 +389,44 @@ function registerIpcHandlers(): void {
   ipcMain.handle('ringwatch:get-storage-stats', () =>
     recordingService.getStorageStats(),
   )
+
+  ipcMain.handle('ringwatch:list-storage-drives', () =>
+    recordingService.listStorageDrives(),
+  )
+
+  ipcMain.handle('ringwatch:set-primary-drive', (_e, drivePath: string) => {
+    const targetDir = path.join(drivePath, 'RingWatch-NVR')
+    fs.mkdirSync(targetDir, { recursive: true })
+    const settings = configStore.updateSettings({ recordingsDir: targetDir })
+    const res = recordingService.rescanDirectory()
+    ringService.syncNvrSettings()
+    sendToRenderer('ringwatch:settings-updated', settings)
+    sendToRenderer('ringwatch:recordings-updated', res.recordings)
+    sendToRenderer('ringwatch:storage-stats-updated', res.stats)
+    rebuildTrayMenu()
+    return { settings, stats: res.stats }
+  })
+
+  ipcMain.handle('ringwatch:set-failover-drive', (_e, drivePath: string) => {
+    const targetDir = path.join(drivePath, 'RingWatch-Failover')
+    fs.mkdirSync(targetDir, { recursive: true })
+    const settings = configStore.updateSettings({ failoverRecordingsDir: targetDir })
+    const res = recordingService.rescanDirectory()
+    ringService.syncNvrSettings()
+    sendToRenderer('ringwatch:settings-updated', settings)
+    sendToRenderer('ringwatch:recordings-updated', res.recordings)
+    sendToRenderer('ringwatch:storage-stats-updated', res.stats)
+    return { settings, stats: res.stats }
+  })
+
+  ipcMain.handle('ringwatch:clear-failover-storage', () => {
+    const settings = configStore.updateSettings({ failoverRecordingsDir: '' })
+    const stats = recordingService.getStorageStats()
+    ringService.syncNvrSettings()
+    sendToRenderer('ringwatch:settings-updated', settings)
+    sendToRenderer('ringwatch:storage-stats-updated', stats)
+    return { settings, stats }
+  })
 
   ipcMain.handle('ringwatch:rescan-storage', () => {
     const res = recordingService.rescanDirectory()
@@ -346,14 +447,14 @@ function registerIpcHandlers(): void {
     if (rec && fs.existsSync(rec.filePath)) {
       shell.showItemInFolder(rec.filePath)
     } else {
-      const dir = configStore.getPublicSettings().recordingsDir
+      const dir = recordingService.resolveActiveStorageDir().activeDir
       fs.mkdirSync(dir, { recursive: true })
       void shell.openPath(dir)
     }
   })
 
   ipcMain.handle('ringwatch:open-recordings-root', () => {
-    const dir = configStore.getPublicSettings().recordingsDir
+    const dir = recordingService.resolveActiveStorageDir().activeDir
     fs.mkdirSync(dir, { recursive: true })
     void shell.openPath(dir)
   })
@@ -401,7 +502,10 @@ function registerIpcHandlers(): void {
   ipcMain.handle('ringwatch:update-settings', (_e, patch: AppSettingsPatch) => {
     const updated = configStore.updateSettings(patch)
     aiPackageService.syncScheduler()
+    syncLoginItemSettings()
+    ringService.syncNvrSettings()
     rebuildTrayMenu()
+    sendToRenderer('ringwatch:settings-updated', updated)
     sendToRenderer('ringwatch:storage-stats-updated', recordingService.getStorageStats())
     return updated
   })
@@ -409,14 +513,36 @@ function registerIpcHandlers(): void {
   ipcMain.handle('ringwatch:choose-recordings-folder', async () => {
     if (!mainWindow) return null
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: 'Select RingWatch Recordings Folder',
+      title: 'Select Primary NVR Recordings Folder (Internal, USB, or NAS)',
       defaultPath: configStore.getPublicSettings().recordingsDir,
       properties: ['openDirectory', 'createDirectory'],
     })
     if (result.canceled || result.filePaths.length === 0) return null
     const chosen = result.filePaths[0]
-    configStore.updateSettings({ recordingsDir: chosen })
+    const updated = configStore.updateSettings({ recordingsDir: chosen })
     const res = recordingService.rescanDirectory()
+    ringService.syncNvrSettings()
+    sendToRenderer('ringwatch:settings-updated', updated)
+    sendToRenderer('ringwatch:recordings-updated', res.recordings)
+    sendToRenderer('ringwatch:storage-stats-updated', res.stats)
+    rebuildTrayMenu()
+    return chosen
+  })
+
+  ipcMain.handle('ringwatch:choose-failover-folder', async () => {
+    if (!mainWindow) return null
+    const current = configStore.getPublicSettings().failoverRecordingsDir
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Select Failover NVR Storage Folder',
+      defaultPath: current || configStore.getDefaultRecordingsDir(),
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (result.canceled || result.filePaths.length === 0) return null
+    const chosen = result.filePaths[0]
+    const updated = configStore.updateSettings({ failoverRecordingsDir: chosen })
+    const res = recordingService.rescanDirectory()
+    ringService.syncNvrSettings()
+    sendToRenderer('ringwatch:settings-updated', updated)
     sendToRenderer('ringwatch:recordings-updated', res.recordings)
     sendToRenderer('ringwatch:storage-stats-updated', res.stats)
     return chosen
@@ -442,8 +568,11 @@ if (!singleInstanceLock) {
     fs.mkdirSync(defaultRecordingsDir, { recursive: true })
 
     configStore = new ConfigStore(userDataDir, defaultRecordingsDir, safeStorage)
+    syncLoginItemSettings()
+
     streamService = new StreamService(
       () => configStore.getPublicSettings().recordingsDir,
+      () => (recordingService ? recordingService.getAllStorageRoots() : []),
     )
     recordingService = new RecordingService(
       userDataDir,
@@ -482,6 +611,8 @@ if (!singleInstanceLock) {
       streamService,
       recordingService,
       aiPackageService,
+      notifications: notificationService,
+      onPowerSaveChange: (shouldBlock) => setPowerSaveBlock(shouldBlock),
       demoAssetsDir: resolveDemoAssetsDir(),
       callbacks: {
         onConnectionChanged: (status) =>
@@ -504,8 +635,10 @@ if (!singleInstanceLock) {
         },
         onRecordingsUpdated: (recordings) =>
           sendToRenderer('ringwatch:recordings-updated', recordings),
-        onStorageStatsUpdated: (stats) =>
-          sendToRenderer('ringwatch:storage-stats-updated', stats),
+        onStorageStatsUpdated: (stats) => {
+          sendToRenderer('ringwatch:storage-stats-updated', stats)
+          rebuildTrayMenu()
+        },
       },
     })
 
@@ -517,6 +650,7 @@ if (!singleInstanceLock) {
 
   app.on('before-quit', () => {
     isQuitting = true
+    setPowerSaveBlock(false)
     ringService?.shutdown()
   })
 

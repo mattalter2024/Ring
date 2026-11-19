@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -475,13 +476,16 @@ describe('Continuous All-Camera NVR Recording', () => {
     const defaults = store.getPublicSettings()
     expect(defaults.continuousSegmentSeconds).toBe(120)
     expect(defaults.continuousSkipBatteryCams).toBe(false)
-    expect(defaults.continuousAutoStart).toBe(false)
+    expect(defaults.continuousAutoStart).toBe(true)
     expect(defaults.continuousCameraIds).toEqual([])
+    expect(defaults.organizeByDateFolder).toBe(true)
+    expect(defaults.preventSleepWhileRecording).toBe(true)
+    expect(defaults.nvrNotificationsEnabled).toBe(true)
 
     store.updateSettings({
       continuousSegmentSeconds: 10, // clamped to 30
       continuousSkipBatteryCams: true,
-      continuousAutoStart: true,
+      continuousAutoStart: false,
       continuousCameraIds: ['cam-a', 'cam-b'],
     })
 
@@ -489,7 +493,7 @@ describe('Continuous All-Camera NVR Recording', () => {
     const pub = reloaded.getPublicSettings()
     expect(pub.continuousSegmentSeconds).toBe(30)
     expect(pub.continuousSkipBatteryCams).toBe(true)
-    expect(pub.continuousAutoStart).toBe(true)
+    expect(pub.continuousAutoStart).toBe(false)
     expect(pub.continuousCameraIds).toEqual(['cam-a', 'cam-b'])
   })
 
@@ -501,11 +505,12 @@ describe('Continuous All-Camera NVR Recording', () => {
 
     const recService = new RecordingService(tmpDir, store, streamService)
     const target = recService.createNvrSegmentTarget('Front Porch')
-    expect(target.dir).toBe(recDir)
+    expect(target.dir.startsWith(recDir)).toBe(true)
+    expect(target.dir).toMatch(/\d{4}-\d{2}-\d{2}[\\/]front-porch$/)
     expect(target.segmentPattern).toContain('_continuous_')
     expect(target.segmentListPath).toContain('.csv')
 
-    const tinyPath = path.join(recDir, `${target.prefix}_0000.mp4`)
+    const tinyPath = path.join(target.dir, `${target.prefix}_0000.mp4`)
     fs.writeFileSync(tinyPath, Buffer.alloc(512, 0))
     const skipped = recService.registerRecordedSegment({
       cameraId: 'cam-1',
@@ -517,7 +522,7 @@ describe('Continuous All-Camera NVR Recording', () => {
     })
     expect(skipped).toBeNull()
 
-    const validPath = path.join(recDir, `${target.prefix}_0001.mp4`)
+    const validPath = path.join(target.dir, `${target.prefix}_0001.mp4`)
     fs.writeFileSync(validPath, Buffer.alloc(8192, 7))
     const startedIso = new Date(Date.now() - 120_000).toISOString()
 
@@ -545,7 +550,7 @@ describe('Continuous All-Camera NVR Recording', () => {
     expect(reg2?.id).toBe(reg1?.id)
     expect(recService.listRecordings()).toHaveLength(1)
 
-    // Rescanning disk on a fresh RecordingService infers 'continuous' trigger & skips tiny files
+    // Rescanning disk recursively on a fresh RecordingService infers 'continuous' trigger & skips tiny files
     const freshService = new RecordingService(
       path.join(tmpDir, 'fresh-index'),
       store,
@@ -602,4 +607,232 @@ describe('Continuous All-Camera NVR Recording', () => {
     expect(onEnded).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('Autonomous 24/7 UNVR & Storage Management', () => {
+  let tmpDir: string
+  let streamService: StreamService
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    streamService?.stopAll()
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('auto-migrates v1 configs to v2 autonomous 24/7 defaults and clamps disk thresholds', () => {
+    const configPath = path.join(tmpDir, 'config.json')
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        mode: 'live',
+        continuousAutoStart: false,
+        maxStorageGb: 25,
+      }),
+    )
+
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    const migrated = store.getPublicSettings()
+    expect(migrated.continuousAutoStart).toBe(true)
+    expect(migrated.preventSleepWhileRecording).toBe(true)
+    expect(migrated.nvrNotificationsEnabled).toBe(true)
+    expect(migrated.organizeByDateFolder).toBe(true)
+    expect(migrated.launchAtLogin).toBe(true)
+
+    // Updating minFreeDiskGb above lowDiskWarningGb automatically raises lowDiskWarningGb >= minFreeDiskGb
+    const updated = store.updateSettings({
+      minFreeDiskGb: 40,
+      lowDiskWarningGb: 15,
+      maxStorageGb: 50000, // clamped to 20000
+    })
+    expect(updated.minFreeDiskGb).toBe(40)
+    expect(updated.lowDiskWarningGb).toBe(40)
+    expect(updated.maxStorageGb).toBe(20000)
+
+    // If user explicitly turns continuousAutoStart off in v2, reload preserves their choice
+    store.updateSettings({ continuousAutoStart: false })
+    const reloaded = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    expect(reloaded.getPublicSettings().continuousAutoStart).toBe(false)
+  })
+
+  it('fails over automatically to failover storage when primary external mount is offline', async () => {
+    const defaultDir = path.join(tmpDir, 'default-videos')
+    const failoverDir = path.join(tmpDir, 'failover-usb')
+    fs.mkdirSync(failoverDir, { recursive: true })
+
+    const store = new ConfigStore(tmpDir, defaultDir)
+    store.updateSettings({
+      recordingsDir: '/mnt/unplugged-ringwatch-external-drive/RingWatch',
+      failoverRecordingsDir: failoverDir,
+    })
+
+    streamService = new StreamService(() => store.getPublicSettings().recordingsDir)
+    await streamService.startServer()
+    const recService = new RecordingService(tmpDir, store, streamService)
+
+    const resolved = recService.resolveActiveStorageDir()
+    expect(resolved.primaryOnline).toBe(false)
+    expect(resolved.usingFailover).toBe(true)
+    expect(resolved.activeDir).toBe(failoverDir)
+
+    // Segments created during failover land under failoverDir
+    const target = recService.createNvrSegmentTarget('Driveway Cam')
+    expect(target.dir.startsWith(failoverDir)).toBe(true)
+
+    // Restoring primary directory switches back seamlessly
+    const restoredPrimary = path.join(tmpDir, 'primary-restored')
+    fs.mkdirSync(restoredPrimary, { recursive: true })
+    store.updateSettings({ recordingsDir: restoredPrimary })
+    const afterRestore = recService.resolveActiveStorageDir()
+    expect(afterRestore.primaryOnline).toBe(true)
+    expect(afterRestore.usingFailover).toBe(false)
+    expect(afterRestore.activeDir).toBe(restoredPrimary)
+  })
+
+  it('serves date-folder MP4 recordings with HTTP 206 Range via /recording-id/<id>', async () => {
+    const recDir = path.join(tmpDir, 'vault')
+    const store = new ConfigStore(tmpDir, recDir)
+    streamService = new StreamService(() => [recDir])
+    await streamService.startServer()
+
+    const recService = new RecordingService(tmpDir, store, streamService)
+    const target = recService.createNvrSegmentTarget('Back Patio')
+    const payload = Buffer.alloc(16_384, 0x42)
+    const mp4Path = path.join(target.dir, `${target.prefix}_0001.mp4`)
+    fs.writeFileSync(mp4Path, payload)
+
+    const item = recService.registerRecordedSegment({
+      cameraId: 'cam-patio',
+      cameraName: 'Back Patio',
+      filePath: mp4Path,
+      createdAt: new Date().toISOString(),
+      durationSeconds: 120,
+      trigger: 'continuous',
+    })
+
+    expect(item?.playbackUrl).toContain('/recording-id/')
+    const res = await fetch(item!.playbackUrl!, {
+      headers: { Range: 'bytes=0-1023' },
+    })
+    expect(res.status).toBe(206)
+    expect(res.headers.get('content-range')).toBe('bytes 0-1023/16384')
+    const buf = Buffer.from(await res.arrayBuffer())
+    expect(buf.length).toBe(1024)
+    expect(buf[0]).toBe(0x42)
+  })
+
+  it('enforces free-disk floor ring-buffer pruning while protecting starred clips and reporting disk health', async () => {
+    const recDir = path.join(tmpDir, 'floor-vault')
+    const store = new ConfigStore(tmpDir, recDir)
+    store.updateSettings({
+      maxStorageGb: 0, // unlimited quota; rely on free-disk floor
+      retentionDays: 0,
+      lowDiskWarningGb: 20,
+      minFreeDiskGb: 10,
+      organizeByDateFolder: false,
+    })
+
+    streamService = new StreamService(() => recDir)
+    await streamService.startServer()
+    const recService = new RecordingService(tmpDir, store, streamService)
+
+    const makeClip = (name: string, ageMinutes: number, bytes: number) => {
+      const p = path.join(recDir, name)
+      fs.mkdirSync(recDir, { recursive: true })
+      fs.writeFileSync(p, Buffer.alloc(bytes, 1))
+      return recService.registerRecordedSegment({
+        cameraId: 'cam-front',
+        cameraName: 'Front Door',
+        filePath: p,
+        createdAt: new Date(Date.now() - ageMinutes * 60_000).toISOString(),
+        durationSeconds: 120,
+        trigger: 'continuous',
+      })!
+    }
+
+    const oldestStarred = makeClip('clip_01.mp4', 90, 20_000)
+    const oldUnprotected = makeClip('clip_02.mp4', 60, 20_000)
+    const newestUnprotected = makeClip('clip_03.mp4', 10, 20_000)
+    recService.toggleStar(oldestStarred.id)
+
+    // Simulate critically low free disk space (below 10 GB floor by 25 KB)
+    const GB = 1024 * 1024 * 1024
+    const simulatedFreeBytes = 10 * GB - 25_000
+
+    const statsBefore = recService.getStorageStats(simulatedFreeBytes)
+    expect(statsBefore.diskHealth).toBe('critical')
+    expect(statsBefore.protectedBytes).toBe(20_000)
+    expect(statsBefore.perCameraUsage).toHaveLength(1)
+    expect(statsBefore.perCameraUsage[0].clipCount).toBe(3)
+
+    const pruneRes = recService.enforceRetentionAndQuota(undefined, simulatedFreeBytes)
+    expect(pruneRes.prunedCount).toBe(2) // both unprotected clips recycled to recover 25KB deficit
+    expect(pruneRes.freedBytes).toBe(40_000)
+
+    const remaining = recService.listRecordings()
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0].id).toBe(oldestStarred.id)
+    expect(fs.existsSync(oldUnprotected.filePath)).toBe(false)
+    expect(fs.existsSync(newestUnprotected.filePath)).toBe(false)
+
+    // Warning health when between minFreeDiskGb (10) and lowDiskWarningGb (20)
+    const statsWarn = recService.getStorageStats(15 * GB)
+    expect(statsWarn.diskHealth).toBe('warning')
+
+    // Healthy when above lowDiskWarningGb (20)
+    const statsOk = recService.getStorageStats(50 * GB)
+    expect(statsOk.diskHealth).toBe('healthy')
+  })
+
+  it('exports tamper-evident SHA-256 evidence bundle (.mp4 + .evidence.json)', async () => {
+    const recDir = path.join(tmpDir, 'evidence-vault')
+    const exportDir = path.join(tmpDir, 'exports')
+    fs.mkdirSync(exportDir, { recursive: true })
+
+    const store = new ConfigStore(tmpDir, recDir)
+    streamService = new StreamService(() => recDir)
+    await streamService.startServer()
+    const recService = new RecordingService(tmpDir, store, streamService)
+
+    const target = recService.createNvrSegmentTarget('Front Porch')
+    const rawBytes = Buffer.from('RINGWATCH-EVIDENCE-TEST-PAYLOAD-'.repeat(256))
+    const srcPath = path.join(target.dir, `${target.prefix}_0001.mp4`)
+    fs.writeFileSync(srcPath, rawBytes)
+
+    const item = recService.registerRecordedSegment({
+      cameraId: 'cam-1',
+      cameraName: 'Front Porch',
+      filePath: srcPath,
+      createdAt: new Date().toISOString(),
+      durationSeconds: 60,
+      trigger: 'package',
+    })!
+
+    const destMp4 = path.join(exportDir, 'porch-delivery.mp4')
+    const bundle = recService.exportEvidenceBundle(item.id, destMp4)
+
+    expect(fs.existsSync(bundle.videoPath)).toBe(true)
+    expect(fs.existsSync(bundle.manifestPath)).toBe(true)
+
+    const expectedSha = crypto.createHash('sha256').update(rawBytes).digest('hex')
+    expect(bundle.sha256).toBe(expectedSha)
+
+    const manifest = JSON.parse(fs.readFileSync(bundle.manifestPath, 'utf-8')) as {
+      schema: string
+      sha256: string
+      recording: {
+        cameraName: string
+        trigger: string
+        sizeBytes: number
+      }
+    }
+    expect(manifest.schema).toBe('ringwatch-evidence-bundle/v1')
+    expect(manifest.sha256).toBe(expectedSha)
+    expect(manifest.recording.cameraName).toBe('Front Porch')
+    expect(manifest.recording.trigger).toBe('package')
+    expect(manifest.recording.sizeBytes).toBe(rawBytes.length)
+  })
+})
+
 

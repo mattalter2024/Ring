@@ -1,7 +1,9 @@
 import {
+  AlertTriangle,
   BellRing,
   Circle,
   DoorOpen,
+  HardDrive,
   PackageCheck,
   RefreshCw,
   ShieldAlert,
@@ -9,7 +11,12 @@ import {
   Square,
   Zap,
 } from 'lucide-react'
-import type { ConnectionStatus, NvrStatus, RingLocationInfo } from '@shared/types'
+import type {
+  ConnectionStatus,
+  NvrStatus,
+  RingLocationInfo,
+  StorageStats,
+} from '@shared/types'
 import type { NavTab } from './Sidebar'
 
 interface TopBarProps {
@@ -17,10 +24,12 @@ interface TopBarProps {
   connection: ConnectionStatus
   primaryLocation?: RingLocationInfo
   nvrStatus: NvrStatus
+  storageStats: StorageStats
   cameraCount: number
   nvrBusy: boolean
   isRefreshing: boolean
   onToggleAllRecording: () => void
+  onOpenNvr: () => void
   onRefresh: () => void
   onSimulateDemoEvent: (
     kind: 'doorbell' | 'motion' | 'contact-open' | 'package-delivery',
@@ -31,6 +40,10 @@ const TAB_COPY: Record<NavTab, { title: string; subtitle: string }> = {
   cameras: {
     title: 'Live Cameras',
     subtitle: 'Real-time HLS video streams, continuous all-camera NVR recording, and instant snapshots',
+  },
+  nvr: {
+    title: '24/7 NVR & Storage Console',
+    subtitle: 'Autonomous continuous recording, external USB/HDD/NAS drive pool, failover, and health watchdog',
   },
   timeline: {
     title: 'Video & Event Timeline',
@@ -59,10 +72,12 @@ export function TopBar({
   connection,
   primaryLocation,
   nvrStatus,
+  storageStats,
   cameraCount,
   nvrBusy,
   isRefreshing,
   onToggleAllRecording,
+  onOpenNvr,
   onRefresh,
   onSimulateDemoEvent,
 }: TopBarProps) {
@@ -77,6 +92,17 @@ export function TopBar({
           ? 'Disarmed'
           : 'No Alarm'
 
+  const showStorageAlert =
+    storageStats.usingFailover || storageStats.diskHealth !== 'healthy'
+
+  const storageAlertLabel = storageStats.usingFailover
+    ? 'Failover Active'
+    : storageStats.diskHealth === 'offline'
+      ? 'Drive Offline'
+      : storageStats.diskHealth === 'critical'
+        ? 'Critical Disk'
+        : 'Low Disk'
+
   return (
     <header className="topbar">
       <div className="topbar-title-group">
@@ -85,6 +111,29 @@ export function TopBar({
       </div>
 
       <div className="topbar-actions">
+        {showStorageAlert && (
+          <button
+            id="btn-topbar-storage-alert"
+            type="button"
+            className={`btn btn-sm ${
+              storageStats.usingFailover ||
+              storageStats.diskHealth === 'critical' ||
+              storageStats.diskHealth === 'offline'
+                ? 'btn-danger'
+                : 'btn-warn'
+            }`}
+            onClick={onOpenNvr}
+            title="Open NVR & Storage Console to inspect drive status and free space"
+          >
+            {storageStats.usingFailover ? (
+              <HardDrive size={13} />
+            ) : (
+              <AlertTriangle size={13} />
+            )}
+            {storageAlertLabel}
+          </button>
+        )}
+
         {cameraCount > 0 && (
           <button
             id="btn-topbar-nvr-toggle"

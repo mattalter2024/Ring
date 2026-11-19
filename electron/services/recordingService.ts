@@ -4,11 +4,18 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import type { LocalRecordingItem, StorageStats } from '../../shared/types'
+import type {
+  CameraStorageUsage,
+  DiskHealthStatus,
+  LocalRecordingItem,
+  StorageDriveInfo,
+  StorageStats,
+} from '../../shared/types'
 import type { ConfigStore } from './configStore'
 import type { StreamService, StreamableRingCamera } from './streamService'
 
 const execFileAsync = promisify(execFile)
+const BYTES_PER_GB = 1024 * 1024 * 1024
 
 export interface RecordableRingCamera {
   recordToFile(outputPath: string, duration?: number): Promise<void>
@@ -26,6 +33,12 @@ export interface NvrSegmentTarget {
   ffmpegSegmentListPath: string
 }
 
+export interface ResolvedStorageLocation {
+  activeDir: string
+  primaryOnline: boolean
+  usingFailover: boolean
+}
+
 export class RecordingService {
   private readonly indexPath: string
   private readonly configStore: ConfigStore
@@ -41,12 +54,319 @@ export class RecordingService {
     this.configStore = configStore
     this.streamService = streamService
     this.recordings = this.loadIndex()
+    this.streamService.setRecordingPathResolver((id) => this.getRecordingById(id)?.filePath)
+  }
+
+  private isMountRootAvailable(dirPath: string): boolean {
+    const trimmed = dirPath.trim()
+    if (!trimmed) return false
+
+    if (process.platform === 'win32') {
+      const parsed = path.parse(trimmed)
+      if (parsed.root && !fs.existsSync(parsed.root)) {
+        return false
+      }
+      return true
+    }
+
+    // On POSIX, prevent creating fake folders inside unmounted external drive roots
+    const normalized = path.resolve(trimmed)
+    const parts = normalized.split(path.sep).filter(Boolean)
+    if (parts.length >= 2 && (parts[0] === 'mnt' || parts[0] === 'Volumes')) {
+      const mountRoot = path.sep + path.join(parts[0], parts[1])
+      if (!fs.existsSync(mountRoot)) return false
+    } else if (parts.length >= 3 && parts[0] === 'media') {
+      const mountRoot = path.sep + path.join(parts[0], parts[1], parts[2])
+      if (!fs.existsSync(mountRoot)) return false
+    }
+    return true
+  }
+
+  isDirectoryWritable(dirPath: string): boolean {
+    const trimmed = dirPath.trim()
+    if (!trimmed) return false
+    if (!this.isMountRootAvailable(trimmed)) return false
+
+    try {
+      if (!fs.existsSync(trimmed)) {
+        fs.mkdirSync(trimmed, { recursive: true })
+      }
+      const stat = fs.statSync(trimmed)
+      if (!stat.isDirectory()) return false
+      fs.accessSync(trimmed, fs.constants.W_OK)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  resolveActiveStorageDir(): ResolvedStorageLocation {
+    const settings = this.configStore.getPublicSettings()
+    if (this.isDirectoryWritable(settings.recordingsDir)) {
+      return {
+        activeDir: settings.recordingsDir,
+        primaryOnline: true,
+        usingFailover: false,
+      }
+    }
+
+    if (
+      settings.failoverRecordingsDir &&
+      this.isDirectoryWritable(settings.failoverRecordingsDir)
+    ) {
+      return {
+        activeDir: settings.failoverRecordingsDir,
+        primaryOnline: false,
+        usingFailover: true,
+      }
+    }
+
+    const fallback = this.configStore.getDefaultRecordingsDir()
+    try {
+      fs.mkdirSync(fallback, { recursive: true })
+    } catch {
+      // ignore fallback mkdir error
+    }
+    return {
+      activeDir: fallback,
+      primaryOnline: false,
+      usingFailover: path.resolve(fallback) !== path.resolve(settings.recordingsDir),
+    }
+  }
+
+  getAllStorageRoots(): string[] {
+    const settings = this.configStore.getPublicSettings()
+    const candidates = [
+      settings.recordingsDir,
+      settings.failoverRecordingsDir,
+      this.configStore.getDefaultRecordingsDir(),
+    ]
+    const unique = new Set<string>()
+    for (const candidate of candidates) {
+      if (!candidate?.trim()) continue
+      if (this.isMountRootAvailable(candidate) && fs.existsSync(candidate)) {
+        unique.add(path.resolve(candidate))
+      }
+    }
+    return Array.from(unique)
   }
 
   private ensureRecordingsDir(): string {
-    const dir = this.configStore.getPublicSettings().recordingsDir
-    fs.mkdirSync(dir, { recursive: true })
-    return dir
+    return this.resolveActiveStorageDir().activeDir
+  }
+
+  private formatLocalDateFolder(date: Date): string {
+    const y = date.getFullYear()
+    const m = String(date.getMonth() + 1).padStart(2, '0')
+    const d = String(date.getDate()).padStart(2, '0')
+    return `${y}-${m}-${d}`
+  }
+
+  private resolveClipDirectory(cameraName: string, date = new Date()): string {
+    const activeDir = this.ensureRecordingsDir()
+    const settings = this.configStore.getPublicSettings()
+    if (!settings.organizeByDateFolder) {
+      return activeDir
+    }
+    const dayFolder = this.formatLocalDateFolder(date)
+    const camSlug = this.buildSlug(cameraName)
+    const targetDir = path.join(activeDir, dayFolder, camSlug)
+    fs.mkdirSync(targetDir, { recursive: true })
+    return targetDir
+  }
+
+  private getDiskSpace(dirPath: string): {
+    totalBytes: number | null
+    freeBytes: number | null
+  } {
+    try {
+      if (typeof fs.statfsSync === 'function' && fs.existsSync(dirPath)) {
+        const statfs = fs.statfsSync(dirPath)
+        const totalBytes = Number(statfs.blocks) * Number(statfs.bsize)
+        const freeBytes = Number(statfs.bavail) * Number(statfs.bsize)
+        return {
+          totalBytes: Number.isFinite(totalBytes) ? totalBytes : null,
+          freeBytes: Number.isFinite(freeBytes) ? freeBytes : null,
+        }
+      }
+    } catch {
+      // ignore statfs errors
+    }
+    return { totalBytes: null, freeBytes: null }
+  }
+
+  async listStorageDrives(): Promise<StorageDriveInfo[]> {
+    const settings = this.configStore.getPublicSettings()
+    const primaryNorm = path.resolve(settings.recordingsDir).toLowerCase()
+    const failoverNorm = settings.failoverRecordingsDir
+      ? path.resolve(settings.failoverRecordingsDir).toLowerCase()
+      : ''
+
+    const matchesTarget = (driveRoot: string, targetNorm: string): boolean => {
+      if (!targetNorm) return false
+      const normRoot = path.resolve(driveRoot).toLowerCase()
+      if (process.platform === 'win32') {
+        return targetNorm.slice(0, 2) === normRoot.slice(0, 2)
+      }
+      return targetNorm === normRoot || targetNorm.startsWith(`${normRoot}${path.sep}`)
+    }
+
+    if (process.platform === 'win32') {
+      try {
+        const { stdout } = await execFileAsync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            'Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID,VolumeName,DriveType,Size,FreeSpace | ConvertTo-Json -Compress',
+          ],
+          { timeout: 6000 },
+        )
+        const trimmed = stdout.trim()
+        if (trimmed) {
+          const parsed = JSON.parse(trimmed) as
+            | Array<Record<string, unknown>>
+            | Record<string, unknown>
+          const rows = Array.isArray(parsed) ? parsed : [parsed]
+          const drives: StorageDriveInfo[] = []
+          for (const row of rows) {
+            const deviceId = String(row.DeviceID ?? '').trim()
+            if (!deviceId) continue
+            const drivePath = deviceId.endsWith('\\') ? deviceId : `${deviceId}\\`
+            const rawType = Number(row.DriveType ?? 0)
+            const driveType: StorageDriveInfo['driveType'] =
+              rawType === 2
+                ? 'removable'
+                : rawType === 3
+                  ? 'fixed'
+                  : rawType === 4
+                    ? 'network'
+                    : 'unknown'
+            // Skip optical CD/DVD drives (5) and RAM disks (6)
+            if (rawType === 5 || rawType === 6) continue
+            const totalBytes =
+              typeof row.Size === 'number' && Number.isFinite(row.Size) ? row.Size : null
+            const freeBytes =
+              typeof row.FreeSpace === 'number' && Number.isFinite(row.FreeSpace)
+                ? row.FreeSpace
+                : null
+            const usedBytes =
+              totalBytes !== null && freeBytes !== null
+                ? Math.max(0, totalBytes - freeBytes)
+                : null
+            const volName = String(row.VolumeName ?? '').trim()
+            const typeTag =
+              driveType === 'removable'
+                ? 'External USB'
+                : driveType === 'network'
+                  ? 'Network / NAS'
+                  : 'Local Disk'
+            const label = volName ? `${volName} (${deviceId})` : `${typeTag} (${deviceId})`
+            let writable = false
+            try {
+              fs.accessSync(drivePath, fs.constants.W_OK)
+              writable = true
+            } catch {
+              writable = freeBytes !== null && freeBytes > 0
+            }
+
+            drives.push({
+              id: deviceId.toLowerCase(),
+              path: drivePath,
+              label,
+              driveType,
+              totalBytes,
+              freeBytes,
+              usedBytes,
+              writable,
+              isPrimary: matchesTarget(drivePath, primaryNorm),
+              isFailover: matchesTarget(drivePath, failoverNorm),
+            })
+          }
+          if (drives.length > 0) {
+            return drives
+          }
+        }
+      } catch {
+        // Fall through to generic filesystem listing
+      }
+    }
+
+    // Fallback for Linux / macOS / restricted Windows environments
+    const candidates: Array<{
+      path: string
+      label: string
+      driveType: StorageDriveInfo['driveType']
+    }> = [
+      {
+        path: settings.recordingsDir,
+        label: 'Primary Recordings Vault',
+        driveType: 'fixed',
+      },
+    ]
+
+    if (settings.failoverRecordingsDir) {
+      candidates.push({
+        path: settings.failoverRecordingsDir,
+        label: 'Failover Vault',
+        driveType: 'fixed',
+      })
+    }
+
+    const defaultDir = this.configStore.getDefaultRecordingsDir()
+    if (path.resolve(defaultDir) !== path.resolve(settings.recordingsDir)) {
+      candidates.push({
+        path: defaultDir,
+        label: 'Internal Local Vault',
+        driveType: 'fixed',
+      })
+    }
+
+    for (const mountParent of ['/Volumes', '/mnt', '/media']) {
+      if (!fs.existsSync(mountParent)) continue
+      try {
+        for (const entry of fs.readdirSync(mountParent, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue
+          const mountPath = path.join(mountParent, entry.name)
+          candidates.push({
+            path: mountPath,
+            label: `${entry.name} (Mounted Drive)`,
+            driveType: 'removable',
+          })
+        }
+      } catch {
+        // ignore unreadable mount directory
+      }
+    }
+
+    const seen = new Set<string>()
+    const drives: StorageDriveInfo[] = []
+    for (const cand of candidates) {
+      const resolved = path.resolve(cand.path)
+      if (seen.has(resolved)) continue
+      seen.add(resolved)
+      const writable = this.isDirectoryWritable(resolved)
+      const { totalBytes, freeBytes } = this.getDiskSpace(resolved)
+      const usedBytes =
+        totalBytes !== null && freeBytes !== null
+          ? Math.max(0, totalBytes - freeBytes)
+          : null
+      drives.push({
+        id: resolved,
+        path: resolved,
+        label: cand.label,
+        driveType: cand.driveType,
+        totalBytes,
+        freeBytes,
+        usedBytes,
+        writable,
+        isPrimary: matchesTarget(resolved, primaryNorm),
+        isFailover: matchesTarget(resolved, failoverNorm),
+      })
+    }
+
+    return drives
   }
 
   private loadIndex(): LocalRecordingItem[] {
@@ -75,10 +395,14 @@ export class RecordingService {
     }
   }
 
+  private buildPlaybackUrl(item: Pick<LocalRecordingItem, 'id' | 'fileName'>): string {
+    return this.streamService.getRecordingPlaybackUrlById(item.id, item.fileName)
+  }
+
   private withPlaybackUrls(items: LocalRecordingItem[]): LocalRecordingItem[] {
     return items.map((item) => ({
       ...item,
-      playbackUrl: this.streamService.getRecordingPlaybackUrl(item.fileName),
+      playbackUrl: this.buildPlaybackUrl(item),
     }))
   }
 
@@ -96,38 +420,129 @@ export class RecordingService {
     return this.recordings.find((r) => r.id === id)
   }
 
-  getStorageStats(): StorageStats {
+  getStorageStats(overrideFreeDiskBytes?: number): StorageStats {
     const settings = this.configStore.getPublicSettings()
-    const dir = this.ensureRecordingsDir()
+    const resolved = this.resolveActiveStorageDir()
     const active = this.listRecordings()
 
     let totalBytes = 0
+    let protectedBytes = 0
     let starredClips = 0
+    const cameraMap = new Map<string, CameraStorageUsage>()
+
+    const nowMs = Date.now()
+    const recentCutoffMs = nowMs - 24 * 60 * 60 * 1000
+    let recentBytes = 0
+    let oldestRecentMs = nowMs
+
     for (const rec of active) {
       totalBytes += rec.sizeBytes
-      if (rec.starred) starredClips++
+      if (rec.starred) {
+        starredClips++
+        protectedBytes += rec.sizeBytes
+      }
+
+      const createdMs = new Date(rec.createdAt).getTime()
+      if (Number.isFinite(createdMs) && createdMs >= recentCutoffMs) {
+        recentBytes += rec.sizeBytes
+        if (createdMs < oldestRecentMs) oldestRecentMs = createdMs
+      }
+
+      const existing = cameraMap.get(rec.cameraId)
+      if (!existing) {
+        cameraMap.set(rec.cameraId, {
+          cameraId: rec.cameraId,
+          cameraName: rec.cameraName,
+          clipCount: 1,
+          totalBytes: rec.sizeBytes,
+          protectedBytes: rec.starred ? rec.sizeBytes : 0,
+          oldestClipAt: rec.createdAt,
+          newestClipAt: rec.createdAt,
+        })
+      } else {
+        existing.clipCount++
+        existing.totalBytes += rec.sizeBytes
+        if (rec.starred) existing.protectedBytes += rec.sizeBytes
+        if (!existing.oldestClipAt || rec.createdAt < existing.oldestClipAt) {
+          existing.oldestClipAt = rec.createdAt
+        }
+        if (!existing.newestClipAt || rec.createdAt > existing.newestClipAt) {
+          existing.newestClipAt = rec.createdAt
+        }
+      }
     }
 
-    let freeDiskBytes: number | null = null
-    try {
-      if (typeof fs.statfsSync === 'function') {
-        const statfs = fs.statfsSync(dir)
-        freeDiskBytes = Number(statfs.bavail) * Number(statfs.bsize)
-      }
-    } catch {
-      freeDiskBytes = null
+    const disk = this.getDiskSpace(resolved.activeDir)
+    const totalDiskBytes = disk.totalBytes
+    const freeDiskBytes =
+      overrideFreeDiskBytes !== undefined ? overrideFreeDiskBytes : disk.freeBytes
+
+    const { minFreeBytes, lowWarnBytes } = this.resolveEffectiveDiskThresholds(
+      totalDiskBytes,
+      overrideFreeDiskBytes !== undefined,
+    )
+
+    let diskHealth: DiskHealthStatus = 'healthy'
+    if (!this.isDirectoryWritable(resolved.activeDir)) {
+      diskHealth = 'offline'
+    } else if (freeDiskBytes !== null && freeDiskBytes < minFreeBytes) {
+      diskHealth = 'critical'
+    } else if (
+      !resolved.primaryOnline ||
+      (freeDiskBytes !== null && freeDiskBytes < lowWarnBytes)
+    ) {
+      diskHealth = 'warning'
     }
+
+    const spanHours =
+      recentBytes > 0
+        ? Math.min(24, Math.max(1, (nowMs - oldestRecentMs) / (60 * 60 * 1000)))
+        : 0
+    const writeRateBytesPerHour =
+      recentBytes > 0 && spanHours > 0 ? Math.round(recentBytes / spanHours) : 0
+
+    let estimatedDaysRemaining: number | null = null
+    if (writeRateBytesPerHour > 0) {
+      const diskVaultCeiling =
+        freeDiskBytes !== null
+          ? Math.max(0, freeDiskBytes + totalBytes - minFreeBytes)
+          : Infinity
+      const quotaCeiling =
+        settings.maxStorageGb > 0 ? settings.maxStorageGb * BYTES_PER_GB : Infinity
+      const effectiveCeiling = Math.min(diskVaultCeiling, quotaCeiling)
+      if (Number.isFinite(effectiveCeiling)) {
+        const ringBudget = Math.max(0, effectiveCeiling - protectedBytes)
+        const days = ringBudget / (writeRateBytesPerHour * 24)
+        estimatedDaysRemaining = Number(days.toFixed(1))
+      }
+    }
+
+    const perCameraUsage = Array.from(cameraMap.values()).sort(
+      (a, b) => b.totalBytes - a.totalBytes,
+    )
 
     return {
-      recordingsDir: dir,
+      recordingsDir: settings.recordingsDir,
+      activeRecordingsDir: resolved.activeDir,
+      failoverRecordingsDir: settings.failoverRecordingsDir,
+      usingFailover: resolved.usingFailover,
+      primaryOnline: resolved.primaryOnline,
       totalClips: active.length,
       starredClips,
       totalBytes,
+      protectedBytes,
       maxStorageGb: settings.maxStorageGb,
       retentionDays: settings.retentionDays,
+      lowDiskWarningGb: settings.lowDiskWarningGb,
+      minFreeDiskGb: settings.minFreeDiskGb,
+      diskHealth,
+      totalDiskBytes,
       freeDiskBytes,
+      writeRateBytesPerHour,
+      estimatedDaysRemaining,
       oldestClipAt: active.length > 0 ? active[active.length - 1].createdAt : undefined,
       newestClipAt: active.length > 0 ? active[0].createdAt : undefined,
+      perCameraUsage,
     }
   }
 
@@ -142,7 +557,7 @@ export class RecordingService {
     this.saveIndex()
     return {
       ...updated,
-      playbackUrl: this.streamService.getRecordingPlaybackUrl(updated.fileName),
+      playbackUrl: this.buildPlaybackUrl(updated),
     }
   }
 
@@ -153,6 +568,7 @@ export class RecordingService {
     }
     this.recordings = this.recordings.filter((r) => r.id !== id)
     this.saveIndex()
+    this.cleanupEmptySubdirs()
   }
 
   exportRecording(id: string, destinationPath: string): string {
@@ -164,8 +580,46 @@ export class RecordingService {
     return destinationPath
   }
 
+  exportEvidenceBundle(
+    id: string,
+    destinationMp4Path: string,
+  ): { videoPath: string; manifestPath: string; sha256: string } {
+    const target = this.recordings.find((r) => r.id === id)
+    if (!target || !fs.existsSync(target.filePath)) {
+      throw new Error('Recording file no longer exists on disk')
+    }
+    fs.copyFileSync(target.filePath, destinationMp4Path)
+    const fileBuf = fs.readFileSync(destinationMp4Path)
+    const sha256 = crypto.createHash('sha256').update(fileBuf).digest('hex')
+    const manifestPath = `${destinationMp4Path}.evidence.json`
+    const manifest = {
+      schema: 'ringwatch-evidence-bundle/v1',
+      exportedAt: new Date().toISOString(),
+      sha256,
+      videoFileName: path.basename(destinationMp4Path),
+      recording: {
+        id: target.id,
+        cameraId: target.cameraId,
+        cameraName: target.cameraName,
+        originalFileName: target.fileName,
+        createdAt: target.createdAt,
+        durationSeconds: target.durationSeconds,
+        sizeBytes: target.sizeBytes,
+        trigger: target.trigger,
+        starred: Boolean(target.starred),
+        notes: target.notes ?? '',
+      },
+    }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8')
+    return {
+      videoPath: destinationMp4Path,
+      manifestPath,
+      sha256,
+    }
+  }
+
   importVideoFiles(sourcePaths: string[]): LocalRecordingItem[] {
-    const dir = this.ensureRecordingsDir()
+    const dir = this.resolveClipDirectory('imported', new Date())
     const imported: LocalRecordingItem[] = []
 
     for (const src of sourcePaths) {
@@ -184,8 +638,9 @@ export class RecordingService {
       }
       fs.copyFileSync(src, destPath)
       const stat = fs.statSync(destPath)
+      const id = crypto.randomUUID()
       const item: LocalRecordingItem = {
-        id: crypto.randomUUID(),
+        id,
         cameraId: 'imported-local',
         cameraName: 'Imported Video',
         filePath: destPath,
@@ -195,7 +650,7 @@ export class RecordingService {
         sizeBytes: stat.size,
         trigger: 'imported',
         starred: false,
-        playbackUrl: this.streamService.getRecordingPlaybackUrl(fileName),
+        playbackUrl: this.buildPlaybackUrl({ id, fileName }),
       }
       this.recordings.unshift(item)
       imported.push(item)
@@ -207,49 +662,119 @@ export class RecordingService {
     return imported
   }
 
+  private collectMp4FilesRecursive(rootDir: string, maxDepth = 3): string[] {
+    const results: string[] = []
+    const walk = (dir: string, depth: number) => {
+      if (depth > maxDepth) return
+      let entries: fs.Dirent[]
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          walk(fullPath, depth + 1)
+        } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.mp4')) {
+          results.push(fullPath)
+        }
+      }
+    }
+    walk(rootDir, 0)
+    return results
+  }
+
+  private cleanupEmptySubdirs(): void {
+    const roots = this.getAllStorageRoots()
+    const pruneDir = (dir: string, depth: number): boolean => {
+      if (depth > 3) return false
+      let entries: fs.Dirent[]
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return false
+      }
+      let remaining = 0
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          const removed = pruneDir(full, depth + 1)
+          if (!removed) remaining++
+        } else {
+          remaining++
+        }
+      }
+      if (depth > 0 && remaining === 0) {
+        try {
+          fs.rmdirSync(dir)
+          return true
+        } catch {
+          return false
+        }
+      }
+      return false
+    }
+
+    for (const root of roots) {
+      pruneDir(root, 0)
+    }
+  }
+
   rescanDirectory(): { recordings: LocalRecordingItem[]; stats: StorageStats } {
-    const dir = this.ensureRecordingsDir()
+    this.ensureRecordingsDir()
     this.recordings = this.recordings.filter((r) => fs.existsSync(r.filePath))
-    const indexedNames = new Set(this.recordings.map((r) => r.fileName.toLowerCase()))
+    const indexedPaths = new Set(
+      this.recordings.map((r) => path.resolve(r.filePath).toLowerCase()),
+    )
 
-    const entries = fs.readdirSync(dir, { withFileTypes: true })
-    for (const entry of entries) {
-      if (!entry.isFile()) continue
-      if (!entry.name.toLowerCase().endsWith('.mp4')) continue
-      if (indexedNames.has(entry.name.toLowerCase())) continue
+    const roots = this.getAllStorageRoots()
+    for (const root of roots) {
+      const mp4Files = this.collectMp4FilesRecursive(root, 3)
+      for (const fullPath of mp4Files) {
+        const key = path.resolve(fullPath).toLowerCase()
+        if (indexedPaths.has(key)) continue
 
-      const fullPath = path.join(dir, entry.name)
-      const stat = fs.statSync(fullPath)
-      if (stat.size < 2048) continue
-      const parts = entry.name.split('_')
-      const guessedCam = parts[0]?.replace(/-/g, ' ') || 'Local Camera'
-      const titleCam = guessedCam.replace(/\b\w/g, (m) => m.toUpperCase())
-      const inferredTrigger: LocalRecordingItem['trigger'] =
-        parts[1] === 'continuous'
-          ? 'continuous'
-          : parts[1] === 'motion'
-            ? 'motion'
-            : parts[1] === 'ding'
-              ? 'ding'
-              : parts[1] === 'package'
-                ? 'package'
-                : 'imported'
+        let stat: fs.Stats
+        try {
+          stat = fs.statSync(fullPath)
+        } catch {
+          continue
+        }
+        if (stat.size < 2048) continue
 
-      this.recordings.push({
-        id: crypto.randomUUID(),
-        cameraId: 'local-disk',
-        cameraName: titleCam,
-        filePath: fullPath,
-        fileName: entry.name,
-        createdAt: stat.mtime.toISOString(),
-        durationSeconds:
-          inferredTrigger === 'continuous'
-            ? this.configStore.getPublicSettings().continuousSegmentSeconds
-            : 30,
-        sizeBytes: stat.size,
-        trigger: inferredTrigger,
-        starred: false,
-      })
+        const fileName = path.basename(fullPath)
+        const parts = fileName.split('_')
+        const guessedCam = parts[0]?.replace(/-/g, ' ') || 'Local Camera'
+        const titleCam = guessedCam.replace(/\b\w/g, (m) => m.toUpperCase())
+        const inferredTrigger: LocalRecordingItem['trigger'] =
+          parts[1] === 'continuous'
+            ? 'continuous'
+            : parts[1] === 'motion'
+              ? 'motion'
+              : parts[1] === 'ding'
+                ? 'ding'
+                : parts[1] === 'package'
+                  ? 'package'
+                  : 'imported'
+
+        this.recordings.push({
+          id: crypto.randomUUID(),
+          cameraId: 'local-disk',
+          cameraName: titleCam,
+          filePath: fullPath,
+          fileName,
+          createdAt: stat.mtime.toISOString(),
+          durationSeconds:
+            inferredTrigger === 'continuous'
+              ? this.configStore.getPublicSettings().continuousSegmentSeconds
+              : 30,
+          sizeBytes: stat.size,
+          trigger: inferredTrigger,
+          starred: false,
+        })
+        indexedPaths.add(key)
+      }
     }
 
     this.recordings.sort(
@@ -263,12 +788,35 @@ export class RecordingService {
     }
   }
 
-  enforceRetentionAndQuota(overrideMaxBytes?: number): {
+  private resolveEffectiveDiskThresholds(
+    totalDiskBytes: number | null,
+    hasFreeOverride: boolean,
+  ): { minFreeBytes: number; lowWarnBytes: number } {
+    const settings = this.configStore.getPublicSettings()
+    const rawMin = settings.minFreeDiskGb * BYTES_PER_GB
+    const rawWarn = settings.lowDiskWarningGb * BYTES_PER_GB
+    if (hasFreeOverride || !totalDiskBytes || totalDiskBytes <= 0) {
+      return { minFreeBytes: rawMin, lowWarnBytes: rawWarn }
+    }
+    const minFreeBytes = Math.min(rawMin, Math.floor(totalDiskBytes * 0.2))
+    const lowWarnBytes = Math.max(
+      minFreeBytes,
+      Math.min(rawWarn, Math.floor(totalDiskBytes * 0.35)),
+    )
+    return { minFreeBytes, lowWarnBytes }
+  }
+
+  enforceRetentionAndQuota(
+    overrideMaxBytes?: number,
+    overrideFreeDiskBytes?: number,
+    protectClipId?: string,
+  ): {
     prunedCount: number
     freedBytes: number
     stats: StorageStats
   } {
     const settings = this.configStore.getPublicSettings()
+    const resolved = this.resolveActiveStorageDir()
     let prunedCount = 0
     let freedBytes = 0
 
@@ -278,7 +826,7 @@ export class RecordingService {
       const keep: LocalRecordingItem[] = []
       for (const rec of this.recordings) {
         const createdMs = new Date(rec.createdAt).getTime()
-        if (!rec.starred && createdMs < cutoffMs) {
+        if (!rec.starred && rec.id !== protectClipId && createdMs < cutoffMs) {
           if (fs.existsSync(rec.filePath)) {
             try {
               fs.unlinkSync(rec.filePath)
@@ -300,15 +848,14 @@ export class RecordingService {
       overrideMaxBytes !== undefined
         ? overrideMaxBytes
         : settings.maxStorageGb > 0
-          ? settings.maxStorageGb * 1024 * 1024 * 1024
+          ? settings.maxStorageGb * BYTES_PER_GB
           : 0
 
     if (maxBytes > 0) {
       let totalBytes = this.recordings.reduce((sum, r) => sum + r.sizeBytes, 0)
       if (totalBytes > maxBytes) {
-        // Sort oldest first for pruning candidates
         const oldestUnstarred = [...this.recordings]
-          .filter((r) => !r.starred)
+          .filter((r) => !r.starred && r.id !== protectClipId)
           .sort(
             (a, b) =>
               new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
@@ -336,14 +883,56 @@ export class RecordingService {
       }
     }
 
+    // 3. Enforce Free-Disk Floor ring buffer (auto-recycle oldest unstarred clips if disk free space < effective minFreeBytes)
+    const disk = this.getDiskSpace(resolved.activeDir)
+    const { minFreeBytes } = this.resolveEffectiveDiskThresholds(
+      disk.totalBytes,
+      overrideFreeDiskBytes !== undefined,
+    )
+    let currentFreeBytes =
+      overrideFreeDiskBytes !== undefined ? overrideFreeDiskBytes : disk.freeBytes
+
+    if (currentFreeBytes !== null && currentFreeBytes < minFreeBytes) {
+      const oldestUnstarred = [...this.recordings]
+        .filter((r) => !r.starred && r.id !== protectClipId)
+        .sort(
+          (a, b) =>
+            new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+        )
+
+      const toRemove = new Set<string>()
+      for (const candidate of oldestUnstarred) {
+        if (currentFreeBytes >= minFreeBytes) break
+        toRemove.add(candidate.id)
+        if (fs.existsSync(candidate.filePath)) {
+          try {
+            fs.unlinkSync(candidate.filePath)
+          } catch {
+            // ignore unlink error
+          }
+        }
+        currentFreeBytes += candidate.sizeBytes
+        prunedCount++
+        freedBytes += candidate.sizeBytes
+      }
+
+      if (toRemove.size > 0) {
+        this.recordings = this.recordings.filter((r) => !toRemove.has(r.id))
+      }
+    }
+
     if (prunedCount > 0) {
       this.saveIndex()
+      this.cleanupEmptySubdirs()
     }
+
+    const updatedFreeOverride =
+      overrideFreeDiskBytes !== undefined ? overrideFreeDiskBytes + freedBytes : undefined
 
     return {
       prunedCount,
       freedBytes,
-      stats: this.getStorageStats(),
+      stats: this.getStorageStats(updatedFreeOverride),
     }
   }
 
@@ -363,7 +952,7 @@ export class RecordingService {
   }
 
   createNvrSegmentTarget(cameraName: string, sessionDate = new Date()): NvrSegmentTarget {
-    const dir = this.ensureRecordingsDir()
+    const dir = this.resolveClipDirectory(cameraName, sessionDate)
     const slug = this.buildSlug(cameraName)
     const stamp = sessionDate.toISOString().replace(/[:.]/g, '-').slice(0, 19)
     const suffix = crypto.randomBytes(2).toString('hex')
@@ -404,13 +993,14 @@ export class RecordingService {
     if (existing) {
       return {
         ...existing,
-        playbackUrl: this.streamService.getRecordingPlaybackUrl(existing.fileName),
+        playbackUrl: this.buildPlaybackUrl(existing),
       }
     }
 
+    const id = crypto.randomUUID()
     const fileName = path.basename(params.filePath)
     const item: LocalRecordingItem = {
-      id: crypto.randomUUID(),
+      id,
       cameraId: params.cameraId,
       cameraName: params.cameraName,
       filePath: params.filePath,
@@ -421,7 +1011,7 @@ export class RecordingService {
       trigger: params.trigger,
       starred: false,
       thumbnailDataUrl: params.thumbnailDataUrl,
-      playbackUrl: this.streamService.getRecordingPlaybackUrl(fileName),
+      playbackUrl: this.buildPlaybackUrl({ id, fileName }),
     }
 
     this.recordings.unshift(item)
@@ -429,7 +1019,7 @@ export class RecordingService {
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     )
     this.saveIndex()
-    this.enforceRetentionAndQuota()
+    this.enforceRetentionAndQuota(undefined, undefined, item.id)
     return item
   }
 
@@ -440,8 +1030,8 @@ export class RecordingService {
     durationSeconds: number
     trigger: LocalRecordingItem['trigger']
   }): Promise<LocalRecordingItem> {
-    const dir = this.ensureRecordingsDir()
     const startedAt = new Date()
+    const dir = this.resolveClipDirectory(params.cameraName, startedAt)
     const fileName = this.buildFileName(params.cameraName, params.trigger, startedAt)
     const filePath = path.join(dir, fileName)
 
@@ -482,8 +1072,9 @@ export class RecordingService {
     )
 
     const stat = fs.statSync(filePath)
+    const id = crypto.randomUUID()
     const item: LocalRecordingItem = {
-      id: crypto.randomUUID(),
+      id,
       cameraId: params.cameraId,
       cameraName: params.cameraName,
       filePath,
@@ -494,7 +1085,7 @@ export class RecordingService {
       trigger: params.trigger,
       starred: false,
       thumbnailDataUrl,
-      playbackUrl: this.streamService.getRecordingPlaybackUrl(fileName),
+      playbackUrl: this.buildPlaybackUrl({ id, fileName }),
     }
 
     this.recordings.unshift(item)
@@ -502,7 +1093,7 @@ export class RecordingService {
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     )
     this.saveIndex()
-    this.enforceRetentionAndQuota()
+    this.enforceRetentionAndQuota(undefined, undefined, item.id)
     return item
   }
 
@@ -514,8 +1105,9 @@ export class RecordingService {
     durationSeconds: number
     thumbnailDataUrl?: string
   }): Promise<LocalRecordingItem> {
-    const dir = this.ensureRecordingsDir()
-    const fileName = this.buildFileName(params.cameraName, 'cloud')
+    const now = new Date()
+    const dir = this.resolveClipDirectory(params.cameraName, now)
+    const fileName = this.buildFileName(params.cameraName, 'cloud', now)
     const filePath = path.join(dir, fileName)
 
     const recordingUrl = await params.camera.getRecordingUrl(params.dingId)
@@ -527,24 +1119,25 @@ export class RecordingService {
     fs.writeFileSync(filePath, Buffer.from(arrayBuf))
 
     const stat = fs.statSync(filePath)
+    const id = crypto.randomUUID()
     const item: LocalRecordingItem = {
-      id: crypto.randomUUID(),
+      id,
       cameraId: params.cameraId,
       cameraName: params.cameraName,
       filePath,
       fileName,
-      createdAt: new Date().toISOString(),
+      createdAt: now.toISOString(),
       durationSeconds: params.durationSeconds,
       sizeBytes: stat.size,
       trigger: 'cloud-download',
       starred: false,
       thumbnailDataUrl: params.thumbnailDataUrl,
-      playbackUrl: this.streamService.getRecordingPlaybackUrl(fileName),
+      playbackUrl: this.buildPlaybackUrl({ id, fileName }),
     }
 
     this.recordings.unshift(item)
     this.saveIndex()
-    this.enforceRetentionAndQuota()
+    this.enforceRetentionAndQuota(undefined, undefined, item.id)
     return item
   }
 
@@ -558,10 +1151,10 @@ export class RecordingService {
     createdAtOverride?: string
     starred?: boolean
   }): Promise<LocalRecordingItem> {
-    const dir = this.ensureRecordingsDir()
     const createdDate = params.createdAtOverride
       ? new Date(params.createdAtOverride)
       : new Date()
+    const dir = this.resolveClipDirectory(params.cameraName, createdDate)
     const fileName = this.buildFileName(params.cameraName, params.trigger, createdDate)
     const filePath = path.join(dir, fileName)
 
@@ -594,8 +1187,9 @@ export class RecordingService {
     }
 
     const stat = fs.statSync(filePath)
+    const id = crypto.randomUUID()
     const item: LocalRecordingItem = {
-      id: crypto.randomUUID(),
+      id,
       cameraId: params.cameraId,
       cameraName: params.cameraName,
       filePath,
@@ -606,12 +1200,12 @@ export class RecordingService {
       trigger: params.trigger,
       starred: Boolean(params.starred),
       thumbnailDataUrl: params.thumbnailDataUrl,
-      playbackUrl: this.streamService.getRecordingPlaybackUrl(fileName),
+      playbackUrl: this.buildPlaybackUrl({ id, fileName }),
     }
 
     this.recordings.unshift(item)
     this.saveIndex()
-    this.enforceRetentionAndQuota()
+    this.enforceRetentionAndQuota(undefined, undefined, item.id)
     return item
   }
 

@@ -44,11 +44,21 @@ export class StreamService {
     { dirPath: string; playlistPath: string; streamUrl: string; startedAt: string }
   >()
   private readonly getRecordingsDir: () => string
+  private readonly getAdditionalRecordingsDirs?: () => string[]
+  private recordingPathResolver?: (id: string) => string | undefined
 
-  constructor(getRecordingsDir: () => string) {
+  constructor(
+    getRecordingsDir: () => string,
+    getAdditionalRecordingsDirs?: () => string[],
+  ) {
     this.getRecordingsDir = getRecordingsDir
+    this.getAdditionalRecordingsDirs = getAdditionalRecordingsDirs
     this.hlsRoot = path.join(os.tmpdir(), 'ringwatch-hls')
     fs.mkdirSync(this.hlsRoot, { recursive: true })
+  }
+
+  setRecordingPathResolver(resolver: (id: string) => string | undefined): void {
+    this.recordingPathResolver = resolver
   }
 
   async startServer(): Promise<number> {
@@ -75,6 +85,34 @@ export class StreamService {
   getRecordingPlaybackUrl(fileName: string): string {
     if (!this.port) return ''
     return `http://127.0.0.1:${this.port}/recordings/${encodeURIComponent(fileName)}`
+  }
+
+  getRecordingPlaybackUrlById(recordingId: string, fallbackFileName?: string): string {
+    if (!this.port) return ''
+    if (this.recordingPathResolver) {
+      return `http://127.0.0.1:${this.port}/recording-id/${encodeURIComponent(recordingId)}`
+    }
+    return this.getRecordingPlaybackUrl(fallbackFileName ?? recordingId)
+  }
+
+  private getAllowedRecordingRoots(): string[] {
+    const roots = new Set<string>()
+    const primary = this.getRecordingsDir()
+    if (primary) roots.add(path.resolve(primary))
+    if (this.getAdditionalRecordingsDirs) {
+      for (const dir of this.getAdditionalRecordingsDirs()) {
+        if (dir) roots.add(path.resolve(dir))
+      }
+    }
+    return Array.from(roots)
+  }
+
+  private isPathInsideRoots(fullPath: string, roots: string[]): boolean {
+    const resolved = path.resolve(fullPath)
+    return roots.some((root) => {
+      const normalizedRoot = root.endsWith(path.sep) ? root : `${root}${path.sep}`
+      return resolved === root || resolved.startsWith(normalizedRoot)
+    })
   }
 
   private handleHttpRequest(
@@ -127,20 +165,43 @@ export class StreamService {
       return
     }
 
-    if (cleanPath.startsWith('/recordings/')) {
-      const fileName = path.basename(cleanPath.slice('/recordings/'.length))
-      const recDir = this.getRecordingsDir()
-      const fullPath = path.resolve(recDir, fileName)
+    if (cleanPath.startsWith('/recording-id/') && this.recordingPathResolver) {
+      const recId = cleanPath.slice('/recording-id/'.length)
+      const targetPath = this.recordingPathResolver(recId)
       if (
-        !fullPath.startsWith(path.resolve(recDir)) ||
-        !fs.existsSync(fullPath) ||
-        !fs.statSync(fullPath).isFile()
+        !targetPath ||
+        !fs.existsSync(targetPath) ||
+        !fs.statSync(targetPath).isFile()
       ) {
         res.writeHead(404)
         res.end('Recording not found')
         return
       }
-      this.serveRangeVideo(req, res, fullPath)
+      this.serveRangeVideo(req, res, targetPath)
+      return
+    }
+
+    if (cleanPath.startsWith('/recordings/')) {
+      const relPart = cleanPath.slice('/recordings/'.length).replace(/^[/\\]+/, '')
+      if (!relPart || relPart.includes('..')) {
+        res.writeHead(403)
+        res.end('Forbidden')
+        return
+      }
+      const roots = this.getAllowedRecordingRoots()
+      for (const root of roots) {
+        const candidate = path.resolve(root, relPart)
+        if (
+          this.isPathInsideRoots(candidate, [root]) &&
+          fs.existsSync(candidate) &&
+          fs.statSync(candidate).isFile()
+        ) {
+          this.serveRangeVideo(req, res, candidate)
+          return
+        }
+      }
+      res.writeHead(404)
+      res.end('Recording not found')
       return
     }
 

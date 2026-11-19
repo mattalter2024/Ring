@@ -5,11 +5,13 @@ import type {
   CloudRecordingItem,
   PackageDetectionRecord,
   RingAuthStepResult,
+  StorageDriveInfo,
 } from '@shared/types'
 import { useRingWatch } from '@/hooks/useRingWatch'
 import { Sidebar, type NavTab } from '@/components/Sidebar'
 import { TopBar } from '@/components/TopBar'
 import { CamerasView } from '@/components/CamerasView'
+import { NvrView } from '@/components/NvrView'
 import { TimelineView } from '@/components/TimelineView'
 import { RecordingsView } from '@/components/RecordingsView'
 import { SensorsView } from '@/components/SensorsView'
@@ -37,6 +39,7 @@ export function App() {
     settings,
     setSettings,
     storageStats,
+    setStorageStats,
     nvrStatus,
     setNvrStatus,
     locations,
@@ -468,7 +471,109 @@ export function App() {
     const dir = await api.chooseRecordingsFolder()
     if (dir) {
       setSettings((prev) => ({ ...prev, recordingsDir: dir }))
-      pushToast('Folder Updated', `Recordings will save to ${dir}`, 'ok')
+      pushToast('Primary Storage Updated', `Recordings will save to ${dir}`, 'ok')
+    }
+  }
+
+  const handleChooseFailoverFolder = async () => {
+    if (!api) return
+    const dir = await api.chooseFailoverFolder()
+    if (dir) {
+      setSettings((prev) => ({ ...prev, failoverRecordingsDir: dir }))
+      pushToast('Failover Storage Updated', `Failover storage set to ${dir}`, 'ok')
+    }
+  }
+
+  const handleListStorageDrives = useCallback(async (): Promise<StorageDriveInfo[]> => {
+    if (!api) return []
+    try {
+      return await api.listStorageDrives()
+    } catch (err) {
+      pushToast(
+        'Drive Scan Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+      return []
+    }
+  }, [api, pushToast])
+
+  const handleSetPrimaryDrive = async (drivePath: string) => {
+    if (!api) return
+    try {
+      const res = await api.setPrimaryStorageDrive(drivePath)
+      setSettings(res.settings)
+      setStorageStats(res.stats)
+      pushToast(
+        'Primary NVR Drive Set',
+        `24/7 NVR now records to ${res.settings.recordingsDir}`,
+        'ok',
+      )
+    } catch (err) {
+      pushToast(
+        'Drive Assignment Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
+  }
+
+  const handleSetFailoverDrive = async (drivePath: string) => {
+    if (!api) return
+    try {
+      const res = await api.setFailoverStorageDrive(drivePath)
+      setSettings(res.settings)
+      setStorageStats(res.stats)
+      pushToast(
+        'Failover Drive Set',
+        `Failover recording target set to ${res.settings.failoverRecordingsDir}`,
+        'ok',
+      )
+    } catch (err) {
+      pushToast(
+        'Failover Assignment Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
+  }
+
+  const handleClearFailover = async () => {
+    if (!api) return
+    const res = await api.clearFailoverStorage()
+    setSettings(res.settings)
+    setStorageStats(res.stats)
+    pushToast(
+      'Failover Cleared',
+      'Cleared custom failover drive (built-in Videos\\RingWatch remains emergency fallback).',
+      'info',
+    )
+  }
+
+  const handleExportEvidenceBundle = async (recordingId: string) => {
+    if (!api) {
+      pushToast(
+        'Desktop App Required',
+        'SHA-256 Evidence Bundle export runs inside the Electron Windows app.',
+        'warn',
+      )
+      return
+    }
+    try {
+      const bundle = await api.exportEvidenceBundle(recordingId)
+      if (bundle) {
+        pushToast(
+          'Evidence Bundle Exported',
+          `Saved MP4 + SHA-256 manifest (${bundle.sha256.slice(0, 12)}…)`,
+          'ok',
+        )
+      }
+    } catch (err) {
+      pushToast(
+        'Evidence Export Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
     }
   }
 
@@ -606,6 +711,8 @@ export function App() {
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         connection={connection}
+        nvrStatus={nvrStatus}
+        storageStats={storageStats}
         streamingCount={Object.keys(streamsByCamera).length}
         recordingsCount={recordings.length}
         faultedSensorCount={faultedSensorCount}
@@ -618,10 +725,12 @@ export function App() {
           connection={connection}
           primaryLocation={locations[0]}
           nvrStatus={nvrStatus}
+          storageStats={storageStats}
           cameraCount={cameras.length}
           nvrBusy={nvrBusy}
           isRefreshing={isRefreshing}
           onToggleAllRecording={() => void handleToggleAllRecording()}
+          onOpenNvr={() => setActiveTab('nvr')}
           onRefresh={() => void handleRefresh()}
           onSimulateDemoEvent={(kind) => void handleSimulateDemoEvent(kind)}
         />
@@ -653,6 +762,29 @@ export function App() {
               onToggleLight={handleToggleLight}
               onToggleSiren={handleToggleSiren}
             />
+          ) : activeTab === 'nvr' ? (
+            <NvrView
+              cameras={cameras}
+              settings={settings}
+              nvrStatus={nvrStatus}
+              storageStats={storageStats}
+              events={events}
+              nvrBusy={nvrBusy}
+              onToggleAllRecording={handleToggleAllRecording}
+              onToggleCameraContinuous={handleToggleCameraContinuous}
+              onUpdateSettings={handleUpdateSettings}
+              onListStorageDrives={handleListStorageDrives}
+              onSetPrimaryDrive={handleSetPrimaryDrive}
+              onSetFailoverDrive={handleSetFailoverDrive}
+              onClearFailover={handleClearFailover}
+              onChoosePrimaryFolder={handleChooseFolder}
+              onChooseFailoverFolder={handleChooseFailoverFolder}
+              onRescanStorage={handleRescanStorage}
+              onPruneStorage={handlePruneStorage}
+              onOpenRootFolder={async () => {
+                if (api) await api.openRecordingsRootFolder()
+              }}
+            />
           ) : activeTab === 'timeline' ? (
             <TimelineView
               cameras={cameras}
@@ -683,6 +815,7 @@ export function App() {
               }}
               onToggleStar={handleToggleStar}
               onExportRecording={handleExportRecording}
+              onExportEvidenceBundle={handleExportEvidenceBundle}
               onImportVideos={handleImportVideos}
               onRescanStorage={handleRescanStorage}
               onPruneStorage={handlePruneStorage}
@@ -727,6 +860,7 @@ export function App() {
               onDisconnectRing={handleDisconnectRing}
               onUpdateSettings={handleUpdateSettings}
               onChooseRecordingsFolder={handleChooseFolder}
+              onChooseFailoverFolder={handleChooseFailoverFolder}
               onTestAiConnection={handleTestAiConnection}
             />
           )}

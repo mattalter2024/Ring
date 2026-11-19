@@ -9,6 +9,7 @@ import {
   PlayCircle,
   RefreshCw,
   Scissors,
+  ShieldCheck,
   Star,
   Trash2,
   Upload,
@@ -30,6 +31,7 @@ interface RecordingsViewProps {
   onDeleteRecording: (recordingId: string) => Promise<void>
   onToggleStar: (recordingId: string) => Promise<void>
   onExportRecording: (recordingId: string) => Promise<void>
+  onExportEvidenceBundle?: (recordingId: string) => Promise<void>
   onImportVideos: () => Promise<void>
   onRescanStorage: () => Promise<void>
   onPruneStorage: () => Promise<void>
@@ -48,6 +50,7 @@ export function RecordingsView({
   onDeleteRecording,
   onToggleStar,
   onExportRecording,
+  onExportEvidenceBundle,
   onImportVideos,
   onRescanStorage,
   onPruneStorage,
@@ -444,7 +447,7 @@ export function RecordingsView({
             <div className="panel-header">
               <h3>Clip Playback</h3>
               {selectedLocal && (
-                <div style={{ display: 'flex', gap: 6 }}>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                   <button
                     type="button"
                     className="btn btn-sm"
@@ -453,6 +456,17 @@ export function RecordingsView({
                     <Download size={13} />
                     Export
                   </button>
+                  {onExportEvidenceBundle && (
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      title="Export MP4 plus tamper-evident SHA-256 .evidence.json manifest"
+                      onClick={() => void onExportEvidenceBundle(selectedLocal.id)}
+                    >
+                      <ShieldCheck size={13} />
+                      Evidence Bundle
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="btn btn-sm"

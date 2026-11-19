@@ -11,6 +11,15 @@ export interface NotifyPackageOptions {
   volume: number
 }
 
+export interface NotifyNvrAlertOptions {
+  title: string
+  body: string
+  severity: 'info' | 'warning' | 'critical'
+  desktopEnabled: boolean
+  soundProfile?: AlertSoundProfile
+  volume?: number
+}
+
 export class NotificationService {
   private readonly iconPath: string
   private readonly getMainWindow: () => BrowserWindow | null
@@ -52,6 +61,49 @@ export class NotificationService {
       const payload: AlertSoundPayload = {
         profile: options.soundProfile,
         volume: options.volume,
+        title: options.title,
+        body: options.body,
+      }
+      win.webContents.send('ringwatch:play-alert-sound', payload)
+    }
+  }
+
+  notifyNvrAlert(options: NotifyNvrAlertOptions): void {
+    const win = this.getMainWindow()
+    const soundProfile =
+      options.soundProfile ??
+      (options.severity === 'critical'
+        ? 'urgent-radar'
+        : options.severity === 'warning'
+          ? 'soft-pulse'
+          : 'none')
+
+    if (options.desktopEnabled && Notification.isSupported()) {
+      const icon = fs.existsSync(this.iconPath)
+        ? nativeImage.createFromPath(this.iconPath)
+        : undefined
+      const notification = new Notification({
+        title: options.title,
+        body: options.body,
+        icon,
+        silent: soundProfile !== 'none',
+        urgency: options.severity === 'critical' ? 'critical' : 'normal',
+      })
+      notification.on('click', () => {
+        const currentWin = this.getMainWindow()
+        if (currentWin) {
+          if (currentWin.isMinimized()) currentWin.restore()
+          currentWin.show()
+          currentWin.focus()
+        }
+      })
+      notification.show()
+    }
+
+    if (soundProfile !== 'none' && win && !win.isDestroyed()) {
+      const payload: AlertSoundPayload = {
+        profile: soundProfile,
+        volume: options.volume ?? 0.75,
         title: options.title,
         body: options.body,
       }

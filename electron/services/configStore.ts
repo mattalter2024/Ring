@@ -13,10 +13,15 @@ interface StoredSecrets {
   geminiApiKey?: string
 }
 
+const CURRENT_CONFIG_VERSION = 2
+
 interface PersistedConfigFile {
+  configVersion?: number
   mode: AppSettings['mode']
   ringSystemId?: string
   recordingsDir: string
+  failoverRecordingsDir: string
+  organizeByDateFolder: boolean
   defaultCaptureSeconds: number
   autoRecordOnMotion: boolean
   autoRecordOnDoorbell: boolean
@@ -27,6 +32,11 @@ interface PersistedConfigFile {
   continuousCameraIds: string[]
   maxStorageGb: number
   retentionDays: number
+  lowDiskWarningGb: number
+  minFreeDiskGb: number
+  nvrNotificationsEnabled: boolean
+  preventSleepWhileRecording: boolean
+  launchAtLogin: boolean
   ffmpegPath: string
   minimizeToTray: boolean
   startMinimized: boolean
@@ -96,23 +106,39 @@ export class ConfigStore {
     this.configPath = path.join(userDataDir, 'ringwatch-config.json')
     this.defaultRecordingsDir = defaultRecordingsDir
     this.cryptoAdapter = cryptoAdapter
-    this.data = this.loadFromDisk()
+    const { config, migrated } = this.loadFromDisk()
+    this.data = config
+    if (migrated) {
+      this.persist()
+    }
+  }
+
+  getDefaultRecordingsDir(): string {
+    return this.defaultRecordingsDir
   }
 
   private getDefaultConfig(): PersistedConfigFile {
     return {
+      configVersion: CURRENT_CONFIG_VERSION,
       mode: 'demo',
       recordingsDir: this.defaultRecordingsDir,
+      failoverRecordingsDir: '',
+      organizeByDateFolder: true,
       defaultCaptureSeconds: 30,
       autoRecordOnMotion: true,
       autoRecordOnDoorbell: true,
       autoRecordOnPackage: true,
       continuousSegmentSeconds: 120,
       continuousSkipBatteryCams: false,
-      continuousAutoStart: false,
+      continuousAutoStart: true,
       continuousCameraIds: [],
-      maxStorageGb: 25,
+      maxStorageGb: 100,
       retentionDays: 30,
+      lowDiskWarningGb: 20,
+      minFreeDiskGb: 10,
+      nvrNotificationsEnabled: true,
+      preventSleepWhileRecording: true,
+      launchAtLogin: true,
       ffmpegPath: '',
       minimizeToTray: true,
       startMinimized: false,
@@ -120,17 +146,20 @@ export class ConfigStore {
     }
   }
 
-  private loadFromDisk(): PersistedConfigFile {
+  private loadFromDisk(): { config: PersistedConfigFile; migrated: boolean } {
     const defaults = this.getDefaultConfig()
     if (!fs.existsSync(this.configPath)) {
-      return defaults
+      return { config: defaults, migrated: false }
     }
     try {
       const raw = fs.readFileSync(this.configPath, 'utf-8')
       const parsed = JSON.parse(raw) as Partial<PersistedConfigFile>
+      const priorVersion = typeof parsed.configVersion === 'number' ? parsed.configVersion : 1
+
       const merged: PersistedConfigFile = {
         ...defaults,
         ...parsed,
+        configVersion: CURRENT_CONFIG_VERSION,
         continuousCameraIds: Array.isArray(parsed.continuousCameraIds)
           ? parsed.continuousCameraIds
           : [],
@@ -140,10 +169,29 @@ export class ConfigStore {
           geminiModel: normalizeGeminiModel(parsed.packageAi?.geminiModel),
         },
       }
+
+      let migrated = false
+      // One-time v1 -> v2 upgrade: turn on zero-touch 24/7 autonomous NVR recording
+      // and NVR protection defaults for existing installations upgrading to the UNVR build.
+      if (priorVersion < 2) {
+        merged.continuousAutoStart = true
+        merged.preventSleepWhileRecording = true
+        merged.nvrNotificationsEnabled = true
+        merged.organizeByDateFolder = true
+        if (parsed.launchAtLogin === undefined) {
+          merged.launchAtLogin = true
+        }
+        migrated = true
+      }
+
+      if (merged.lowDiskWarningGb < merged.minFreeDiskGb) {
+        merged.lowDiskWarningGb = merged.minFreeDiskGb
+      }
+
       this.secrets = this.readSecrets(parsed)
-      return merged
+      return { config: merged, migrated }
     } catch {
-      return defaults
+      return { config: defaults, migrated: false }
     }
   }
 
@@ -177,9 +225,12 @@ export class ConfigStore {
 
   private persist(): void {
     const payload: PersistedConfigFile = {
+      configVersion: CURRENT_CONFIG_VERSION,
       mode: this.data.mode,
       ringSystemId: this.data.ringSystemId,
       recordingsDir: this.data.recordingsDir,
+      failoverRecordingsDir: this.data.failoverRecordingsDir,
+      organizeByDateFolder: this.data.organizeByDateFolder,
       defaultCaptureSeconds: this.data.defaultCaptureSeconds,
       autoRecordOnMotion: this.data.autoRecordOnMotion,
       autoRecordOnDoorbell: this.data.autoRecordOnDoorbell,
@@ -190,6 +241,11 @@ export class ConfigStore {
       continuousCameraIds: [...this.data.continuousCameraIds],
       maxStorageGb: this.data.maxStorageGb,
       retentionDays: this.data.retentionDays,
+      lowDiskWarningGb: this.data.lowDiskWarningGb,
+      minFreeDiskGb: this.data.minFreeDiskGb,
+      nvrNotificationsEnabled: this.data.nvrNotificationsEnabled,
+      preventSleepWhileRecording: this.data.preventSleepWhileRecording,
+      launchAtLogin: this.data.launchAtLogin,
       ffmpegPath: this.data.ffmpegPath,
       minimizeToTray: this.data.minimizeToTray,
       startMinimized: this.data.startMinimized,
@@ -220,6 +276,8 @@ export class ConfigStore {
     return {
       mode: this.data.mode,
       recordingsDir: this.data.recordingsDir,
+      failoverRecordingsDir: this.data.failoverRecordingsDir,
+      organizeByDateFolder: this.data.organizeByDateFolder,
       defaultCaptureSeconds: this.data.defaultCaptureSeconds,
       autoRecordOnMotion: this.data.autoRecordOnMotion,
       autoRecordOnDoorbell: this.data.autoRecordOnDoorbell,
@@ -230,6 +288,11 @@ export class ConfigStore {
       continuousCameraIds: [...this.data.continuousCameraIds],
       maxStorageGb: this.data.maxStorageGb,
       retentionDays: this.data.retentionDays,
+      lowDiskWarningGb: this.data.lowDiskWarningGb,
+      minFreeDiskGb: this.data.minFreeDiskGb,
+      nvrNotificationsEnabled: this.data.nvrNotificationsEnabled,
+      preventSleepWhileRecording: this.data.preventSleepWhileRecording,
+      launchAtLogin: this.data.launchAtLogin,
       ffmpegPath: this.data.ffmpegPath,
       minimizeToTray: this.data.minimizeToTray,
       startMinimized: this.data.startMinimized,
@@ -246,6 +309,12 @@ export class ConfigStore {
     if (patch.mode !== undefined) this.data.mode = patch.mode
     if (patch.recordingsDir !== undefined && patch.recordingsDir.trim()) {
       this.data.recordingsDir = patch.recordingsDir.trim()
+    }
+    if (patch.failoverRecordingsDir !== undefined) {
+      this.data.failoverRecordingsDir = patch.failoverRecordingsDir.trim()
+    }
+    if (patch.organizeByDateFolder !== undefined) {
+      this.data.organizeByDateFolder = patch.organizeByDateFolder
     }
     if (patch.defaultCaptureSeconds !== undefined) {
       this.data.defaultCaptureSeconds = Math.max(
@@ -278,10 +347,31 @@ export class ConfigStore {
       this.data.continuousCameraIds = [...patch.continuousCameraIds]
     }
     if (patch.maxStorageGb !== undefined) {
-      this.data.maxStorageGb = Math.max(0, Math.min(2000, patch.maxStorageGb))
+      this.data.maxStorageGb = Math.max(0, Math.min(20000, patch.maxStorageGb))
     }
     if (patch.retentionDays !== undefined) {
       this.data.retentionDays = Math.max(0, Math.min(365, Math.round(patch.retentionDays)))
+    }
+    if (patch.minFreeDiskGb !== undefined) {
+      this.data.minFreeDiskGb = Math.max(1, Math.min(250, Math.round(patch.minFreeDiskGb)))
+    }
+    if (patch.lowDiskWarningGb !== undefined) {
+      this.data.lowDiskWarningGb = Math.max(
+        2,
+        Math.min(500, Math.round(patch.lowDiskWarningGb)),
+      )
+    }
+    if (this.data.lowDiskWarningGb < this.data.minFreeDiskGb) {
+      this.data.lowDiskWarningGb = this.data.minFreeDiskGb
+    }
+    if (patch.nvrNotificationsEnabled !== undefined) {
+      this.data.nvrNotificationsEnabled = patch.nvrNotificationsEnabled
+    }
+    if (patch.preventSleepWhileRecording !== undefined) {
+      this.data.preventSleepWhileRecording = patch.preventSleepWhileRecording
+    }
+    if (patch.launchAtLogin !== undefined) {
+      this.data.launchAtLogin = patch.launchAtLogin
     }
     if (patch.ffmpegPath !== undefined) this.data.ffmpegPath = patch.ffmpegPath.trim()
     if (patch.minimizeToTray !== undefined) this.data.minimizeToTray = patch.minimizeToTray

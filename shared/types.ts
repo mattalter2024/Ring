@@ -90,6 +90,8 @@ export type SecurityEventKind =
   | 'package-detected'
   | 'package-cleared'
   | 'recording-saved'
+  | 'storage-alert'
+  | 'nvr-health'
   | 'info'
 
 export interface SecurityEvent {
@@ -128,13 +130,42 @@ export interface LocalRecordingItem {
   playbackUrl?: string
 }
 
+export type DiskHealthStatus = 'healthy' | 'warning' | 'critical' | 'offline'
+
+export interface StorageDriveInfo {
+  id: string
+  path: string
+  label: string
+  driveType: 'fixed' | 'removable' | 'network' | 'unknown'
+  totalBytes: number | null
+  freeBytes: number | null
+  usedBytes: number | null
+  writable: boolean
+  isPrimary: boolean
+  isFailover: boolean
+}
+
+export interface CameraStorageUsage {
+  cameraId: string
+  cameraName: string
+  clipCount: number
+  totalBytes: number
+  protectedBytes: number
+  oldestClipAt?: string
+  newestClipAt?: string
+}
+
 export interface NvrCameraStatus {
   cameraId: string
   cameraName: string
-  state: 'connecting' | 'recording' | 'reconnecting' | 'stopped' | 'error'
+  state: 'connecting' | 'recording' | 'reconnecting' | 'stalled' | 'stopped' | 'error'
   startedAt?: string
   currentSegmentStartedAt?: string
+  lastSegmentAt?: string
   segmentsCaptured: number
+  reconnectCount: number
+  bytesRecorded: number
+  estimatedBitrateKbps?: number
   lastError?: string
 }
 
@@ -144,19 +175,36 @@ export interface NvrStatus {
   segmentSeconds: number
   totalSegmentsCaptured: number
   activeCameraCount: number
+  powerSaveBlocked: boolean
+  usingFailoverStorage: boolean
+  diskHealth: DiskHealthStatus
+  watchdogChecks: number
+  lastHealthCheckAt?: string
   cameras: Record<string, NvrCameraStatus>
 }
 
 export interface StorageStats {
   recordingsDir: string
+  activeRecordingsDir: string
+  failoverRecordingsDir: string
+  usingFailover: boolean
+  primaryOnline: boolean
   totalClips: number
   starredClips: number
   totalBytes: number
+  protectedBytes: number
   maxStorageGb: number
   retentionDays: number
+  lowDiskWarningGb: number
+  minFreeDiskGb: number
+  diskHealth: DiskHealthStatus
+  totalDiskBytes: number | null
   freeDiskBytes: number | null
+  writeRateBytesPerHour: number
+  estimatedDaysRemaining: number | null
   oldestClipAt?: string
   newestClipAt?: string
+  perCameraUsage: CameraStorageUsage[]
 }
 
 export interface CloudRecordingItem {
@@ -233,6 +281,8 @@ export interface PackageDetectionRecord {
 export interface AppSettings {
   mode: AppMode
   recordingsDir: string
+  failoverRecordingsDir: string
+  organizeByDateFolder: boolean
   defaultCaptureSeconds: number
   autoRecordOnMotion: boolean
   autoRecordOnDoorbell: boolean
@@ -243,6 +293,11 @@ export interface AppSettings {
   continuousCameraIds: string[]
   maxStorageGb: number
   retentionDays: number
+  lowDiskWarningGb: number
+  minFreeDiskGb: number
+  nvrNotificationsEnabled: boolean
+  preventSleepWhileRecording: boolean
+  launchAtLogin: boolean
   ffmpegPath: string
   minimizeToTray: boolean
   startMinimized: boolean
@@ -253,6 +308,8 @@ export interface AppSettings {
 export interface AppSettingsPatch {
   mode?: AppMode
   recordingsDir?: string
+  failoverRecordingsDir?: string
+  organizeByDateFolder?: boolean
   defaultCaptureSeconds?: number
   autoRecordOnMotion?: boolean
   autoRecordOnDoorbell?: boolean
@@ -263,6 +320,11 @@ export interface AppSettingsPatch {
   continuousCameraIds?: string[]
   maxStorageGb?: number
   retentionDays?: number
+  lowDiskWarningGb?: number
+  minFreeDiskGb?: number
+  nvrNotificationsEnabled?: boolean
+  preventSleepWhileRecording?: boolean
+  launchAtLogin?: boolean
   ffmpegPath?: string
   minimizeToTray?: boolean
   startMinimized?: boolean
@@ -349,8 +411,26 @@ export interface RingWatchApi {
   deleteLocalRecording: (recordingId: string) => Promise<void>
   toggleRecordingStar: (recordingId: string) => Promise<LocalRecordingItem>
   exportRecording: (recordingId: string) => Promise<string | null>
+  exportEvidenceBundle: (recordingId: string) => Promise<{
+    videoPath: string
+    manifestPath: string
+    sha256: string
+  } | null>
   importLocalVideos: () => Promise<LocalRecordingItem[]>
   getStorageStats: () => Promise<StorageStats>
+  listStorageDrives: () => Promise<StorageDriveInfo[]>
+  setPrimaryStorageDrive: (drivePath: string) => Promise<{
+    settings: AppSettings
+    stats: StorageStats
+  }>
+  setFailoverStorageDrive: (drivePath: string) => Promise<{
+    settings: AppSettings
+    stats: StorageStats
+  }>
+  clearFailoverStorage: () => Promise<{
+    settings: AppSettings
+    stats: StorageStats
+  }>
   rescanLocalStorage: () => Promise<{
     recordings: LocalRecordingItem[]
     stats: StorageStats
@@ -380,6 +460,7 @@ export interface RingWatchApi {
 
   updateSettings: (patch: AppSettingsPatch) => Promise<AppSettings>
   chooseRecordingsFolder: () => Promise<string | null>
+  chooseFailoverFolder: () => Promise<string | null>
 
   onConnectionChanged: (cb: (status: ConnectionStatus) => void) => () => void
   onSettingsUpdated: (cb: (settings: AppSettings) => void) => () => void

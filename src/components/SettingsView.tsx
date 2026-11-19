@@ -33,6 +33,7 @@ interface SettingsViewProps {
   onDisconnectRing: () => Promise<void>
   onUpdateSettings: (patch: AppSettingsPatch) => Promise<void>
   onChooseRecordingsFolder: () => Promise<void>
+  onChooseFailoverFolder: () => Promise<void>
   onTestAiConnection: () => Promise<{
     ok: boolean
     message: string
@@ -50,6 +51,7 @@ export function SettingsView({
   onDisconnectRing,
   onUpdateSettings,
   onChooseRecordingsFolder,
+  onChooseFailoverFolder,
   onTestAiConnection,
 }: SettingsViewProps) {
   const [email, setEmail] = useState('')
@@ -669,7 +671,7 @@ export function SettingsView({
 
           <div className="panel-body form-stack">
             <div className="field">
-              <label htmlFor="rec-dir">Local Recordings Folder</label>
+              <label htmlFor="rec-dir">Primary Recordings Folder (Local / External USB / NAS)</label>
               <div style={{ display: 'flex', gap: 6 }}>
                 <input
                   id="rec-dir"
@@ -686,6 +688,38 @@ export function SettingsView({
                   <FolderOpen size={14} />
                   Browse
                 </button>
+              </div>
+            </div>
+
+            <div className="field">
+              <label htmlFor="failover-dir">
+                Failover Recordings Folder (used automatically if Primary drive disconnects)
+              </label>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input
+                  id="failover-dir"
+                  type="text"
+                  className="input mono"
+                  value={settings.failoverRecordingsDir || 'Built-in local Videos\\RingWatch fallback'}
+                  readOnly
+                />
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => void onChooseFailoverFolder()}
+                >
+                  <FolderOpen size={14} />
+                  Browse
+                </button>
+                {settings.failoverRecordingsDir && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => void onUpdateSettings({ failoverRecordingsDir: '' })}
+                  >
+                    Clear
+                  </button>
+                )}
               </div>
             </div>
 
@@ -720,13 +754,19 @@ export function SettingsView({
                     void onUpdateSettings({ maxStorageGb: Number(e.target.value) })
                   }
                 >
-                  <option value={5}>5 GB</option>
-                  <option value={10}>10 GB</option>
-                  <option value={25}>25 GB (Recommended)</option>
+                  <option value={25}>25 GB</option>
                   <option value={50}>50 GB</option>
-                  <option value={100}>100 GB</option>
+                  <option value={100}>100 GB (Recommended)</option>
                   <option value={250}>250 GB</option>
-                  <option value={0}>Unlimited</option>
+                  <option value={500}>500 GB</option>
+                  <option value={1000}>1 TB (1000 GB)</option>
+                  <option value={2000}>2 TB (2000 GB)</option>
+                  <option value={4000}>4 TB (4000 GB)</option>
+                  <option value={8000}>8 TB (8000 GB)</option>
+                  <option value={0}>Unlimited (Drive-Floor Managed)</option>
+                  {![0, 25, 50, 100, 250, 500, 1000, 2000, 4000, 8000].includes(
+                    settings.maxStorageGb,
+                  ) && <option value={settings.maxStorageGb}>{settings.maxStorageGb} GB</option>}
                 </select>
               </div>
 
@@ -745,9 +785,69 @@ export function SettingsView({
                   <option value={30}>30 days (Recommended)</option>
                   <option value={60}>60 days</option>
                   <option value={90}>90 days</option>
-                  <option value={0}>Keep forever</option>
+                  <option value={180}>180 days</option>
+                  <option value={365}>365 days</option>
+                  <option value={0}>Keep until quota / floor</option>
                 </select>
               </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <div className="field">
+                <label htmlFor="low-disk-warning-gb">Low Disk Alert Threshold (GB)</label>
+                <input
+                  id="low-disk-warning-gb"
+                  type="number"
+                  min={2}
+                  max={500}
+                  className="input mono"
+                  value={settings.lowDiskWarningGb}
+                  onChange={(e) => {
+                    const val = Number(e.target.value)
+                    if (Number.isFinite(val)) {
+                      void onUpdateSettings({ lowDiskWarningGb: val })
+                    }
+                  }}
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="min-free-disk-gb">Free-Disk Floor Auto-Prune (GB)</label>
+                <input
+                  id="min-free-disk-gb"
+                  type="number"
+                  min={1}
+                  max={250}
+                  className="input mono"
+                  value={settings.minFreeDiskGb}
+                  onChange={(e) => {
+                    const val = Number(e.target.value)
+                    if (Number.isFinite(val)) {
+                      void onUpdateSettings({ minFreeDiskGb: val })
+                    }
+                  }}
+                />
+              </div>
+            </div>
+
+            <div className="toggle-row">
+              <div>
+                <div className="toggle-label-main">Organize Recordings into Date &amp; Camera Folders</div>
+                <div className="toggle-label-sub">
+                  Store clips as <code className="mono">YYYY-MM-DD/camera-name/</code> for clean multi-terabyte browsing
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={settings.organizeByDateFolder}
+                className={`switch ${settings.organizeByDateFolder ? 'on' : ''}`}
+                onClick={() =>
+                  void onUpdateSettings({
+                    organizeByDateFolder: !settings.organizeByDateFolder,
+                  })
+                }
+              />
             </div>
 
             <div className="toggle-row">
@@ -828,9 +928,69 @@ export function SettingsView({
 
             <div className="toggle-row">
               <div>
+                <div className="toggle-label-main">NVR Health &amp; Low-Disk Alerts</div>
+                <div className="toggle-label-sub">
+                  Windows notifications when disk space is low, failover triggers, or a camera disconnects
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={settings.nvrNotificationsEnabled}
+                className={`switch ${settings.nvrNotificationsEnabled ? 'on' : ''}`}
+                onClick={() =>
+                  void onUpdateSettings({
+                    nvrNotificationsEnabled: !settings.nvrNotificationsEnabled,
+                  })
+                }
+              />
+            </div>
+
+            <div className="toggle-row">
+              <div>
+                <div className="toggle-label-main">Keep PC Awake While 24/7 NVR Is Recording</div>
+                <div className="toggle-label-sub">
+                  Blocks Windows standby sleep so unattended continuous recording never interrupts
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={settings.preventSleepWhileRecording}
+                className={`switch ${settings.preventSleepWhileRecording ? 'on' : ''}`}
+                onClick={() =>
+                  void onUpdateSettings({
+                    preventSleepWhileRecording: !settings.preventSleepWhileRecording,
+                  })
+                }
+              />
+            </div>
+
+            <div className="toggle-row">
+              <div>
+                <div className="toggle-label-main">Launch Automatically on Windows Sign-In</div>
+                <div className="toggle-label-sub">
+                  Start RingWatch in the tray after reboot and resume 24/7 recording hands-free
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={settings.launchAtLogin}
+                className={`switch ${settings.launchAtLogin ? 'on' : ''}`}
+                onClick={() =>
+                  void onUpdateSettings({
+                    launchAtLogin: !settings.launchAtLogin,
+                  })
+                }
+              />
+            </div>
+
+            <div className="toggle-row">
+              <div>
                 <div className="toggle-label-main">Minimize to Windows System Tray</div>
                 <div className="toggle-label-sub">
-                  Keep monitoring sensors &amp; AI package alerts when window closes
+                  Keep 24/7 NVR recording, sensors &amp; AI package alerts running when window closes
                 </div>
               </div>
               <button

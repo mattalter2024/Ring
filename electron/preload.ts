@@ -63,8 +63,17 @@ const api: RingWatchApi = {
     ipcRenderer.invoke('ringwatch:toggle-recording-star', recordingId),
   exportRecording: (recordingId: string) =>
     ipcRenderer.invoke('ringwatch:export-recording', recordingId),
+  exportEvidenceBundle: (recordingId: string) =>
+    ipcRenderer.invoke('ringwatch:export-evidence-bundle', recordingId),
   importLocalVideos: () => ipcRenderer.invoke('ringwatch:import-videos'),
   getStorageStats: () => ipcRenderer.invoke('ringwatch:get-storage-stats'),
+  listStorageDrives: () => ipcRenderer.invoke('ringwatch:list-storage-drives'),
+  setPrimaryStorageDrive: (drivePath: string) =>
+    ipcRenderer.invoke('ringwatch:set-primary-drive', drivePath),
+  setFailoverStorageDrive: (drivePath: string) =>
+    ipcRenderer.invoke('ringwatch:set-failover-drive', drivePath),
+  clearFailoverStorage: () =>
+    ipcRenderer.invoke('ringwatch:clear-failover-storage'),
   rescanLocalStorage: () => ipcRenderer.invoke('ringwatch:rescan-storage'),
   pruneLocalStorage: () => ipcRenderer.invoke('ringwatch:prune-storage'),
   openRecordingInFolder: (recordingId: string) =>
@@ -92,6 +101,8 @@ const api: RingWatchApi = {
     ipcRenderer.invoke('ringwatch:update-settings', patch),
   chooseRecordingsFolder: () =>
     ipcRenderer.invoke('ringwatch:choose-recordings-folder'),
+  chooseFailoverFolder: () =>
+    ipcRenderer.invoke('ringwatch:choose-failover-folder'),
 
   onConnectionChanged: (cb: (status: ConnectionStatus) => void) =>
     subscribe('ringwatch:connection-changed', cb),

@@ -2,15 +2,17 @@ import {
   Camera,
   Clock,
   Film,
+  HardDrive,
   Package,
   Radio,
   Settings,
   Shield,
 } from 'lucide-react'
-import type { ConnectionStatus } from '@shared/types'
+import type { ConnectionStatus, NvrStatus, StorageStats } from '@shared/types'
 
 export type NavTab =
   | 'cameras'
+  | 'nvr'
   | 'timeline'
   | 'recordings'
   | 'sensors'
@@ -21,6 +23,8 @@ interface SidebarProps {
   activeTab: NavTab
   onSelectTab: (tab: NavTab) => void
   connection: ConnectionStatus
+  nvrStatus: NvrStatus
+  storageStats: StorageStats
   streamingCount: number
   recordingsCount: number
   faultedSensorCount: number
@@ -31,11 +35,23 @@ export function Sidebar({
   activeTab,
   onSelectTab,
   connection,
+  nvrStatus,
+  storageStats,
   streamingCount,
   recordingsCount,
   faultedSensorCount,
   detectedPackagesCount,
 }: SidebarProps) {
+  const nvrBadge = storageStats.usingFailover
+    ? { text: 'FAILOVER', tone: 'alert' as const }
+    : storageStats.diskHealth === 'offline'
+      ? { text: 'OFFLINE', tone: 'alert' as const }
+      : storageStats.diskHealth === 'critical' || storageStats.diskHealth === 'warning'
+        ? { text: 'DISK LOW', tone: 'alert' as const }
+        : nvrStatus.active
+          ? { text: '24/7', tone: 'live' as const }
+          : undefined
+
   const navItems: Array<{
     id: NavTab
     label: string
@@ -49,6 +65,13 @@ export function Sidebar({
       icon: Camera,
       badge: streamingCount > 0 ? `${streamingCount} LIVE` : undefined,
       badgeTone: 'live',
+    },
+    {
+      id: 'nvr',
+      label: 'NVR & Storage',
+      icon: HardDrive,
+      badge: nvrBadge?.text,
+      badgeTone: nvrBadge?.tone,
     },
     {
       id: 'timeline',

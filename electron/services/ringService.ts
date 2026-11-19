@@ -9,6 +9,7 @@ import type {
   AppSettings,
   CloudRecordingItem,
   ConnectionStatus,
+  DiskHealthStatus,
   LiveStreamSession,
   LocalRecordingItem,
   NvrCameraStatus,
@@ -24,6 +25,7 @@ import type { ConfigStore } from './configStore'
 import type { StreamService, StreamableRingCamera } from './streamService'
 import type { RecordingService, RecordableRingCamera } from './recordingService'
 import type { AiPackageService, SnapshotSource } from './aiPackageService'
+import type { NotificationService } from './notificationService'
 
 type RingClientApiModule = typeof import('ring-client-api')
 type RingRestClientModule = typeof import('ring-client-api/lib/rest-client')
@@ -106,7 +108,14 @@ interface NvrWorker {
   state: NvrCameraStatus['state']
   startedAt: string
   currentSegmentStartedAt?: string
+  lastSegmentAt?: string
+  lastActivityMs: number
   segmentsCaptured: number
+  reconnectCount: number
+  bytesRecorded: number
+  estimatedBitrateKbps?: number
+  consecutiveFailures: number
+  offlineNotified: boolean
   lastError?: string
   activeCall?: { stop(): void }
   cancelWait?: () => void
@@ -118,6 +127,8 @@ export class RingService implements SnapshotSource {
   private readonly streamService: StreamService
   private readonly recordingService: RecordingService
   private readonly aiPackageService: AiPackageService
+  private readonly notifications?: NotificationService
+  private readonly onPowerSaveChange?: (shouldBlock: boolean) => void
   private readonly callbacks: RingServiceCallbacks
   private readonly demoAssetsDir: string
   private readonly eventsLogPath: string | null
@@ -132,6 +143,15 @@ export class RingService implements SnapshotSource {
   private nvrWorkers = new Map<string, NvrWorker>()
   private nvrStartedAt: string | undefined
   private nvrTotalSegmentsCaptured = 0
+  private nvrWatchdogTimer: NodeJS.Timeout | null = null
+  private nvrWatchdogChecks = 0
+  private nvrLastHealthCheckAt: string | undefined
+  private powerSaveBlocked = false
+  private lastKnownDiskHealth: DiskHealthStatus = 'healthy'
+  private lastKnownUsingFailover = false
+  private lastLowDiskNotifiedAt = 0
+  private lastCriticalDiskNotifiedAt = 0
+  private lastFailoverNotifiedAt = 0
   private snapshotCache = new Map<string, { dataUrl: string; capturedAt: string }>()
 
   private connection: ConnectionStatus = {
@@ -155,6 +175,8 @@ export class RingService implements SnapshotSource {
     streamService: StreamService
     recordingService: RecordingService
     aiPackageService: AiPackageService
+    notifications?: NotificationService
+    onPowerSaveChange?: (shouldBlock: boolean) => void
     demoAssetsDir: string
     callbacks: RingServiceCallbacks
   }) {
@@ -162,6 +184,8 @@ export class RingService implements SnapshotSource {
     this.streamService = params.streamService
     this.recordingService = params.recordingService
     this.aiPackageService = params.aiPackageService
+    this.notifications = params.notifications
+    this.onPowerSaveChange = params.onPowerSaveChange
     this.demoAssetsDir = params.demoAssetsDir
     this.callbacks = params.callbacks
     this.eventsLogPath = params.userDataDir
@@ -201,6 +225,7 @@ export class RingService implements SnapshotSource {
   async initialize(): Promise<void> {
     await this.streamService.startServer()
     this.aiPackageService.attachSnapshotSource(this)
+    this.startNvrWatchdog()
 
     const settings = this.configStore.getPublicSettings()
     const savedToken = this.configStore.getRingRefreshToken()
@@ -223,7 +248,12 @@ export class RingService implements SnapshotSource {
   private isCameraNvrActive(cameraId: string): boolean {
     const w = this.nvrWorkers.get(cameraId)
     return Boolean(
-      w && !w.stopped && (w.state === 'recording' || w.state === 'connecting' || w.state === 'reconnecting'),
+      w &&
+        !w.stopped &&
+        (w.state === 'recording' ||
+          w.state === 'connecting' ||
+          w.state === 'reconnecting' ||
+          w.state === 'stalled'),
     )
   }
 
@@ -244,6 +274,203 @@ export class RingService implements SnapshotSource {
     return [...this.events]
   }
 
+  private getActiveNvrCameraCount(): number {
+    let count = 0
+    for (const w of this.nvrWorkers.values()) {
+      if (!w.stopped) count++
+    }
+    return count
+  }
+
+  private syncPowerSaveBlocker(): void {
+    const settings = this.configStore.getPublicSettings()
+    const shouldBlock =
+      this.getActiveNvrCameraCount() > 0 && settings.preventSleepWhileRecording
+    if (shouldBlock !== this.powerSaveBlocked) {
+      this.powerSaveBlocked = shouldBlock
+      this.onPowerSaveChange?.(shouldBlock)
+    }
+  }
+
+  syncNvrSettings(): void {
+    this.syncPowerSaveBlocker()
+    this.runNvrHealthCheck()
+  }
+
+  private startNvrWatchdog(): void {
+    this.stopNvrWatchdog()
+    this.runNvrHealthCheck()
+    this.nvrWatchdogTimer = setInterval(() => {
+      this.runNvrHealthCheck()
+    }, 30_000)
+  }
+
+  private stopNvrWatchdog(): void {
+    if (this.nvrWatchdogTimer) {
+      clearInterval(this.nvrWatchdogTimer)
+      this.nvrWatchdogTimer = null
+    }
+  }
+
+  runNvrHealthCheck(): void {
+    this.nvrWatchdogChecks++
+    this.nvrLastHealthCheckAt = new Date().toISOString()
+
+    const settings = this.configStore.getPublicSettings()
+    let stats = this.recordingService.getStorageStats()
+    const nowMs = Date.now()
+
+    // 1. Detect Primary Storage Offline -> Failover or Restore transitions
+    if (stats.usingFailover && !this.lastKnownUsingFailover) {
+      this.pushEvent({
+        id: crypto.randomUUID(),
+        timestamp: this.nvrLastHealthCheckAt,
+        sourceType: 'system',
+        deviceName: 'RingWatch Storage',
+        kind: 'storage-alert',
+        title: 'Primary Storage Offline — Failover Active',
+        detail: `Primary vault (${stats.recordingsDir}) is unavailable. Recording automatically failed over to ${stats.activeRecordingsDir}.`,
+        severity: 'alert',
+      })
+      if (nowMs - this.lastFailoverNotifiedAt > 5 * 60 * 1000) {
+        this.lastFailoverNotifiedAt = nowMs
+        this.notifications?.notifyNvrAlert({
+          title: 'RingWatch NVR — Storage Failover Active',
+          body: `Primary drive offline. Recording seamlessly to failover folder: ${stats.activeRecordingsDir}`,
+          severity: 'critical',
+          desktopEnabled: settings.nvrNotificationsEnabled,
+        })
+      }
+    } else if (!stats.usingFailover && this.lastKnownUsingFailover) {
+      this.pushEvent({
+        id: crypto.randomUUID(),
+        timestamp: this.nvrLastHealthCheckAt,
+        sourceType: 'system',
+        deviceName: 'RingWatch Storage',
+        kind: 'storage-alert',
+        title: 'Primary Storage Restored',
+        detail: `Primary vault (${stats.recordingsDir}) is back online and writable.`,
+        severity: 'success',
+      })
+      this.notifications?.notifyNvrAlert({
+        title: 'RingWatch NVR — Primary Storage Restored',
+        body: `Primary storage drive is back online: ${stats.recordingsDir}`,
+        severity: 'info',
+        desktopEnabled: settings.nvrNotificationsEnabled,
+      })
+    }
+    this.lastKnownUsingFailover = stats.usingFailover
+
+    // 2. Enforce Free-Disk Floor & emit rate-limited Low Disk Space notifications
+    const freeGb =
+      stats.freeDiskBytes !== null
+        ? Number((stats.freeDiskBytes / (1024 * 1024 * 1024)).toFixed(1))
+        : null
+
+    if (stats.diskHealth === 'critical') {
+      const pruned = this.recordingService.enforceRetentionAndQuota()
+      stats = pruned.stats
+      if (pruned.prunedCount > 0) {
+        this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
+        this.pushEvent({
+          id: crypto.randomUUID(),
+          timestamp: new Date().toISOString(),
+          sourceType: 'system',
+          deviceName: 'RingWatch Storage',
+          kind: 'storage-alert',
+          title: `Auto-Pruned ${pruned.prunedCount} Clip(s) — Low Disk Floor`,
+          detail: `Reclaimed ${(pruned.freedBytes / (1024 * 1024)).toFixed(1)} MB to keep at least ${settings.minFreeDiskGb} GB free.`,
+          severity: 'warning',
+        })
+      }
+
+      if (
+        (stats.diskHealth === 'critical' || stats.diskHealth === 'warning') &&
+        nowMs - this.lastCriticalDiskNotifiedAt > 15 * 60 * 1000
+      ) {
+        this.lastCriticalDiskNotifiedAt = nowMs
+        const updatedFreeGb =
+          stats.freeDiskBytes !== null
+            ? (stats.freeDiskBytes / (1024 * 1024 * 1024)).toFixed(1)
+            : '0'
+        this.pushEvent({
+          id: crypto.randomUUID(),
+          timestamp: new Date().toISOString(),
+          sourceType: 'system',
+          deviceName: 'RingWatch Storage',
+          kind: 'storage-alert',
+          title: `Critical Disk Space — ${updatedFreeGb} GB Free`,
+          detail: `Drive free space is below the ${settings.minFreeDiskGb} GB safety floor. Consider attaching a larger external drive or lowering protected clips.`,
+          severity: 'alert',
+        })
+        this.notifications?.notifyNvrAlert({
+          title: `RingWatch NVR — Critical Disk Space (${updatedFreeGb} GB Free)`,
+          body: `Storage is below the ${settings.minFreeDiskGb} GB floor. Oldest unstarred clips are being recycled automatically.`,
+          severity: 'critical',
+          desktopEnabled: settings.nvrNotificationsEnabled,
+        })
+      }
+    } else if (
+      stats.diskHealth === 'warning' &&
+      stats.primaryOnline &&
+      freeGb !== null &&
+      nowMs - this.lastLowDiskNotifiedAt > 60 * 60 * 1000
+    ) {
+      this.lastLowDiskNotifiedAt = nowMs
+      this.pushEvent({
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        sourceType: 'system',
+        deviceName: 'RingWatch Storage',
+        kind: 'storage-alert',
+        title: `Low Disk Space Warning — ${freeGb} GB Free`,
+        detail: `Drive free space dropped below your ${settings.lowDiskWarningGb} GB warning threshold.`,
+        severity: 'warning',
+      })
+      this.notifications?.notifyNvrAlert({
+        title: `RingWatch NVR — Low Disk Space (${freeGb} GB Free)`,
+        body: `Free space is below ${settings.lowDiskWarningGb} GB on ${stats.activeRecordingsDir}.`,
+        severity: 'warning',
+        desktopEnabled: settings.nvrNotificationsEnabled,
+      })
+    }
+    this.lastKnownDiskHealth = stats.diskHealth
+
+    // 3. Stalled Stream Self-Healing Watchdog (Live Mode)
+    if (this.connection.mode === 'live') {
+      const stallTimeoutMs =
+        Math.max(settings.continuousSegmentSeconds * 2 + 60, 240) * 1000
+      for (const worker of this.nvrWorkers.values()) {
+        if (worker.stopped || worker.state !== 'recording') continue
+        if (nowMs - worker.lastActivityMs > stallTimeoutMs) {
+          worker.state = 'stalled'
+          worker.lastError = `Stream stalled for ${Math.round((nowMs - worker.lastActivityMs) / 1000)}s — restarting automatically`
+          worker.lastActivityMs = nowMs
+          try {
+            worker.activeCall?.stop()
+          } catch {
+            // ignore stop errors
+          }
+          this.pushEvent({
+            id: crypto.randomUUID(),
+            timestamp: new Date().toISOString(),
+            sourceType: 'camera',
+            deviceId: worker.cameraId,
+            deviceName: worker.cameraName,
+            kind: 'nvr-health',
+            title: `Watchdog Restarted Stream — ${worker.cameraName}`,
+            detail: 'No new video segments arrived within watchdog window; reconnecting live feed.',
+            severity: 'warning',
+          })
+        }
+      }
+    }
+
+    this.syncPowerSaveBlocker()
+    this.callbacks.onStorageStatsUpdated(stats)
+    this.callbacks.onNvrStatusUpdated?.(this.getNvrStatus())
+  }
+
   getNvrStatus(): NvrStatus {
     const camerasStatus: Record<string, NvrCameraStatus> = {}
     let activeCameraCount = 0
@@ -255,7 +482,11 @@ export class RingService implements SnapshotSource {
         state: w.state,
         startedAt: w.startedAt,
         currentSegmentStartedAt: w.currentSegmentStartedAt,
+        lastSegmentAt: w.lastSegmentAt,
         segmentsCaptured: w.segmentsCaptured,
+        reconnectCount: w.reconnectCount,
+        bytesRecorded: w.bytesRecorded,
+        estimatedBitrateKbps: w.estimatedBitrateKbps,
         lastError: w.lastError,
       }
     }
@@ -265,11 +496,17 @@ export class RingService implements SnapshotSource {
       segmentSeconds: this.configStore.getPublicSettings().continuousSegmentSeconds,
       totalSegmentsCaptured: this.nvrTotalSegmentsCaptured,
       activeCameraCount,
+      powerSaveBlocked: this.powerSaveBlocked,
+      usingFailoverStorage: this.lastKnownUsingFailover,
+      diskHealth: this.lastKnownDiskHealth,
+      watchdogChecks: this.nvrWatchdogChecks,
+      lastHealthCheckAt: this.nvrLastHealthCheckAt,
       cameras: camerasStatus,
     }
   }
 
   private emitNvrStatus(): void {
+    this.syncPowerSaveBlocker()
     this.callbacks.onNvrStatusUpdated?.(this.getNvrStatus())
     this.callbacks.onCamerasUpdated(this.getCameras())
   }
@@ -1629,7 +1866,12 @@ export class RingService implements SnapshotSource {
         stopped: false,
         state: 'connecting',
         startedAt: new Date().toISOString(),
+        lastActivityMs: Date.now(),
         segmentsCaptured: 0,
+        reconnectCount: 0,
+        bytesRecorded: 0,
+        consecutiveFailures: 0,
+        offlineNotified: false,
       }
       this.nvrWorkers.set(cam.id, worker)
 
@@ -1646,7 +1888,7 @@ export class RingService implements SnapshotSource {
       sourceType: 'recording',
       deviceName: 'RingWatch NVR',
       kind: 'info',
-      title: `Continuous Recording Started (${targets.length} camera${targets.length === 1 ? '' : 's'})`,
+      title: `24/7 NVR Recording Started (${targets.length} camera${targets.length === 1 ? '' : 's'})`,
       detail: `Recording rolling ${this.configStore.getPublicSettings().continuousSegmentSeconds}s local MP4 segments for the Timeline.`,
       severity: 'success',
     })
@@ -1742,13 +1984,74 @@ export class RingService implements SnapshotSource {
     return this.getNvrStatus()
   }
 
+  private recordWorkerSegmentMetrics(
+    worker: NvrWorker,
+    saved: LocalRecordingItem,
+    nextSegStartIso?: string,
+  ): void {
+    const nowIso = new Date().toISOString()
+    worker.segmentsCaptured++
+    this.nvrTotalSegmentsCaptured++
+    worker.bytesRecorded += saved.sizeBytes
+    worker.lastSegmentAt = nowIso
+    worker.lastActivityMs = Date.now()
+    worker.consecutiveFailures = 0
+    if (saved.durationSeconds > 0) {
+      worker.estimatedBitrateKbps = Math.max(
+        1,
+        Math.round((saved.sizeBytes * 8) / saved.durationSeconds / 1000),
+      )
+    }
+    if (nextSegStartIso) {
+      worker.currentSegmentStartedAt = nextSegStartIso
+    }
+
+    if (worker.offlineNotified) {
+      worker.offlineNotified = false
+      this.pushEvent({
+        id: crypto.randomUUID(),
+        timestamp: nowIso,
+        sourceType: 'camera',
+        deviceId: worker.cameraId,
+        deviceName: worker.cameraName,
+        kind: 'nvr-health',
+        title: `Camera Stream Recovered — ${worker.cameraName}`,
+        detail: '24/7 NVR recording resumed normally and is writing segments to storage.',
+        severity: 'success',
+      })
+    }
+  }
+
+  private handleWorkerFailureNotification(worker: NvrWorker, reason: string): void {
+    worker.consecutiveFailures++
+    if (worker.consecutiveFailures >= 3 && !worker.offlineNotified) {
+      worker.offlineNotified = true
+      const settings = this.configStore.getPublicSettings()
+      this.pushEvent({
+        id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+        sourceType: 'camera',
+        deviceId: worker.cameraId,
+        deviceName: worker.cameraName,
+        kind: 'nvr-health',
+        title: `Camera Recording Interrupted — ${worker.cameraName}`,
+        detail: `${reason}. RingWatch NVR will keep retrying automatically.`,
+        severity: 'alert',
+      })
+      this.notifications?.notifyNvrAlert({
+        title: `RingWatch NVR — ${worker.cameraName} Offline`,
+        body: `24/7 stream interrupted (${reason}). Retrying automatically in background.`,
+        severity: 'warning',
+        desktopEnabled: settings.nvrNotificationsEnabled,
+      })
+    }
+  }
+
   private async runLiveNvrWorker(worker: NvrWorker, initialDelayMs: number): Promise<void> {
     if (initialDelayMs > 0) {
       const ok = await this.cancellableDelay(worker, initialDelayMs)
       if (!ok) return
     }
-
-    let consecutiveFailures = 0
 
     while (!worker.stopped) {
       const liveCam = this.liveCamerasById.get(worker.cameraId)
@@ -1826,11 +2129,11 @@ export class RingService implements SnapshotSource {
 
           if (saved) {
             addedAny = true
-            worker.segmentsCaptured++
-            this.nvrTotalSegmentsCaptured++
-            worker.currentSegmentStartedAt = new Date(
-              sessionStartMs + Math.max(0, endSec) * 1000,
-            ).toISOString()
+            this.recordWorkerSegmentMetrics(
+              worker,
+              saved,
+              new Date(sessionStartMs + Math.max(0, endSec) * 1000).toISOString(),
+            )
           }
         }
 
@@ -1881,8 +2184,7 @@ export class RingService implements SnapshotSource {
             indexedFiles.add(key)
             if (saved) {
               addedAny = true
-              worker.segmentsCaptured++
-              this.nvrTotalSegmentsCaptured++
+              this.recordWorkerSegmentMetrics(worker, saved)
             }
           }
 
@@ -1896,7 +2198,7 @@ export class RingService implements SnapshotSource {
       }
 
       try {
-        worker.state = consecutiveFailures > 0 ? 'reconnecting' : 'connecting'
+        worker.state = worker.consecutiveFailures > 0 ? 'reconnecting' : 'connecting'
         this.emitNvrStatus()
 
         const call = await liveCam.streamVideo({
@@ -1944,6 +2246,7 @@ export class RingService implements SnapshotSource {
         worker.activeCall = call
         worker.state = 'recording'
         worker.lastError = undefined
+        worker.lastActivityMs = sessionStartMs
         worker.currentSegmentStartedAt = new Date(sessionStartMs).toISOString()
         this.streamService.registerNvrHlsFeed(worker.cameraId, hlsOutput)
         this.emitNvrStatus()
@@ -1984,17 +2287,19 @@ export class RingService implements SnapshotSource {
 
         // Normal Ring ~10-minute WebRTC session rotation -> quick seamless reconnect
         const ranMs = Date.now() - sessionStartMs
+        worker.reconnectCount++
         if (ranMs >= 25000) {
-          consecutiveFailures = 0
+          worker.consecutiveFailures = 0
           worker.state = 'reconnecting'
           this.emitNvrStatus()
           const keepGoing = await this.cancellableDelay(worker, 2500)
           if (!keepGoing) break
         } else {
-          consecutiveFailures++
-          const backoffMs = Math.min(60000, 5000 * 2 ** (consecutiveFailures - 1))
+          const reason = `Stream closed after ${Math.round(ranMs / 1000)}s`
+          this.handleWorkerFailureNotification(worker, reason)
+          const backoffMs = Math.min(60000, 5000 * 2 ** (worker.consecutiveFailures - 1))
           worker.state = 'reconnecting'
-          worker.lastError = `Stream closed after ${Math.round(ranMs / 1000)}s; retrying in ${Math.round(backoffMs / 1000)}s`
+          worker.lastError = `${reason}; retrying in ${Math.round(backoffMs / 1000)}s`
           this.emitNvrStatus()
           const keepGoing = await this.cancellableDelay(worker, backoffMs)
           if (!keepGoing) break
@@ -2014,9 +2319,10 @@ export class RingService implements SnapshotSource {
 
         if (worker.stopped) break
 
-        consecutiveFailures++
-        const backoffMs = Math.min(60000, 5000 * 2 ** (consecutiveFailures - 1))
+        worker.reconnectCount++
         const message = err instanceof Error ? err.message : String(err)
+        this.handleWorkerFailureNotification(worker, message)
+        const backoffMs = Math.min(60000, 5000 * 2 ** (worker.consecutiveFailures - 1))
         worker.state = 'reconnecting'
         worker.lastError = `${message} (retrying in ${Math.round(backoffMs / 1000)}s)`
         this.emitNvrStatus()
@@ -2062,7 +2368,7 @@ export class RingService implements SnapshotSource {
           cam.demoImage || 'front_porch.jpg',
         )
         const { dataUrl } = await this.captureSnapshotBase64(cam.id)
-        await this.recordingService.captureDemoRecording({
+        const saved = await this.recordingService.captureDemoRecording({
           cameraId: cam.id,
           cameraName: cam.name,
           durationSeconds: Math.max(6, Math.round(waitMs / 1000)),
@@ -2071,8 +2377,7 @@ export class RingService implements SnapshotSource {
           thumbnailDataUrl: dataUrl,
           createdAtOverride: segStart.toISOString(),
         })
-        worker.segmentsCaptured++
-        this.nvrTotalSegmentsCaptured++
+        this.recordWorkerSegmentMetrics(worker, saved)
         this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
         this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
         this.emitNvrStatus()
@@ -2205,7 +2510,9 @@ export class RingService implements SnapshotSource {
   }
 
   shutdown(): void {
+    this.stopNvrWatchdog()
     this.aiPackageService.stop()
     this.clearLiveSubscriptions()
+    this.syncPowerSaveBlocker()
   }
 }
