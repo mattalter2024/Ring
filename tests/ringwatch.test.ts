@@ -414,9 +414,13 @@ describe('Local Video Storage quota, star protection & disk rescan', () => {
 describe('Timeline Tool scrubbing helpers', async () => {
   const {
     computeVisibleWindow,
+    computeZoomedWindowCenter,
+    panWindowCenter,
     findClipAtTimestamp,
     findNearestTimelineStop,
     buildRulerTicks,
+    msToPercent,
+    formatZoomLabel,
   } = await import('../src/utils/timeline')
 
   it('clamps visible zoom window and locates clips and nearest events accurately', () => {
@@ -456,6 +460,33 @@ describe('Timeline Tool scrubbing helpers', async () => {
 
     const nextStop = findNearestTimelineStop(clips, [], dayStart + 3600 * 1000, 'next')
     expect(nextStop).toBe(clipStart)
+  })
+
+  it('keeps cursor timestamp anchored when zooming and clamps panning within the day', () => {
+    const dayStart = new Date(2026, 10, 18, 0, 0, 0).getTime()
+    const dayEnd = new Date(2026, 10, 18, 24, 0, 0).getTime()
+
+    // Anchor 12:30 at 75% across the viewport when zooming from 6h down to 15m (0.25h)
+    const anchorTs = dayStart + 12.5 * 3600 * 1000
+    const nextCenter = computeZoomedWindowCenter(dayStart, dayEnd, anchorTs, 75, 0.25)
+    const zoomedWin = computeVisibleWindow(dayStart, dayEnd, nextCenter, 0.25)
+    expect(msToPercent(anchorTs, zoomedWin.windowStartMs, zoomedWin.windowEndMs)).toBeCloseTo(
+      75,
+      3,
+    )
+
+    // Fine zoom ticks and labels work for 15m and 30m levels
+    expect(formatZoomLabel(0.25)).toBe('15m')
+    expect(formatZoomLabel(0.5)).toBe('30m')
+    expect(formatZoomLabel(1)).toBe('1h')
+    const fineTicks = buildRulerTicks(zoomedWin.windowStartMs, zoomedWin.windowEndMs, 0.25)
+    expect(fineTicks.length).toBeGreaterThanOrEqual(7)
+
+    // Panning clamps cleanly at start and end of day
+    const pannedStart = panWindowCenter(dayStart, dayEnd, nextCenter, 1, -24 * 3600 * 1000)
+    expect(pannedStart).toBe(dayStart + 0.5 * 3600 * 1000)
+    const pannedEnd = panWindowCenter(dayStart, dayEnd, nextCenter, 1, 24 * 3600 * 1000)
+    expect(pannedEnd).toBe(dayEnd - 0.5 * 3600 * 1000)
   })
 })
 

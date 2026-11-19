@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Calendar,
   Camera,
   ChevronLeft,
   ChevronRight,
   Circle,
+  Crosshair,
   Download,
   FastForward,
   Film,
@@ -32,10 +33,13 @@ import type {
 import {
   buildRulerTicks,
   computeVisibleWindow,
+  computeZoomedWindowCenter,
   findClipAtTimestamp,
   findNearestTimelineStop,
+  formatZoomLabel,
   getDayRangeMs,
   msToPercent,
+  panWindowCenter,
   percentToMs,
   shiftDateKey,
   toLocalDateKey,
@@ -59,7 +63,14 @@ interface TimelineViewProps {
   onOpenInFolder: (recordingId: string) => Promise<void>
 }
 
-const ZOOM_LEVELS: TimelineZoomHours[] = [24, 12, 6, 1]
+const ZOOM_LEVELS: TimelineZoomHours[] = [24, 12, 6, 1, 0.5, 0.25]
+
+function formatClipClock(seconds: number): string {
+  const safe = Math.max(0, Math.floor(Number.isFinite(seconds) ? seconds : 0))
+  const mins = Math.floor(safe / 60)
+  const secs = safe % 60
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+}
 
 export function TimelineView({
   cameras,
@@ -76,16 +87,22 @@ export function TimelineView({
   onExportRecording,
   onOpenInFolder,
 }: TimelineViewProps) {
-  const [dateKey, setDateKey] = useState<string>(() => toLocalDateKey(new Date()))
-  const [zoomHours, setZoomHours] = useState<TimelineZoomHours>(6)
+  const initialAnchorMs = useMemo(
+    () => (recordings[0] ? new Date(recordings[0].createdAt).getTime() : Date.now()),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+
+  const [dateKey, setDateKey] = useState<string>(() =>
+    toLocalDateKey(new Date(initialAnchorMs)),
+  )
+  const [zoomHours, setZoomHours] = useState<TimelineZoomHours>(1)
+  const [viewportCenterMs, setViewportCenterMs] = useState<number>(initialAnchorMs)
   const [selectedCameraId, setSelectedCameraId] = useState<string>(
     () => cameras[0]?.id ?? recordings[0]?.cameraId ?? '',
   )
   const [clipListScope, setClipListScope] = useState<'camera' | 'all'>('camera')
-  const [playheadMs, setPlayheadMs] = useState<number>(() => {
-    if (recordings[0]) return new Date(recordings[0].createdAt).getTime()
-    return Date.now()
-  })
+  const [playheadMs, setPlayheadMs] = useState<number>(initialAnchorMs)
   const [activeClipId, setActiveClipId] = useState<string | null>(
     recordings[0]?.id ?? null,
   )
@@ -97,21 +114,45 @@ export function TimelineView({
   const [showDoorbell, setShowDoorbell] = useState(true)
   const [showPackages, setShowPackages] = useState(true)
   const [showSensors, setShowSensors] = useState(true)
-  const [hoverInfo, setHoverInfo] = useState<{ pct: number; tsMs: number } | null>(
-    null,
-  )
   const [dragging, setDragging] = useState(false)
+  const [clipDurationSec, setClipDurationSec] = useState<number>(
+    recordings[0]?.durationSeconds ?? 0,
+  )
+  const [clipCurrentSec, setClipCurrentSec] = useState<number>(0)
   const [capturing, setCapturing] = useState(false)
   const [syncingEvents, setSyncingEvents] = useState(false)
   const [nowMs, setNowMs] = useState<number>(() => Date.now())
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const tracksContainerRef = useRef<HTMLDivElement | null>(null)
+  const playheadElRef = useRef<HTMLDivElement | null>(null)
+  const hoverLineRef = useRef<HTMLDivElement | null>(null)
+  const hoverBadgeRef = useRef<HTMLSpanElement | null>(null)
+  const clipScrubTrackRef = useRef<HTMLDivElement | null>(null)
+  const clipScrubFillRef = useRef<HTMLDivElement | null>(null)
+  const clipScrubThumbRef = useRef<HTMLDivElement | null>(null)
+  const clipCurrentTimeLabelRef = useRef<HTMLSpanElement | null>(null)
+
   const pendingSeekRef = useRef<{
     clipId: string
     offsetSeconds: number
     autoPlay: boolean
   } | null>(null)
+  const queuedSeekRef = useRef<{
+    clipId: string
+    offsetSeconds: number
+    exact: boolean
+  } | null>(null)
+
+  const isDraggingRef = useRef(false)
+  const isClipBarDraggingRef = useRef(false)
+  const dragCameraIdRef = useRef<string | undefined>(undefined)
+  const wasPlayingBeforeDragRef = useRef(false)
+  const lastDragClientXRef = useRef(0)
+  const lastDragTsMsRef = useRef(initialAnchorMs)
+  const dragRafRef = useRef<number | null>(null)
+  const clipSwitchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastReactSyncRef = useRef(0)
 
   useEffect(() => {
     if (!nvrStatus.active) return
@@ -222,9 +263,10 @@ export function TimelineView({
     [packageDetections, dayStartMs, dayEndMs, showPackages],
   )
 
+  // Decoupled from playheadMs so the timeline stays stationary under your cursor while scrubbing!
   const { windowStartMs, windowEndMs } = useMemo(
-    () => computeVisibleWindow(dayStartMs, dayEndMs, playheadMs, zoomHours),
-    [dayStartMs, dayEndMs, playheadMs, zoomHours],
+    () => computeVisibleWindow(dayStartMs, dayEndMs, viewportCenterMs, zoomHours),
+    [dayStartMs, dayEndMs, viewportCenterMs, zoomHours],
   )
 
   const rulerTicks = useMemo(
@@ -249,93 +291,295 @@ export function TimelineView({
     [dayEvents, selectedEventId],
   )
 
+  // Live refs so high-frequency pointer/wheel/RAF callbacks read fresh values with zero listener churn
+  const windowRef = useRef({
+    windowStartMs,
+    windowEndMs,
+    dayStartMs,
+    dayEndMs,
+    zoomHours,
+    viewportCenterMs,
+  })
+  windowRef.current = {
+    windowStartMs,
+    windowEndMs,
+    dayStartMs,
+    dayEndMs,
+    zoomHours,
+    viewportCenterMs,
+  }
+  const activeClipRef = useRef(activeClip)
+  activeClipRef.current = activeClip
+  const dayRecordingsRef = useRef(dayRecordings)
+  dayRecordingsRef.current = dayRecordings
+  const activeCameraIdRef = useRef(activeCameraTrack?.id)
+  activeCameraIdRef.current = activeCameraTrack?.id
+
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.playbackRate = playbackRate
     }
   }, [playbackRate, activeClip?.id])
 
-  const applySeekIfSameClip = (
-    clipId: string,
-    offsetSeconds: number,
-    autoPlay: boolean,
-  ) => {
-    pendingSeekRef.current = { clipId, offsetSeconds, autoPlay }
-    if (activeClip?.id === clipId && videoRef.current && videoRef.current.readyState >= 1) {
+  useEffect(() => {
+    setClipDurationSec(activeClip?.durationSeconds ?? 0)
+    setClipCurrentSec(0)
+  }, [activeClip?.id, activeClip?.durationSeconds])
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (dragRafRef.current !== null) cancelAnimationFrame(dragRafRef.current)
+      if (clipSwitchTimerRef.current !== null) clearTimeout(clipSwitchTimerRef.current)
+    }
+  }, [])
+
+  const syncPlayheadDom = useCallback((tsMs: number) => {
+    const el = playheadElRef.current
+    if (!el) return
+    const { windowStartMs: ws, windowEndMs: we } = windowRef.current
+    const pct = msToPercent(tsMs, ws, we)
+    if (pct >= 0 && pct <= 100) {
+      el.style.left = `${pct}%`
+      el.style.opacity = '1'
+    } else {
+      el.style.opacity = '0'
+    }
+  }, [])
+
+  const syncClipBarDom = useCallback((currentSec: number, durationSec: number) => {
+    const pct = durationSec > 0 ? Math.max(0, Math.min(100, (currentSec / durationSec) * 100)) : 0
+    if (clipScrubFillRef.current) {
+      clipScrubFillRef.current.style.width = `${pct}%`
+    }
+    if (clipScrubThumbRef.current) {
+      clipScrubThumbRef.current.style.left = `${pct}%`
+    }
+    if (clipCurrentTimeLabelRef.current) {
+      clipCurrentTimeLabelRef.current.textContent = formatClipClock(currentSec)
+    }
+  }, [])
+
+  const ensureTimestampInView = useCallback((tsMs: number) => {
+    const { windowStartMs: ws, windowEndMs: we } = windowRef.current
+    if (tsMs < ws || tsMs > we) {
+      setViewportCenterMs(tsMs)
+    }
+  }, [])
+
+  // Seek-in-flight coalescing so Chromium's H.264 decoder never backs up during fast drags
+  const applyVideoSeek = useCallback(
+    (
+      clipId: string,
+      offsetSeconds: number,
+      options?: { exact?: boolean; autoPlay?: boolean },
+    ) => {
+      const exact = options?.exact ?? true
+      const autoPlay = Boolean(options?.autoPlay)
+      const currentClip = activeClipRef.current
       const video = videoRef.current
-      const clamped = Math.max(
-        0,
-        Math.min(
-          offsetSeconds,
-          Number.isFinite(video.duration) && video.duration > 0
-            ? Math.max(0, video.duration - 0.5)
-            : offsetSeconds,
-        ),
-      )
+
+      if (!currentClip || currentClip.id !== clipId || !video || video.readyState < 1) {
+        pendingSeekRef.current = { clipId, offsetSeconds, autoPlay }
+        return
+      }
+
+      const maxTime =
+        Number.isFinite(video.duration) && video.duration > 0
+          ? Math.max(0, video.duration - 0.15)
+          : offsetSeconds
+      const clamped = Math.max(0, Math.min(offsetSeconds, maxTime))
+
+      syncClipBarDom(clamped, Number.isFinite(video.duration) && video.duration > 0 ? video.duration : currentClip.durationSeconds)
+
+      if (video.seeking && !exact) {
+        queuedSeekRef.current = { clipId, offsetSeconds: clamped, exact: false }
+        return
+      }
+
+      queuedSeekRef.current = null
       try {
-        video.currentTime = clamped
+        if (
+          !exact &&
+          typeof video.fastSeek === 'function' &&
+          Math.abs(video.currentTime - clamped) > 0.45
+        ) {
+          video.fastSeek(clamped)
+        } else {
+          video.currentTime = clamped
+        }
       } catch {
         // Metadata still settling
       }
+
       if (autoPlay) {
         void video.play().then(() => setIsPlaying(true)).catch(() => {})
       }
       pendingSeekRef.current = null
+    },
+    [syncClipBarDom],
+  )
+
+  const handleVideoSeeked = useCallback(() => {
+    const queued = queuedSeekRef.current
+    if (!queued) return
+    queuedSeekRef.current = null
+    applyVideoSeek(queued.clipId, queued.offsetSeconds, { exact: queued.exact })
+  }, [applyVideoSeek])
+
+  // 60fps smooth playhead glide during normal playback
+  useEffect(() => {
+    if (!isPlaying || dragging || !activeClip?.playbackUrl) return
+    let rafId = 0
+    const clipStartMs = new Date(activeClip.createdAt).getTime()
+
+    const tick = () => {
+      const video = videoRef.current
+      if (video && !video.paused && !isDraggingRef.current && !isClipBarDraggingRef.current) {
+        const current = video.currentTime
+        const dur =
+          Number.isFinite(video.duration) && video.duration > 0
+            ? video.duration
+            : activeClip.durationSeconds
+        const liveMs = clipStartMs + current * 1000
+        syncPlayheadDom(liveMs)
+        syncClipBarDom(current, dur)
+
+        const now = performance.now()
+        if (now - lastReactSyncRef.current > 90) {
+          lastReactSyncRef.current = now
+          setPlayheadMs(liveMs)
+          setClipCurrentSec(current)
+          const { windowEndMs: we, zoomHours: zh, dayStartMs: ds, dayEndMs: de, viewportCenterMs: vc } =
+            windowRef.current
+          if (liveMs > we && zh < 24) {
+            setViewportCenterMs(
+              panWindowCenter(ds, de, vc, zh, zh * 3600 * 1000 * 0.65),
+            )
+          }
+        }
+      }
+      rafId = requestAnimationFrame(tick)
     }
-  }
+
+    rafId = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(rafId)
+  }, [isPlaying, dragging, activeClip, syncPlayheadDom, syncClipBarDom])
 
   const handleSelectCamera = (cameraId: string) => {
     setSelectedCameraId(cameraId)
     setSelectedEventId(null)
 
-    // Try finding a clip for this camera at the current playhead first
     const atPlayhead = findClipAtTimestamp(dayRecordings, playheadMs, cameraId)
     if (atPlayhead) {
       setActiveClipId(atPlayhead.clip.id)
-      applySeekIfSameClip(atPlayhead.clip.id, atPlayhead.offsetSeconds, isPlaying)
+      applyVideoSeek(atPlayhead.clip.id, atPlayhead.offsetSeconds, {
+        exact: true,
+        autoPlay: isPlaying,
+      })
       return
     }
 
-    // Otherwise jump to the latest clip for this camera on the selected day
     const camDayClips = dayRecordings.filter((r) => r.cameraId === cameraId)
     if (camDayClips.length > 0) {
       const latest = camDayClips[camDayClips.length - 1]
+      const latestMs = new Date(latest.createdAt).getTime()
       setActiveClipId(latest.id)
-      setPlayheadMs(new Date(latest.createdAt).getTime())
-      applySeekIfSameClip(latest.id, 0, false)
+      setPlayheadMs(latestMs)
+      ensureTimestampInView(latestMs)
+      applyVideoSeek(latest.id, 0, { exact: true, autoPlay: false })
     } else {
       setActiveClipId(null)
     }
   }
 
-  const seekToTimestamp = (
-    tsMs: number,
-    preferCameraId?: string,
-    options?: { keepEventId?: string | null; preRollSeconds?: number; autoPlay?: boolean },
-  ) => {
-    const targetCamId = preferCameraId ?? activeCameraTrack?.id
-    if (preferCameraId && preferCameraId !== selectedCameraId) {
-      setSelectedCameraId(preferCameraId)
-    }
+  const seekToTimestamp = useCallback(
+    (
+      tsMs: number,
+      preferCameraId?: string,
+      options?: {
+        keepEventId?: string | null
+        preRollSeconds?: number
+        autoPlay?: boolean
+        isDrag?: boolean
+        centerIfOutOfView?: boolean
+      },
+    ) => {
+      const { dayStartMs: ds, dayEndMs: de } = windowRef.current
+      const targetCamId = preferCameraId ?? activeCameraIdRef.current
+      if (preferCameraId && preferCameraId !== activeCameraIdRef.current) {
+        setSelectedCameraId(preferCameraId)
+      }
 
-    const clamped = Math.max(dayStartMs, Math.min(dayEndMs - 1, tsMs))
-    setPlayheadMs(clamped)
+      const clamped = Math.max(ds, Math.min(de - 1, tsMs))
+      lastDragTsMsRef.current = clamped
+      syncPlayheadDom(clamped)
 
-    const match = findClipAtTimestamp(dayRecordings, clamped, targetCamId)
+      if (options?.centerIfOutOfView) {
+        ensureTimestampInView(clamped)
+      }
 
-    if (options?.keepEventId !== undefined) {
-      setSelectedEventId(options.keepEventId)
-    } else if (match) {
-      setSelectedEventId(null)
-    }
+      const now = performance.now()
+      if (!options?.isDrag || now - lastReactSyncRef.current > 45) {
+        lastReactSyncRef.current = now
+        setPlayheadMs(clamped)
+      }
 
-    if (match) {
-      const preRoll = options?.preRollSeconds ?? 0
-      const targetOffset = Math.max(0, match.offsetSeconds - preRoll)
-      setActiveClipId(match.clip.id)
-      applySeekIfSameClip(match.clip.id, targetOffset, Boolean(options?.autoPlay))
-    }
-  }
+      const match = findClipAtTimestamp(dayRecordingsRef.current, clamped, targetCamId)
+
+      if (options?.keepEventId !== undefined) {
+        setSelectedEventId(options.keepEventId)
+      } else if (match && !options?.isDrag) {
+        setSelectedEventId(null)
+      }
+
+      if (match) {
+        const preRoll = options?.preRollSeconds ?? 0
+        const targetOffset = Math.max(0, match.offsetSeconds - preRoll)
+
+        if (activeClipRef.current?.id === match.clip.id) {
+          if (clipSwitchTimerRef.current !== null) {
+            clearTimeout(clipSwitchTimerRef.current)
+            clipSwitchTimerRef.current = null
+          }
+          applyVideoSeek(match.clip.id, targetOffset, {
+            exact: !options?.isDrag,
+            autoPlay: Boolean(options?.autoPlay),
+          })
+        } else if (options?.isDrag) {
+          // Debounce switching <video> sources during rapid sweeps across multiple clips
+          pendingSeekRef.current = {
+            clipId: match.clip.id,
+            offsetSeconds: targetOffset,
+            autoPlay: false,
+          }
+          if (clipSwitchTimerRef.current !== null) {
+            clearTimeout(clipSwitchTimerRef.current)
+          }
+          clipSwitchTimerRef.current = setTimeout(() => {
+            clipSwitchTimerRef.current = null
+            setActiveClipId(match.clip.id)
+          }, 95)
+        } else {
+          if (clipSwitchTimerRef.current !== null) {
+            clearTimeout(clipSwitchTimerRef.current)
+            clipSwitchTimerRef.current = null
+          }
+          pendingSeekRef.current = {
+            clipId: match.clip.id,
+            offsetSeconds: targetOffset,
+            autoPlay: Boolean(options?.autoPlay),
+          }
+          setActiveClipId(match.clip.id)
+          applyVideoSeek(match.clip.id, targetOffset, {
+            exact: true,
+            autoPlay: Boolean(options?.autoPlay),
+          })
+        }
+      }
+    },
+    [applyVideoSeek, ensureTimestampInView, syncPlayheadDom],
+  )
 
   const selectClip = (clip: LocalRecordingItem) => {
     const clipStart = new Date(clip.createdAt).getTime()
@@ -347,7 +591,8 @@ export function TimelineView({
     setActiveClipId(clip.id)
     setSelectedEventId(null)
     setPlayheadMs(clipStart)
-    applySeekIfSameClip(clip.id, 0, true)
+    setViewportCenterMs(clipStart)
+    applyVideoSeek(clip.id, 0, { exact: true, autoPlay: true })
   }
 
   const selectEventPin = (ev: SecurityEvent, preferCameraId?: string) => {
@@ -356,6 +601,7 @@ export function TimelineView({
       keepEventId: ev.id,
       preRollSeconds: 3,
       autoPlay: true,
+      centerIfOutOfView: true,
     })
   }
 
@@ -375,31 +621,245 @@ export function TimelineView({
       direction,
     )
     if (target !== null) {
-      seekToTimestamp(target, activeCameraTrack?.id)
+      seekToTimestamp(target, activeCameraTrack?.id, { centerIfOutOfView: true })
     }
   }
 
-  const handleTrackPointer = (clientX: number, laneCameraId?: string) => {
+  // Zero-rerender hover indicator update directly via DOM refs
+  const updateHoverIndicator = useCallback((clientX: number | null) => {
+    const line = hoverLineRef.current
+    const badge = hoverBadgeRef.current
+    const container = tracksContainerRef.current
+    if (!line || !badge || !container || clientX === null) {
+      if (line) line.style.opacity = '0'
+      return
+    }
+    const rect = container.getBoundingClientRect()
+    const pct = Math.max(0, Math.min(100, ((clientX - rect.left) / Math.max(1, rect.width)) * 100))
+    const { windowStartMs: ws, windowEndMs: we } = windowRef.current
+    const tsMs = percentToMs(pct, ws, we)
+    line.style.left = `${pct}%`
+    line.style.opacity = '1'
+    badge.textContent = formatTimestamp(new Date(tsMs).toISOString())
+    // Keep tooltip inside right edge of viewport
+    badge.style.left = pct > 84 ? '-72px' : '5px'
+  }, [])
+
+  const processDragFrame = useCallback(() => {
+    dragRafRef.current = null
+    if (!isDraggingRef.current) return
+    const container = tracksContainerRef.current
+    if (!container) return
+
+    const rect = container.getBoundingClientRect()
+    const rawPct = ((lastDragClientXRef.current - rect.left) / Math.max(1, rect.width)) * 100
+    const pct = Math.max(0, Math.min(100, rawPct))
+    const {
+      windowStartMs: ws,
+      windowEndMs: we,
+      dayStartMs: ds,
+      dayEndMs: de,
+      zoomHours: zh,
+      viewportCenterMs: vc,
+    } = windowRef.current
+
+    // Gentle edge auto-pan when dragging against the left or right 3% margin while zoomed in
+    if (zh < 24 && (rawPct < 3 || rawPct > 97)) {
+      const spanMs = we - ws
+      const dir = rawPct < 3 ? -1 : 1
+      const nextCenter = panWindowCenter(ds, de, vc, zh, dir * spanMs * 0.015)
+      if (nextCenter !== vc) {
+        setViewportCenterMs(nextCenter)
+        dragRafRef.current = requestAnimationFrame(processDragFrame)
+      }
+    }
+
+    const tsMs = percentToMs(pct, ws, we)
+    seekToTimestamp(tsMs, dragCameraIdRef.current, { isDrag: true })
+  }, [seekToTimestamp])
+
+  const handleTracksPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return
+    const targetEl = e.target as HTMLElement | null
+    // Let event/package pins handle their own jump-with-preroll click
+    if (targetEl?.closest('.timeline-pin')) return
+
+    const laneEl = targetEl?.closest<HTMLElement>('[data-camera-id]')
+    const laneCamId = laneEl?.dataset.cameraId || activeCameraIdRef.current
+    dragCameraIdRef.current = laneCamId
+
+    e.currentTarget.setPointerCapture(e.pointerId)
+    isDraggingRef.current = true
+    setDragging(true)
+
+    const video = videoRef.current
+    if (video && !video.paused) {
+      wasPlayingBeforeDragRef.current = true
+      video.pause()
+      setIsPlaying(false)
+    } else {
+      wasPlayingBeforeDragRef.current = false
+    }
+
+    lastDragClientXRef.current = e.clientX
+    updateHoverIndicator(e.clientX)
+
+    const rect = e.currentTarget.getBoundingClientRect()
+    const pct = Math.max(0, Math.min(100, ((e.clientX - rect.left) / Math.max(1, rect.width)) * 100))
+    const { windowStartMs: ws, windowEndMs: we } = windowRef.current
+    const tsMs = percentToMs(pct, ws, we)
+    seekToTimestamp(tsMs, laneCamId, { isDrag: true })
+  }
+
+  const handleTracksPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    updateHoverIndicator(e.clientX)
+    if (!isDraggingRef.current) return
+    lastDragClientXRef.current = e.clientX
+    if (dragRafRef.current === null) {
+      dragRafRef.current = requestAnimationFrame(processDragFrame)
+    }
+  }
+
+  const finishTracksDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDraggingRef.current) return
+    isDraggingRef.current = false
+    setDragging(false)
+    if (dragRafRef.current !== null) {
+      cancelAnimationFrame(dragRafRef.current)
+      dragRafRef.current = null
+    }
+    if (clipSwitchTimerRef.current !== null) {
+      clearTimeout(clipSwitchTimerRef.current)
+      clipSwitchTimerRef.current = null
+    }
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      }
+    } catch {
+      // ignore release errors
+    }
+
+    const rect = e.currentTarget.getBoundingClientRect()
+    const pct = Math.max(0, Math.min(100, ((e.clientX - rect.left) / Math.max(1, rect.width)) * 100))
+    const { windowStartMs: ws, windowEndMs: we } = windowRef.current
+    const finalTs = percentToMs(pct, ws, we)
+    const shouldResume = wasPlayingBeforeDragRef.current
+    wasPlayingBeforeDragRef.current = false
+
+    seekToTimestamp(finalTs, dragCameraIdRef.current, {
+      isDrag: false,
+      autoPlay: shouldResume,
+    })
+  }
+
+  // Non-passive mouse-wheel listener for cursor-anchored zoom & horizontal pan
+  useEffect(() => {
     const el = tracksContainerRef.current
     if (!el) return
-    const rect = el.getBoundingClientRect()
-    const pct = ((clientX - rect.left) / Math.max(1, rect.width)) * 100
-    const tsMs = percentToMs(pct, windowStartMs, windowEndMs)
-    seekToTimestamp(tsMs, laneCameraId ?? activeCameraTrack?.id)
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      const pct = Math.max(0, Math.min(100, ((e.clientX - rect.left) / Math.max(1, rect.width)) * 100))
+      const {
+        windowStartMs: ws,
+        windowEndMs: we,
+        dayStartMs: ds,
+        dayEndMs: de,
+        zoomHours: zh,
+        viewportCenterMs: vc,
+      } = windowRef.current
+
+      // Horizontal scroll / Shift+Wheel pans smoothly left/right
+      if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
+        const deltaMs = (delta / Math.max(200, rect.width)) * (we - ws) * 1.15
+        setViewportCenterMs(panWindowCenter(ds, de, vc, zh, deltaMs))
+        return
+      }
+
+      // Vertical wheel zooms in/out anchored at the cursor timestamp
+      const idx = ZOOM_LEVELS.indexOf(zh)
+      const nextIdx =
+        e.deltaY < 0
+          ? Math.min(ZOOM_LEVELS.length - 1, idx + 1)
+          : Math.max(0, idx - 1)
+      if (nextIdx === idx) return
+
+      const nextZoom = ZOOM_LEVELS[nextIdx]
+      const anchorTs = percentToMs(pct, ws, we)
+      setZoomHours(nextZoom)
+      setViewportCenterMs(
+        computeZoomedWindowCenter(ds, de, anchorTs, pct, nextZoom),
+      )
+    }
+
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [])
+
+  // Direct in-player clip scrub bar handlers
+  const scrubActiveClipAtClientX = (clientX: number, exact: boolean) => {
+    const track = clipScrubTrackRef.current
+    const clip = activeClipRef.current
+    const video = videoRef.current
+    if (!track || !clip) return
+
+    const rect = track.getBoundingClientRect()
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)))
+    const dur =
+      video && Number.isFinite(video.duration) && video.duration > 0
+        ? video.duration
+        : Math.max(1, clip.durationSeconds)
+    const offsetSec = ratio * dur
+    const targetMs = new Date(clip.createdAt).getTime() + offsetSec * 1000
+
+    syncPlayheadDom(targetMs)
+    syncClipBarDom(offsetSec, dur)
+    setClipCurrentSec(offsetSec)
+    if (exact || performance.now() - lastReactSyncRef.current > 45) {
+      lastReactSyncRef.current = performance.now()
+      setPlayheadMs(targetMs)
+    }
+    applyVideoSeek(clip.id, offsetSec, { exact })
   }
 
-  useEffect(() => {
-    if (!dragging) return
-    const onMove = (e: MouseEvent) => handleTrackPointer(e.clientX)
-    const onUp = () => setDragging(false)
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
-    return () => {
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
+  const handleClipBarPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !activeClip?.playbackUrl) return
+    e.currentTarget.setPointerCapture(e.pointerId)
+    isClipBarDraggingRef.current = true
+    const video = videoRef.current
+    if (video && !video.paused) {
+      wasPlayingBeforeDragRef.current = true
+      video.pause()
+      setIsPlaying(false)
+    } else {
+      wasPlayingBeforeDragRef.current = false
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dragging, windowStartMs, windowEndMs, dayRecordings, activeCameraTrack?.id])
+    scrubActiveClipAtClientX(e.clientX, false)
+  }
+
+  const handleClipBarPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isClipBarDraggingRef.current) return
+    scrubActiveClipAtClientX(e.clientX, false)
+  }
+
+  const handleClipBarPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isClipBarDraggingRef.current) return
+    isClipBarDraggingRef.current = false
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      }
+    } catch {
+      // ignore
+    }
+    scrubActiveClipAtClientX(e.clientX, true)
+    if (wasPlayingBeforeDragRef.current && videoRef.current) {
+      wasPlayingBeforeDragRef.current = false
+      void videoRef.current.play().then(() => setIsPlaying(true)).catch(() => {})
+    }
+  }
 
   const togglePlayPause = () => {
     const video = videoRef.current
@@ -414,8 +874,33 @@ export function TimelineView({
 
   const stepVideoSeconds = (delta: number) => {
     const video = videoRef.current
-    if (!video) return
-    video.currentTime = Math.max(0, video.currentTime + delta)
+    const clip = activeClipRef.current
+    if (!video || !clip) return
+    const dur =
+      Number.isFinite(video.duration) && video.duration > 0
+        ? video.duration
+        : clip.durationSeconds
+    const nextSec = Math.max(0, Math.min(dur, video.currentTime + delta))
+    applyVideoSeek(clip.id, nextSec, { exact: true })
+    const nextMs = new Date(clip.createdAt).getTime() + nextSec * 1000
+    setPlayheadMs(nextMs)
+    setClipCurrentSec(nextSec)
+    syncPlayheadDom(nextMs)
+  }
+
+  const handleZoomChange = (nextZoom: TimelineZoomHours) => {
+    setZoomHours(nextZoom)
+    // Keep playhead centered nicely when changing zoom via buttons
+    setViewportCenterMs(
+      computeZoomedWindowCenter(dayStartMs, dayEndMs, playheadMs, 50, nextZoom),
+    )
+  }
+
+  const handlePanStep = (direction: -1 | 1) => {
+    const spanMs = windowEndMs - windowStartMs
+    setViewportCenterMs((prev) =>
+      panWindowCenter(dayStartMs, dayEndMs, prev, zoomHours, direction * spanMs * 0.5),
+    )
   }
 
   const zoomIdx = ZOOM_LEVELS.indexOf(zoomHours)
@@ -533,9 +1018,15 @@ export function TimelineView({
                   key={activeClip.id}
                   src={activeClip.playbackUrl}
                   poster={activeClip.thumbnailDataUrl}
+                  preload="auto"
                   onLoadedMetadata={(e) => {
                     const video = e.currentTarget
                     video.playbackRate = playbackRate
+                    const dur =
+                      Number.isFinite(video.duration) && video.duration > 0
+                        ? video.duration
+                        : activeClip.durationSeconds
+                    setClipDurationSec(dur)
                     const pending = pendingSeekRef.current
                     if (pending && pending.clipId === activeClip.id) {
                       const target = Math.max(
@@ -543,7 +1034,7 @@ export function TimelineView({
                         Math.min(
                           pending.offsetSeconds,
                           Number.isFinite(video.duration) && video.duration > 0
-                            ? Math.max(0, video.duration - 0.5)
+                            ? Math.max(0, video.duration - 0.15)
                             : pending.offsetSeconds,
                         ),
                       )
@@ -552,18 +1043,33 @@ export function TimelineView({
                       } catch {
                         // ignore
                       }
+                      setClipCurrentSec(target)
+                      syncClipBarDom(target, dur)
                       if (pending.autoPlay) {
                         void video.play().then(() => setIsPlaying(true)).catch(() => {})
                       }
                       pendingSeekRef.current = null
                     }
                   }}
+                  onSeeked={handleVideoSeeked}
                   onPlay={() => setIsPlaying(true)}
                   onPause={() => setIsPlaying(false)}
                   onTimeUpdate={(e) => {
+                    if (isDraggingRef.current || isClipBarDraggingRef.current) return
                     const current = e.currentTarget.currentTime
+                    const dur =
+                      Number.isFinite(e.currentTarget.duration) &&
+                      e.currentTarget.duration > 0
+                        ? e.currentTarget.duration
+                        : activeClip.durationSeconds
                     const base = new Date(activeClip.createdAt).getTime()
-                    setPlayheadMs(base + current * 1000)
+                    const liveMs = base + current * 1000
+                    syncPlayheadDom(liveMs)
+                    syncClipBarDom(current, dur)
+                    if (videoRef.current?.paused) {
+                      setPlayheadMs(liveMs)
+                      setClipCurrentSec(current)
+                    }
                   }}
                   onEnded={() => {
                     setIsPlaying(false)
@@ -632,6 +1138,43 @@ export function TimelineView({
                 </div>
               )}
             </div>
+
+            {/* Direct Smooth Clip Scrub Bar */}
+            {activeClip?.playbackUrl && (
+              <div className="clip-scrub-row" aria-label="Active clip scrubber">
+                <span ref={clipCurrentTimeLabelRef} className="clip-scrub-time mono">
+                  {formatClipClock(clipCurrentSec)}
+                </span>
+                <div
+                  ref={clipScrubTrackRef}
+                  className="clip-scrub-track"
+                  onPointerDown={handleClipBarPointerDown}
+                  onPointerMove={handleClipBarPointerMove}
+                  onPointerUp={handleClipBarPointerUp}
+                  onPointerCancel={handleClipBarPointerUp}
+                >
+                  <div className="clip-scrub-rail">
+                    <div
+                      ref={clipScrubFillRef}
+                      className="clip-scrub-fill"
+                      style={{
+                        width: `${clipDurationSec > 0 ? Math.min(100, (clipCurrentSec / clipDurationSec) * 100) : 0}%`,
+                      }}
+                    />
+                  </div>
+                  <div
+                    ref={clipScrubThumbRef}
+                    className="clip-scrub-thumb"
+                    style={{
+                      left: `${clipDurationSec > 0 ? Math.min(100, (clipCurrentSec / clipDurationSec) * 100) : 0}%`,
+                    }}
+                  />
+                </div>
+                <span className="clip-scrub-time mono">
+                  {formatClipClock(clipDurationSec)}
+                </span>
+              </div>
+            )}
 
             {/* Transport Controls */}
             <div className="timeline-transport">
@@ -955,8 +1498,10 @@ export function TimelineView({
               title="Previous day"
               onClick={() => {
                 const nextDate = shiftDateKey(dateKey, -1)
+                const midMs = getDayRangeMs(nextDate).startMs + 12 * 3600 * 1000
                 setDateKey(nextDate)
-                setPlayheadMs(getDayRangeMs(nextDate).startMs + 12 * 3600 * 1000)
+                setPlayheadMs(midMs)
+                setViewportCenterMs(midMs)
               }}
             >
               <ChevronLeft size={15} />
@@ -975,8 +1520,10 @@ export function TimelineView({
                 value={dateKey}
                 onChange={(e) => {
                   if (!e.target.value) return
+                  const midMs = getDayRangeMs(e.target.value).startMs + 12 * 3600 * 1000
                   setDateKey(e.target.value)
-                  setPlayheadMs(getDayRangeMs(e.target.value).startMs + 12 * 3600 * 1000)
+                  setPlayheadMs(midMs)
+                  setViewportCenterMs(midMs)
                 }}
               />
             </div>
@@ -987,8 +1534,10 @@ export function TimelineView({
               title="Next day"
               onClick={() => {
                 const nextDate = shiftDateKey(dateKey, 1)
+                const midMs = getDayRangeMs(nextDate).startMs + 12 * 3600 * 1000
                 setDateKey(nextDate)
-                setPlayheadMs(getDayRangeMs(nextDate).startMs + 12 * 3600 * 1000)
+                setPlayheadMs(midMs)
+                setViewportCenterMs(midMs)
               }}
             >
               <ChevronRight size={15} />
@@ -998,9 +1547,11 @@ export function TimelineView({
               type="button"
               className="btn btn-sm"
               onClick={() => {
-                const today = toLocalDateKey(new Date())
+                const now = Date.now()
+                const today = toLocalDateKey(new Date(now))
                 setDateKey(today)
-                setPlayheadMs(Date.now())
+                setPlayheadMs(now)
+                setViewportCenterMs(now)
               }}
             >
               Today
@@ -1040,13 +1591,41 @@ export function TimelineView({
             </button>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            {zoomHours < 24 && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-icon"
+                  title="Pan timeline earlier (or Shift+Scroll)"
+                  onClick={() => handlePanStep(-1)}
+                >
+                  <ChevronLeft size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-icon"
+                  title="Center view on playhead"
+                  onClick={() => setViewportCenterMs(playheadMs)}
+                >
+                  <Crosshair size={13} />
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-icon"
+                  title="Pan timeline later (or Shift+Scroll)"
+                  onClick={() => handlePanStep(1)}
+                >
+                  <ChevronRight size={14} />
+                </button>
+              </>
+            )}
             <button
               type="button"
               className="btn btn-icon"
-              title="Zoom out"
+              title="Zoom out (or scroll down on timeline)"
               disabled={zoomIdx <= 0}
-              onClick={() => setZoomHours(ZOOM_LEVELS[Math.max(0, zoomIdx - 1)])}
+              onClick={() => handleZoomChange(ZOOM_LEVELS[Math.max(0, zoomIdx - 1)])}
             >
               <ZoomOut size={14} />
             </button>
@@ -1056,19 +1635,19 @@ export function TimelineView({
                   key={hrs}
                   type="button"
                   className={zoomHours === hrs ? 'active' : ''}
-                  onClick={() => setZoomHours(hrs)}
+                  onClick={() => handleZoomChange(hrs)}
                 >
-                  {hrs}h
+                  {formatZoomLabel(hrs)}
                 </button>
               ))}
             </div>
             <button
               type="button"
               className="btn btn-icon"
-              title="Zoom in"
+              title="Zoom in (or scroll up on timeline)"
               disabled={zoomIdx >= ZOOM_LEVELS.length - 1}
               onClick={() =>
-                setZoomHours(
+                handleZoomChange(
                   ZOOM_LEVELS[Math.min(ZOOM_LEVELS.length - 1, zoomIdx + 1)],
                 )
               }
@@ -1105,7 +1684,7 @@ export function TimelineView({
             Recording Now
           </span>
           <span style={{ marginLeft: 'auto', color: 'var(--text-muted)' }}>
-            Click or drag any lane to scrub · Click a camera name to switch
+            Drag anywhere to scrub · Scroll wheel to zoom · Shift+Scroll to pan
           </span>
         </div>
 
@@ -1156,20 +1735,16 @@ export function TimelineView({
 
             <div
               ref={tracksContainerRef}
-              className="timeline-lanes-col"
-              onMouseDown={(e) => {
-                setDragging(true)
-                handleTrackPointer(e.clientX)
+              className={`timeline-lanes-col ${dragging ? 'dragging' : ''}`}
+              onPointerDown={handleTracksPointerDown}
+              onPointerMove={handleTracksPointerMove}
+              onPointerUp={finishTracksDrag}
+              onPointerCancel={finishTracksDrag}
+              onPointerLeave={() => {
+                if (!isDraggingRef.current) {
+                  updateHoverIndicator(null)
+                }
               }}
-              onMouseMove={(e) => {
-                const rect = e.currentTarget.getBoundingClientRect()
-                const pct = ((e.clientX - rect.left) / Math.max(1, rect.width)) * 100
-                setHoverInfo({
-                  pct: Math.max(0, Math.min(100, pct)),
-                  tsMs: percentToMs(pct, windowStartMs, windowEndMs),
-                })
-              }}
-              onMouseLeave={() => setHoverInfo(null)}
             >
               {/* Time Ruler */}
               <div className="timeline-ruler">
@@ -1203,16 +1778,12 @@ export function TimelineView({
                 return (
                   <div
                     key={cam.id}
+                    data-camera-id={cam.id}
                     className={`timeline-lane ${isSelected ? 'active-lane' : ''}`}
-                    onMouseDown={(e) => {
-                      e.stopPropagation()
-                      setDragging(true)
-                      handleTrackPointer(e.clientX, cam.id)
-                    }}
                   >
                     {camClips.map((clip) => {
                       const start = new Date(clip.createdAt).getTime()
-                      const end = start + Math.max(15, clip.durationSeconds) * 1000
+                      const end = start + Math.max(1, clip.durationSeconds) * 1000
                       if (end < windowStartMs || start > windowEndMs) return null
                       const leftPct = Math.max(
                         0,
@@ -1222,12 +1793,11 @@ export function TimelineView({
                         100,
                         msToPercent(end, windowStartMs, windowEndMs),
                       )
-                      const widthPct = Math.max(1.1, rightPct - leftPct)
+                      const widthPct = Math.max(0.2, rightPct - leftPct)
 
                       return (
-                        <button
+                        <div
                           key={clip.id}
-                          type="button"
                           className={`timeline-clip-bar trigger-${clip.trigger} ${
                             activeClip?.id === clip.id ? 'active' : ''
                           }`}
@@ -1236,11 +1806,6 @@ export function TimelineView({
                             width: `${widthPct}%`,
                           }}
                           title={`${clip.cameraName} · ${formatTimestamp(clip.createdAt)} (${formatDuration(clip.durationSeconds)}) [${clip.trigger}]`}
-                          onMouseDown={(e) => e.stopPropagation()}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            selectClip(clip)
-                          }}
                         />
                       )
                     })}
@@ -1251,7 +1816,7 @@ export function TimelineView({
                         style={{
                           left: `${Math.max(0, msToPercent(liveStartMs, windowStartMs, windowEndMs))}%`,
                           width: `${Math.max(
-                            0.8,
+                            0.3,
                             Math.min(100, msToPercent(nowMs, windowStartMs, windowEndMs)) -
                               Math.max(0, msToPercent(liveStartMs, windowStartMs, windowEndMs)),
                           )}%`,
@@ -1271,7 +1836,7 @@ export function TimelineView({
                           className={`timeline-pin pin-${ev.kind}`}
                           style={{ left: `${pct}%` }}
                           title={`${ev.title} (${formatTimestamp(ev.timestamp)}) — Click to jump & play`}
-                          onMouseDown={(e) => e.stopPropagation()}
+                          onPointerDown={(e) => e.stopPropagation()}
                           onClick={(e) => {
                             e.stopPropagation()
                             selectEventPin(ev, cam.id)
@@ -1291,12 +1856,13 @@ export function TimelineView({
                           className="timeline-pin pin-package-detected"
                           style={{ left: `${pct}%` }}
                           title={`AI Package (${Math.round(pkg.confidence * 100)}%): ${pkg.summary} — Click to jump & play`}
-                          onMouseDown={(e) => e.stopPropagation()}
+                          onPointerDown={(e) => e.stopPropagation()}
                           onClick={(e) => {
                             e.stopPropagation()
                             seekToTimestamp(ts, cam.id, {
                               preRollSeconds: 3,
                               autoPlay: true,
+                              centerIfOutOfView: true,
                             })
                           }}
                         />
@@ -1320,7 +1886,7 @@ export function TimelineView({
                         className="timeline-pin pin-sensor"
                         style={{ left: `${pct}%` }}
                         title={`${ev.title} (${formatTimestamp(ev.timestamp)}) — Click to jump & play`}
-                        onMouseDown={(e) => e.stopPropagation()}
+                        onPointerDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation()
                           selectEventPin(ev)
@@ -1331,25 +1897,20 @@ export function TimelineView({
                 </div>
               )}
 
-              {/* Hover Ghost Line + Tooltip */}
-              {hoverInfo && (
-                <div
-                  className="timeline-hover-line"
-                  style={{ left: `${hoverInfo.pct}%` }}
-                >
-                  <span className="timeline-hover-badge mono">
-                    {formatTimestamp(new Date(hoverInfo.tsMs).toISOString())}
-                  </span>
-                </div>
-              )}
+              {/* Zero-Rerender Hover Ghost Line + Tooltip */}
+              <div ref={hoverLineRef} className="timeline-hover-line">
+                <span ref={hoverBadgeRef} className="timeline-hover-badge mono" />
+              </div>
 
-              {/* Playhead Needle */}
-              {playheadPct >= 0 && playheadPct <= 100 && (
-                <div
-                  className="timeline-playhead"
-                  style={{ left: `${playheadPct}%` }}
-                />
-              )}
+              {/* 60fps Playhead Needle */}
+              <div
+                ref={playheadElRef}
+                className="timeline-playhead"
+                style={{
+                  left: `${Math.max(0, Math.min(100, playheadPct))}%`,
+                  opacity: playheadPct >= 0 && playheadPct <= 100 ? 1 : 0,
+                }}
+              />
             </div>
           </div>
         </div>

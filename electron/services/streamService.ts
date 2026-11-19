@@ -226,6 +226,7 @@ export class StreamService {
     const stat = fs.statSync(filePath)
     const fileSize = stat.size
     const range = req.headers.range
+    const isHead = req.method === 'HEAD'
 
     if (range) {
       const match = /bytes=(\d*)-(\d*)/.exec(range)
@@ -244,18 +245,38 @@ export class StreamService {
         'Accept-Ranges': 'bytes',
         'Content-Length': end - start + 1,
         'Content-Type': 'video/mp4',
+        'Cache-Control': 'private, max-age=3600',
       })
+      if (isHead) {
+        res.end()
+        return
+      }
       const stream = fs.createReadStream(filePath, { start, end })
-      stream.on('error', () => res.end())
+      stream.on('error', () => {
+        if (!res.writableEnded) res.end()
+      })
+      res.on('close', () => {
+        if (!stream.destroyed) stream.destroy()
+      })
       stream.pipe(res)
     } else {
       res.writeHead(200, {
         'Content-Length': fileSize,
         'Content-Type': 'video/mp4',
         'Accept-Ranges': 'bytes',
+        'Cache-Control': 'private, max-age=3600',
       })
+      if (isHead) {
+        res.end()
+        return
+      }
       const stream = fs.createReadStream(filePath)
-      stream.on('error', () => res.end())
+      stream.on('error', () => {
+        if (!res.writableEnded) res.end()
+      })
+      res.on('close', () => {
+        if (!stream.destroyed) stream.destroy()
+      })
       stream.pipe(res)
     }
   }

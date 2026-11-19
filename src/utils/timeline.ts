@@ -1,6 +1,6 @@
 import type { LocalRecordingItem, SecurityEvent } from '@shared/types'
 
-export type TimelineZoomHours = 1 | 6 | 12 | 24
+export type TimelineZoomHours = 0.25 | 0.5 | 1 | 6 | 12 | 24
 
 export interface TimelineWindow {
   windowStartMs: number
@@ -56,6 +56,43 @@ export function computeVisibleWindow(
     start = dayEndMs - spanMs
   }
   return { windowStartMs: start, windowEndMs: end }
+}
+
+export function computeZoomedWindowCenter(
+  dayStartMs: number,
+  dayEndMs: number,
+  anchorTsMs: number,
+  anchorPct: number,
+  nextZoomHours: TimelineZoomHours,
+): number {
+  const nextSpanMs = nextZoomHours * 60 * 60 * 1000
+  const daySpan = dayEndMs - dayStartMs
+  if (nextSpanMs >= daySpan) {
+    return dayStartMs + daySpan / 2
+  }
+  const clampedPct = Math.max(0, Math.min(100, anchorPct))
+  const nextStart = anchorTsMs - (clampedPct / 100) * nextSpanMs
+  const nextCenter = nextStart + nextSpanMs / 2
+  const minCenter = dayStartMs + nextSpanMs / 2
+  const maxCenter = dayEndMs - nextSpanMs / 2
+  return Math.max(minCenter, Math.min(maxCenter, nextCenter))
+}
+
+export function panWindowCenter(
+  dayStartMs: number,
+  dayEndMs: number,
+  currentCenterMs: number,
+  zoomHours: TimelineZoomHours,
+  deltaMs: number,
+): number {
+  const spanMs = zoomHours * 60 * 60 * 1000
+  const daySpan = dayEndMs - dayStartMs
+  if (spanMs >= daySpan) {
+    return dayStartMs + daySpan / 2
+  }
+  const minCenter = dayStartMs + spanMs / 2
+  const maxCenter = dayEndMs - spanMs / 2
+  return Math.max(minCenter, Math.min(maxCenter, currentCenterMs + deltaMs))
 }
 
 export function msToPercent(
@@ -119,13 +156,32 @@ export function findNearestTimelineStop(
   return null
 }
 
+export function formatZoomLabel(hours: TimelineZoomHours): string {
+  if (hours < 1) {
+    return `${Math.round(hours * 60)}m`
+  }
+  return `${hours}h`
+}
+
 export function buildRulerTicks(
   windowStartMs: number,
   windowEndMs: number,
   zoomHours: TimelineZoomHours,
 ): TimelineTick[] {
   const stepMinutes =
-    zoomHours === 1 ? 10 : zoomHours === 6 ? 30 : zoomHours === 12 ? 60 : 120
+    zoomHours <= 0.25
+      ? 2
+      : zoomHours <= 0.5
+        ? 5
+        : zoomHours === 1
+          ? 10
+          : zoomHours === 6
+            ? 30
+            : zoomHours === 12
+              ? 60
+              : 120
+  const majorMinutes =
+    zoomHours <= 0.25 ? 10 : zoomHours <= 0.5 ? 15 : 60
   const stepMs = stepMinutes * 60 * 1000
   const firstTick = Math.ceil(windowStartMs / stepMs) * stepMs
 
@@ -134,7 +190,7 @@ export function buildRulerTicks(
     const dt = new Date(ms)
     const hours = String(dt.getHours()).padStart(2, '0')
     const mins = String(dt.getMinutes()).padStart(2, '0')
-    const major = dt.getMinutes() === 0
+    const major = dt.getMinutes() % majorMinutes === 0
     ticks.push({
       ms,
       pct: msToPercent(ms, windowStartMs, windowEndMs),
