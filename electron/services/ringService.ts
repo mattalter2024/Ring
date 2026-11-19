@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { pathToFileURL } from 'node:url'
@@ -1390,6 +1391,170 @@ export class RingService implements SnapshotSource {
     }
   }
 
+  private commitSnapshotBuffer(
+    cameraId: string,
+    buf: Buffer,
+  ): { base64: string; dataUrl: string } {
+    const base64 = buf.toString('base64')
+    const dataUrl = `data:image/jpeg;base64,${base64}`
+    const now = new Date().toISOString()
+    this.snapshotCache.set(cameraId, { dataUrl, capturedAt: now })
+    this.cameras = this.cameras.map((c) =>
+      c.id === cameraId
+        ? { ...c, lastSnapshotDataUrl: dataUrl, lastSnapshotAt: now }
+        : c,
+    )
+    this.callbacks.onCamerasUpdated(this.getCameras())
+    return { base64, dataUrl }
+  }
+
+  private async tryExtractLiveHlsSnapshot(
+    cameraId: string,
+    waitTimeoutMs = 3500,
+  ): Promise<Buffer | null> {
+    const segPath = this.streamService.hasActiveFeed(cameraId)
+      ? await this.streamService.waitForLatestHlsSegment(cameraId, waitTimeoutMs)
+      : this.streamService.getLatestHlsSegmentPath(cameraId)
+    if (!segPath) return null
+    return this.recordingService.extractJpegFrame(segPath)
+  }
+
+  private async tryExtractRecentRecordingSnapshot(
+    cameraId: string,
+    maxAgeMs = 15 * 60 * 1000,
+  ): Promise<Buffer | null> {
+    const now = Date.now()
+    const recs = this.recordingService
+      .listRecordings()
+      .filter((r) => r.cameraId === cameraId && fs.existsSync(r.filePath))
+    for (const rec of recs.slice(0, 3)) {
+      const endMs =
+        new Date(rec.createdAt).getTime() + Math.max(0, rec.durationSeconds) * 1000
+      if (now - endMs > maxAgeMs) continue
+      const frame = await this.recordingService.extractJpegFrame(rec.filePath)
+      if (frame) return frame
+    }
+    return null
+  }
+
+  private async tryUnforcedCloudSnapshot(
+    liveCam: RingCameraInstance,
+  ): Promise<Buffer | null> {
+    const camAny = liveCam as unknown as {
+      getNextSnapshot?: (opts: {
+        force?: boolean
+        maxWaitMs?: number
+      }) => Promise<Buffer>
+    }
+    if (typeof camAny.getNextSnapshot !== 'function') return null
+    try {
+      const buf = await Promise.race([
+        camAny.getNextSnapshot({ force: false, maxWaitMs: 4000 }),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+      ])
+      if (
+        buf &&
+        Buffer.isBuffer(buf) &&
+        buf.length >= 256 &&
+        buf[0] === 0xff &&
+        buf[1] === 0xd8
+      ) {
+        return buf
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  private async tryOneShotLiveFrame(
+    cameraId: string,
+    liveCam: RingCameraInstance,
+  ): Promise<Buffer | null> {
+    // Never disrupt an active NVR, Live View, or manual recording stream
+    if (
+      this.streamService.hasActiveFeed(cameraId) ||
+      this.isCameraNvrActive(cameraId) ||
+      this.recordingCameraIds.has(cameraId)
+    ) {
+      return null
+    }
+    if (typeof liveCam.streamVideo !== 'function') return null
+
+    const tmpDir = path.join(os.tmpdir(), 'ringwatch-snap')
+    fs.mkdirSync(tmpDir, { recursive: true })
+    const outPath = path.join(
+      tmpDir,
+      `snap_${cameraId.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now()}.jpg`,
+    )
+    const ffmpegOutPath = outPath.replace(/\\/g, '/')
+
+    let call: { stop(): void; onCallEnded: { subscribe(cb: () => void): unknown } } | null =
+      null
+    try {
+      call = await Promise.race([
+        liveCam.streamVideo({
+          audio: ['-an'],
+          video: ['-vcodec', 'mjpeg', '-q:v', '3'],
+          output: ['-frames:v', '1', '-f', 'image2', ffmpegOutPath],
+        }),
+        new Promise<never>((_res, rej) =>
+          setTimeout(() => rej(new Error('One-shot live frame timed out')), 10000),
+        ),
+      ])
+
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          try {
+            call?.stop()
+          } catch {
+            // ignore
+          }
+          resolve()
+        }, 8000)
+        call?.onCallEnded.subscribe(() => {
+          clearTimeout(timer)
+          resolve()
+        })
+      })
+
+      if (fs.existsSync(outPath)) {
+        const buf = fs.readFileSync(outPath)
+        if (buf.length >= 256 && buf[0] === 0xff && buf[1] === 0xd8) {
+          return buf
+        }
+      }
+      return null
+    } catch {
+      try {
+        call?.stop()
+      } catch {
+        // ignore
+      }
+      return null
+    } finally {
+      try {
+        fs.rmSync(outPath, { force: true })
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private getCachedSnapshotFallback(
+    cameraId: string,
+  ): { base64: string; dataUrl: string } | null {
+    const cachedUrl =
+      this.snapshotCache.get(cameraId)?.dataUrl ??
+      this.cameras.find((c) => c.id === cameraId)?.lastSnapshotDataUrl
+    if (!cachedUrl || !cachedUrl.startsWith('data:image/')) return null
+    const commaIdx = cachedUrl.indexOf(',')
+    if (commaIdx < 0) return null
+    const base64 = cachedUrl.slice(commaIdx + 1)
+    if (base64.length < 128) return null
+    return { base64, dataUrl: cachedUrl }
+  }
+
   async captureSnapshotBase64(
     cameraId: string,
   ): Promise<{ base64: string; dataUrl: string }> {
@@ -1414,18 +1579,60 @@ export class RingService implements SnapshotSource {
     const liveCam = this.liveCamerasById.get(cameraId)
     if (!liveCam) throw new Error(`Ring camera ${cameraId} is not connected`)
 
-    const buf = await liveCam.getSnapshot()
-    const base64 = buf.toString('base64')
-    const dataUrl = `data:image/jpeg;base64,${base64}`
-    const now = new Date().toISOString()
-    this.snapshotCache.set(cameraId, { dataUrl, capturedAt: now })
-    this.cameras = this.cameras.map((c) =>
-      c.id === cameraId
-        ? { ...c, lastSnapshotDataUrl: dataUrl, lastSnapshotAt: now }
-        : c,
-    )
-    this.callbacks.onCamerasUpdated(this.getCameras())
-    return { base64, dataUrl }
+    // Tier 1: Grab an instant live JPEG frame directly from an active NVR / Live View HLS feed.
+    // Ring cameras (especially battery/hybrid models like cocoa_camera_v3) refuse cloud snapshot
+    // refreshes while a WebRTC live stream is active, causing a 15-second timeout.
+    const liveHlsFrame = await this.tryExtractLiveHlsSnapshot(cameraId, 3500)
+    if (liveHlsFrame) {
+      return this.commitSnapshotBuffer(cameraId, liveHlsFrame)
+    }
+
+    // Tier 2: Standard Ring cloud snapshot when no local HLS feed is active yet
+    let primaryErr: unknown
+    try {
+      const buf = await liveCam.getSnapshot()
+      if (buf && buf.length >= 256) {
+        return this.commitSnapshotBuffer(cameraId, buf)
+      }
+    } catch (err) {
+      primaryErr = err
+    }
+
+    // Tier 3a: Re-check active HLS feed (NVR / Live View may have produced segments while waiting)
+    const lateHlsFrame = await this.tryExtractLiveHlsSnapshot(cameraId, 1500)
+    if (lateHlsFrame) {
+      return this.commitSnapshotBuffer(cameraId, lateHlsFrame)
+    }
+
+    // Tier 3b: Ask Ring cloud for the latest unforced snapshot (avoids 15s forced-refresh failure)
+    const unforcedBuf = await this.tryUnforcedCloudSnapshot(liveCam)
+    if (unforcedBuf) {
+      return this.commitSnapshotBuffer(cameraId, unforcedBuf)
+    }
+
+    // Tier 4: Extract the most recent frame from a recent local MP4 recording (last 15 min)
+    const recentClipFrame = await this.tryExtractRecentRecordingSnapshot(cameraId)
+    if (recentClipFrame) {
+      return this.commitSnapshotBuffer(cameraId, recentClipFrame)
+    }
+
+    // Tier 5: Grab a single live frame via a brief one-shot WebRTC stream (when camera is idle)
+    const oneShotFrame = await this.tryOneShotLiveFrame(cameraId, liveCam)
+    if (oneShotFrame) {
+      return this.commitSnapshotBuffer(cameraId, oneShotFrame)
+    }
+
+    // Tier 6: Fall back to last cached snapshot so AI scan / UI still has an image
+    const cached = this.getCachedSnapshotFallback(cameraId)
+    if (cached) {
+      return cached
+    }
+
+    throw primaryErr instanceof Error
+      ? primaryErr
+      : new Error(
+          `Unable to capture snapshot for camera ${cameraId}: ${String(primaryErr ?? 'no video frame available')}`,
+        )
   }
 
   async captureSnapshot(
@@ -2250,6 +2457,20 @@ export class RingService implements SnapshotSource {
         worker.currentSegmentStartedAt = new Date(sessionStartMs).toISOString()
         this.streamService.registerNvrHlsFeed(worker.cameraId, hlsOutput)
         this.emitNvrStatus()
+
+        const cachedSnap = this.snapshotCache.get(worker.cameraId)
+        const snapAgeMs = cachedSnap
+          ? Date.now() - new Date(cachedSnap.capturedAt).getTime()
+          : Number.POSITIVE_INFINITY
+        if (!cachedSnap || snapAgeMs > 5 * 60 * 1000) {
+          void this.tryExtractLiveHlsSnapshot(worker.cameraId, 8000)
+            .then((frame) => {
+              if (frame && !worker.stopped) {
+                this.commitSnapshotBuffer(worker.cameraId, frame)
+              }
+            })
+            .catch(() => {})
+        }
 
         if (worker.stopped) {
           try {

@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import type {
   CameraStorageUsage,
@@ -1071,6 +1071,13 @@ export class RecordingService {
       ),
     )
 
+    if (!thumbnailDataUrl) {
+      const frame = await this.extractJpegFrame(filePath)
+      if (frame) {
+        thumbnailDataUrl = `data:image/jpeg;base64,${frame.toString('base64')}`
+      }
+    }
+
     const stat = fs.statSync(filePath)
     const id = crypto.randomUUID()
     const item: LocalRecordingItem = {
@@ -1247,6 +1254,114 @@ export class RecordingService {
       }
     }
     return this.listRecordings()
+  }
+
+  private runFfmpegJpegPipe(
+    ffmpegBin: string,
+    args: string[],
+    timeoutMs = 8000,
+  ): Promise<Buffer | null> {
+    return new Promise((resolve) => {
+      let settled = false
+      const chunks: Buffer[] = []
+      let totalBytes = 0
+
+      let child: ReturnType<typeof spawn>
+      try {
+        child = spawn(ffmpegBin, args, { windowsHide: true })
+      } catch {
+        resolve(null)
+        return
+      }
+
+      const finish = (buf: Buffer | null) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(buf)
+      }
+
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          // ignore kill failure
+        }
+        finish(null)
+      }, timeoutMs)
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        totalBytes += chunk.length
+        if (totalBytes <= 12 * 1024 * 1024) {
+          chunks.push(chunk)
+        }
+      })
+
+      child.on('error', () => finish(null))
+      child.on('close', (code) => {
+        if (code !== 0 || chunks.length === 0) {
+          finish(null)
+          return
+        }
+        const out = Buffer.concat(chunks)
+        if (out.length >= 256 && out[0] === 0xff && out[1] === 0xd8) {
+          finish(out)
+        } else {
+          finish(null)
+        }
+      })
+    })
+  }
+
+  async extractJpegFrame(videoPath: string): Promise<Buffer | null> {
+    if (!videoPath || !fs.existsSync(videoPath)) return null
+    try {
+      const stat = fs.statSync(videoPath)
+      if (!stat.isFile() || stat.size < 1024) return null
+    } catch {
+      return null
+    }
+
+    const ffmpegBin = this.resolveFfmpegBinary()
+
+    // Attempt 1: seek near the end of the segment for the freshest frame
+    const tailFrame = await this.runFfmpegJpegPipe(ffmpegBin, [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-sseof',
+      '-1',
+      '-i',
+      videoPath,
+      '-frames:v',
+      '1',
+      '-q:v',
+      '3',
+      '-f',
+      'image2pipe',
+      '-vcodec',
+      'mjpeg',
+      'pipe:1',
+    ])
+    if (tailFrame) return tailFrame
+
+    // Attempt 2: decode first available keyframe (handles short or non-seekable MPEG-TS segments)
+    return this.runFfmpegJpegPipe(ffmpegBin, [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-i',
+      videoPath,
+      '-frames:v',
+      '1',
+      '-q:v',
+      '3',
+      '-f',
+      'image2pipe',
+      '-vcodec',
+      'mjpeg',
+      'pipe:1',
+    ])
   }
 
   resolveFfmpegBinary(): string {

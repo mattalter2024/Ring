@@ -268,6 +268,96 @@ export class StreamService {
     return this.activeStreams.has(cameraId)
   }
 
+  hasActiveFeed(cameraId: string): boolean {
+    if (this.nvrHlsFeeds.has(cameraId)) return true
+    const active = this.activeStreams.get(cameraId)
+    return Boolean(active && active.dirPath)
+  }
+
+  getLatestHlsSegmentPath(cameraId: string): string | null {
+    const candidateDirs: string[] = []
+    const nvrDir = this.nvrHlsFeeds.get(cameraId)?.dirPath
+    if (nvrDir) candidateDirs.push(nvrDir)
+    const activeDir = this.activeStreams.get(cameraId)?.dirPath
+    if (activeDir && !candidateDirs.includes(activeDir)) {
+      candidateDirs.push(activeDir)
+    }
+
+    for (const dirPath of candidateDirs) {
+      if (!fs.existsSync(dirPath)) continue
+
+      // Prefer the latest finalized segment listed in index.m3u8 (guaranteed complete via temp_file flag)
+      const playlistPath = path.join(dirPath, 'index.m3u8')
+      if (fs.existsSync(playlistPath)) {
+        try {
+          const lines = fs
+            .readFileSync(playlistPath, 'utf-8')
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line && !line.startsWith('#') && line.toLowerCase().endsWith('.ts'))
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const segPath = path.resolve(dirPath, path.basename(lines[i]))
+            if (fs.existsSync(segPath)) {
+              const stat = fs.statSync(segPath)
+              if (stat.isFile() && stat.size >= 1024) {
+                return segPath
+              }
+            }
+          }
+        } catch {
+          // Playlist mid-rename; fall through to directory scan
+        }
+      }
+
+      // Fallback: pick newest non-temporary .ts file in directory
+      try {
+        const candidates = fs
+          .readdirSync(dirPath)
+          .filter((name) => {
+            const lower = name.toLowerCase()
+            return lower.endsWith('.ts') && !lower.endsWith('.tmp')
+          })
+          .map((name) => {
+            const fullPath = path.join(dirPath, name)
+            try {
+              const stat = fs.statSync(fullPath)
+              return stat.isFile() && stat.size >= 1024
+                ? { fullPath, name, mtimeMs: stat.mtimeMs }
+                : null
+            } catch {
+              return null
+            }
+          })
+          .filter((item): item is { fullPath: string; name: string; mtimeMs: number } => Boolean(item))
+          .sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name))
+
+        if (candidates.length > 0) {
+          return candidates[0].fullPath
+        }
+      } catch {
+        // Ignore transient directory errors
+      }
+    }
+
+    return null
+  }
+
+  async waitForLatestHlsSegment(
+    cameraId: string,
+    timeoutMs = 3500,
+  ): Promise<string | null> {
+    const immediate = this.getLatestHlsSegmentPath(cameraId)
+    if (immediate) return immediate
+
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline && this.hasActiveFeed(cameraId)) {
+      await new Promise((r) => setTimeout(r, 250))
+      const found = this.getLatestHlsSegmentPath(cameraId)
+      if (found) return found
+    }
+    return this.getLatestHlsSegmentPath(cameraId)
+  }
+
   async prepareNvrHlsOutput(cameraId: string): Promise<PreparedHlsOutput> {
     await this.startServer()
 

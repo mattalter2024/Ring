@@ -526,7 +526,7 @@ export function TimelineView({
           </div>
 
           <div className="panel-body" style={{ padding: 12 }}>
-            <div className="player-video-box" style={{ maxHeight: 380 }}>
+            <div className="player-video-box timeline-player-box">
               {activeClip?.playbackUrl ? (
                 <video
                   ref={videoRef}
@@ -584,7 +584,6 @@ export function TimelineView({
                 <img
                   src={activeClip.thumbnailDataUrl}
                   alt={activeClip.cameraName}
-                  style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                 />
               ) : (
                 <div className="empty-state">

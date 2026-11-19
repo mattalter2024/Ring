@@ -11,6 +11,7 @@ import {
 } from '../electron/services/aiPackageService'
 import { StreamService } from '../electron/services/streamService'
 import { RecordingService } from '../electron/services/recordingService'
+import { RingService } from '../electron/services/ringService'
 import type { NotificationService } from '../electron/services/notificationService'
 
 function makeTempDir(): string {
@@ -888,6 +889,146 @@ describe('Windows System Theme & Live Stream Sync', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true })
   })
 })
+
+describe('Resilient Live-Stream Snapshot & AI Scan Fallback (cocoa_camera_v3)', () => {
+  let tmpDir: string
+  let streamService: StreamService
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    streamService?.stopAll()
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('locates the newest finalized HLS .ts segment and ignores partial .tmp files', async () => {
+    const recDir = path.join(tmpDir, 'hls-snap')
+    const store = new ConfigStore(tmpDir, recDir)
+    streamService = new StreamService(() => store.getPublicSettings().recordingsDir)
+    await streamService.startServer()
+
+    const prepared = await streamService.prepareNvrHlsOutput('cam-front-yard')
+    const seg0 = path.join(prepared.dirPath, 'seg_00000.ts')
+    const seg1 = path.join(prepared.dirPath, 'seg_00001.ts')
+    const tmpSeg = path.join(prepared.dirPath, 'seg_00002.ts.tmp')
+
+    fs.writeFileSync(seg0, Buffer.alloc(4096, 1))
+    fs.writeFileSync(seg1, Buffer.alloc(4096, 2))
+    fs.writeFileSync(tmpSeg, Buffer.alloc(4096, 3))
+    fs.writeFileSync(
+      prepared.playlistPath,
+      '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\nseg_00000.ts\n#EXTINF:2.0,\nseg_00001.ts\n',
+    )
+    streamService.registerNvrHlsFeed('cam-front-yard', prepared)
+
+    expect(streamService.hasActiveFeed('cam-front-yard')).toBe(true)
+    expect(streamService.getLatestHlsSegmentPath('cam-front-yard')).toBe(seg1)
+  })
+
+  it('extracts a valid live JPEG frame via FFmpeg and recovers when cocoa_camera_v3 getSnapshot times out after 15s', async () => {
+    const recDir = path.join(tmpDir, 'vault')
+    const store = new ConfigStore(tmpDir, recDir)
+    streamService = new StreamService(() => store.getPublicSettings().recordingsDir)
+    await streamService.startServer()
+    const recService = new RecordingService(tmpDir, store, streamService)
+
+    const sampleImg = path.resolve(__dirname, '..', 'public', 'demo', 'front_porch.jpg')
+    const mp4Item = await recService.captureDemoRecording({
+      cameraId: 'front-yard-id',
+      cameraName: 'Front yard',
+      durationSeconds: 4,
+      trigger: 'continuous',
+      sourceImagePath: sampleImg,
+      thumbnailDataUrl: 'data:image/jpeg;base64,abc',
+    })
+
+    // Direct FFmpeg extraction from MP4 returns a valid JPEG SOI buffer
+    const directJpeg = await recService.extractJpegFrame(mp4Item.filePath)
+    expect(directJpeg).not.toBeNull()
+    expect(directJpeg![0]).toBe(0xff)
+    expect(directJpeg![1]).toBe(0xd8)
+
+    const mockNotifications = {
+      notifyPackageAlert: vi.fn(),
+      notifyNvrAlert: vi.fn(),
+    } as unknown as NotificationService
+    const aiService = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: mockNotifications,
+      onDetection: vi.fn(),
+      onSecurityEvent: vi.fn(),
+    })
+
+    const ringService = new RingService({
+      userDataDir: tmpDir,
+      configStore: store,
+      streamService,
+      recordingService: recService,
+      aiPackageService: aiService,
+      notifications: mockNotifications,
+      demoAssetsDir: path.resolve(__dirname, '..', 'public', 'demo'),
+      callbacks: {
+        onConnectionChanged: vi.fn(),
+        onCamerasUpdated: vi.fn(),
+        onSensorsUpdated: vi.fn(),
+        onLocationsUpdated: vi.fn(),
+        onSecurityEvent: vi.fn(),
+        onRecordingsUpdated: vi.fn(),
+        onStorageStatsUpdated: vi.fn(),
+      },
+    })
+
+    // Simulate live mode with a cocoa_camera_v3 whose cloud getSnapshot() always rejects after 15s
+    const failingGetSnapshot = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          'Snapshot for Front yard (cocoa_camera_v3 - Unknown Model) failed to refresh after 15 seconds',
+        ),
+      )
+
+    const svcInternal = ringService as unknown as {
+      connection: { mode: string }
+      cameras: Array<{ id: string; name: string }>
+      liveCamerasById: Map<string, unknown>
+    }
+    svcInternal.connection.mode = 'live'
+    svcInternal.cameras = [{ id: 'front-yard-id', name: 'Front yard' }]
+    svcInternal.liveCamerasById.set('front-yard-id', {
+      id: 'front-yard-id',
+      name: 'Front yard',
+      getSnapshot: failingGetSnapshot,
+    })
+
+    // Case 1: Active HLS feed exists -> extracts live frame directly without waiting on failing cloud getSnapshot()
+    const prepared = await streamService.prepareNvrHlsOutput('front-yard-id')
+    const hlsSeg = path.join(prepared.dirPath, 'seg_00001.ts')
+    fs.copyFileSync(mp4Item.filePath, hlsSeg)
+    fs.writeFileSync(
+      prepared.playlistPath,
+      '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\nseg_00001.ts\n',
+    )
+    streamService.registerNvrHlsFeed('front-yard-id', prepared)
+
+    const fromHls = await ringService.captureSnapshotBase64('front-yard-id')
+    expect(fromHls.dataUrl.startsWith('data:image/jpeg;base64,')).toBe(true)
+    expect(Buffer.from(fromHls.base64, 'base64')[0]).toBe(0xff)
+    expect(failingGetSnapshot).not.toHaveBeenCalled()
+
+    // Case 2: No active HLS feed -> getSnapshot() fails with cocoa_camera_v3 15s timeout -> falls back to recent local MP4
+    streamService.unregisterNvrHlsFeed('front-yard-id')
+    const fromRecentMp4 = await ringService.captureSnapshotBase64('front-yard-id')
+    expect(failingGetSnapshot).toHaveBeenCalledTimes(1)
+    expect(fromRecentMp4.dataUrl.startsWith('data:image/jpeg;base64,')).toBe(true)
+    expect(Buffer.from(fromRecentMp4.base64, 'base64')[0]).toBe(0xff)
+
+    ringService.shutdown()
+  })
+})
+
 
 
 
