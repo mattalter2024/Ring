@@ -29,7 +29,7 @@ import type { AiPackageService, SnapshotSource } from './aiPackageService'
 import type { NotificationService } from './notificationService'
 
 type RingClientApiModule = typeof import('ring-client-api')
-type RingRestClientModule = typeof import('ring-client-api/lib/rest-client')
+type RingRestClientModule = typeof import('ring-client-api/rest-client')
 type RingApiInstance = InstanceType<RingClientApiModule['RingApi']>
 type RingRestClientInstance = InstanceType<RingRestClientModule['RingRestClient']>
 type RingCameraInstance = Awaited<ReturnType<RingApiInstance['getCameras']>>[number]
