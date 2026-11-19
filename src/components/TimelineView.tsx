@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Calendar,
+  Camera,
   ChevronLeft,
   ChevronRight,
   Circle,
@@ -77,6 +78,10 @@ export function TimelineView({
 }: TimelineViewProps) {
   const [dateKey, setDateKey] = useState<string>(() => toLocalDateKey(new Date()))
   const [zoomHours, setZoomHours] = useState<TimelineZoomHours>(6)
+  const [selectedCameraId, setSelectedCameraId] = useState<string>(
+    () => cameras[0]?.id ?? recordings[0]?.cameraId ?? '',
+  )
+  const [clipListScope, setClipListScope] = useState<'camera' | 'all'>('camera')
   const [playheadMs, setPlayheadMs] = useState<number>(() => {
     if (recordings[0]) return new Date(recordings[0].createdAt).getTime()
     return Date.now()
@@ -98,7 +103,6 @@ export function TimelineView({
   const [dragging, setDragging] = useState(false)
   const [capturing, setCapturing] = useState(false)
   const [syncingEvents, setSyncingEvents] = useState(false)
-  const [quickCameraId, setQuickCameraId] = useState<string>('')
   const [nowMs, setNowMs] = useState<number>(() => Date.now())
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -133,6 +137,64 @@ export function TimelineView({
         ),
     [recordings, dayStartMs, dayEndMs],
   )
+
+  // Camera tracks = all configured cameras + any imported/historical recordings cameraIds
+  const cameraTracks = useMemo(() => {
+    const map = new Map<
+      string,
+      { id: string; name: string; snapshot?: string; model?: string }
+    >()
+    for (const c of cameras) {
+      map.set(c.id, {
+        id: c.id,
+        name: c.name,
+        snapshot: c.lastSnapshotDataUrl,
+        model: c.model,
+      })
+    }
+    for (const r of recordings) {
+      if (!map.has(r.cameraId)) {
+        map.set(r.cameraId, {
+          id: r.cameraId,
+          name: r.cameraName,
+          snapshot: r.thumbnailDataUrl,
+        })
+      }
+    }
+    return Array.from(map.values())
+  }, [cameras, recordings])
+
+  // Keep selectedCameraId valid as cameras/recordings load
+  useEffect(() => {
+    if (cameraTracks.length === 0) return
+    if (!selectedCameraId || !cameraTracks.some((c) => c.id === selectedCameraId)) {
+      setSelectedCameraId(cameraTracks[0].id)
+    }
+  }, [cameraTracks, selectedCameraId])
+
+  const activeCameraTrack = useMemo(
+    () => cameraTracks.find((c) => c.id === selectedCameraId) ?? cameraTracks[0] ?? null,
+    [cameraTracks, selectedCameraId],
+  )
+
+  const activeCameraRecordingsOnDay = useMemo(
+    () =>
+      activeCameraTrack
+        ? dayRecordings.filter((r) => r.cameraId === activeCameraTrack.id)
+        : dayRecordings,
+    [dayRecordings, activeCameraTrack],
+  )
+
+  const latestRecordingForActiveCamera = useMemo(() => {
+    if (!activeCameraTrack) return null
+    const allForCam = recordings
+      .filter((r) => r.cameraId === activeCameraTrack.id)
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      )
+    return allForCam[0] ?? null
+  }, [recordings, activeCameraTrack])
 
   const dayEvents = useMemo(
     () =>
@@ -170,10 +232,17 @@ export function TimelineView({
     [windowStartMs, windowEndMs, zoomHours],
   )
 
-  const activeClip = useMemo(
-    () => recordings.find((r) => r.id === activeClipId) ?? dayRecordings[0] ?? null,
-    [recordings, activeClipId, dayRecordings],
-  )
+  // Always show a clip belonging to the active camera when available on this day
+  const activeClip = useMemo(() => {
+    const exact = recordings.find((r) => r.id === activeClipId)
+    if (
+      exact &&
+      (!activeCameraTrack || exact.cameraId === activeCameraTrack.id)
+    ) {
+      return exact
+    }
+    return activeCameraRecordingsOnDay[activeCameraRecordingsOnDay.length - 1] ?? null
+  }, [recordings, activeClipId, activeCameraTrack, activeCameraRecordingsOnDay])
 
   const selectedEvent = useMemo(
     () => dayEvents.find((e) => e.id === selectedEventId) ?? null,
@@ -215,17 +284,44 @@ export function TimelineView({
     }
   }
 
+  const handleSelectCamera = (cameraId: string) => {
+    setSelectedCameraId(cameraId)
+    setSelectedEventId(null)
+
+    // Try finding a clip for this camera at the current playhead first
+    const atPlayhead = findClipAtTimestamp(dayRecordings, playheadMs, cameraId)
+    if (atPlayhead) {
+      setActiveClipId(atPlayhead.clip.id)
+      applySeekIfSameClip(atPlayhead.clip.id, atPlayhead.offsetSeconds, isPlaying)
+      return
+    }
+
+    // Otherwise jump to the latest clip for this camera on the selected day
+    const camDayClips = dayRecordings.filter((r) => r.cameraId === cameraId)
+    if (camDayClips.length > 0) {
+      const latest = camDayClips[camDayClips.length - 1]
+      setActiveClipId(latest.id)
+      setPlayheadMs(new Date(latest.createdAt).getTime())
+      applySeekIfSameClip(latest.id, 0, false)
+    } else {
+      setActiveClipId(null)
+    }
+  }
+
   const seekToTimestamp = (
     tsMs: number,
     preferCameraId?: string,
     options?: { keepEventId?: string | null; preRollSeconds?: number; autoPlay?: boolean },
   ) => {
+    const targetCamId = preferCameraId ?? activeCameraTrack?.id
+    if (preferCameraId && preferCameraId !== selectedCameraId) {
+      setSelectedCameraId(preferCameraId)
+    }
+
     const clamped = Math.max(dayStartMs, Math.min(dayEndMs - 1, tsMs))
     setPlayheadMs(clamped)
 
-    const match =
-      findClipAtTimestamp(dayRecordings, clamped, preferCameraId) ??
-      (preferCameraId ? findClipAtTimestamp(dayRecordings, clamped) : null)
+    const match = findClipAtTimestamp(dayRecordings, clamped, targetCamId)
 
     if (options?.keepEventId !== undefined) {
       setSelectedEventId(options.keepEventId)
@@ -243,6 +339,11 @@ export function TimelineView({
 
   const selectClip = (clip: LocalRecordingItem) => {
     const clipStart = new Date(clip.createdAt).getTime()
+    const clipDate = toLocalDateKey(new Date(clipStart))
+    if (clipDate !== dateKey) {
+      setDateKey(clipDate)
+    }
+    setSelectedCameraId(clip.cameraId)
     setActiveClipId(clip.id)
     setSelectedEventId(null)
     setPlayheadMs(clipStart)
@@ -251,7 +352,7 @@ export function TimelineView({
 
   const selectEventPin = (ev: SecurityEvent, preferCameraId?: string) => {
     const ts = new Date(ev.timestamp).getTime()
-    seekToTimestamp(ts, preferCameraId ?? activeClip?.cameraId, {
+    seekToTimestamp(ts, preferCameraId ?? activeCameraTrack?.id, {
       keepEventId: ev.id,
       preRollSeconds: 3,
       autoPlay: true,
@@ -259,14 +360,22 @@ export function TimelineView({
   }
 
   const jumpStop = (direction: 'prev' | 'next') => {
+    const scopedClips = activeCameraTrack
+      ? activeCameraRecordingsOnDay
+      : dayRecordings
+    const scopedEvents = activeCameraTrack
+      ? dayEvents.filter(
+          (e) => e.deviceId === activeCameraTrack.id || e.sourceType === 'sensor',
+        )
+      : dayEvents
     const target = findNearestTimelineStop(
-      dayRecordings,
-      dayEvents,
+      scopedClips,
+      scopedEvents,
       playheadMs,
       direction,
     )
     if (target !== null) {
-      seekToTimestamp(target, activeClip?.cameraId)
+      seekToTimestamp(target, activeCameraTrack?.id)
     }
   }
 
@@ -276,7 +385,7 @@ export function TimelineView({
     const rect = el.getBoundingClientRect()
     const pct = ((clientX - rect.left) / Math.max(1, rect.width)) * 100
     const tsMs = percentToMs(pct, windowStartMs, windowEndMs)
-    seekToTimestamp(tsMs, laneCameraId ?? activeClip?.cameraId)
+    seekToTimestamp(tsMs, laneCameraId ?? activeCameraTrack?.id)
   }
 
   useEffect(() => {
@@ -290,7 +399,7 @@ export function TimelineView({
       window.removeEventListener('mouseup', onUp)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dragging, windowStartMs, windowEndMs, dayRecordings])
+  }, [dragging, windowStartMs, windowEndMs, dayRecordings, activeCameraTrack?.id])
 
   const togglePlayPause = () => {
     const video = videoRef.current
@@ -311,34 +420,98 @@ export function TimelineView({
 
   const zoomIdx = ZOOM_LEVELS.indexOf(zoomHours)
   const playheadPct = msToPercent(playheadMs, windowStartMs, windowEndMs)
-
-  // Camera tracks = all configured cameras + any imported/other recordings cameraIds
-  const cameraTracks = useMemo(() => {
-    const map = new Map<string, { id: string; name: string }>()
-    for (const c of cameras) map.set(c.id, { id: c.id, name: c.name })
-    for (const r of dayRecordings) {
-      if (!map.has(r.cameraId)) {
-        map.set(r.cameraId, { id: r.cameraId, name: r.cameraName })
-      }
-    }
-    return Array.from(map.values())
-  }, [cameras, dayRecordings])
-
   const sensorEvents = dayEvents.filter((e) => e.sourceType === 'sensor')
-  const selectedQuickCameraId = quickCameraId || cameras[0]?.id || ''
+
+  const displayedClipList =
+    clipListScope === 'camera' && activeCameraTrack
+      ? activeCameraRecordingsOnDay
+      : dayRecordings
+
+  const activeCameraCanRecord = Boolean(
+    activeCameraTrack && cameras.some((c) => c.id === activeCameraTrack.id),
+  )
 
   return (
     <div className="timeline-page">
-      {/* Top Player + Inspector Row */}
+      {/* Step 1: Clear Active Camera Selector Strip */}
+      <section className="panel timeline-camera-bar" aria-label="Select active timeline camera">
+        <div className="timeline-camera-bar-head">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Camera size={15} color="var(--accent-text)" />
+            <strong style={{ fontSize: 13.5 }}>Active Timeline Camera</strong>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+              Click a camera below (or its track on the left) to switch playback &amp; scrubbing
+            </span>
+          </div>
+          {nvrStatus.active && (
+            <span className="chip alert">
+              <span className="timeline-rec-dot" />
+              24/7 NVR Live ({nvrStatus.activeCameraCount}/{cameras.length})
+            </span>
+          )}
+        </div>
+
+        <div className="timeline-camera-strip">
+          {cameraTracks.length === 0 ? (
+            <div style={{ fontSize: 12.5, color: 'var(--text-muted)', padding: '6px 2px' }}>
+              No cameras connected yet. Connect Ring in Settings to record onto the timeline.
+            </div>
+          ) : (
+            cameraTracks.map((cam) => {
+              const isSelected = activeCameraTrack?.id === cam.id
+              const camClipCount = dayRecordings.filter((r) => r.cameraId === cam.id).length
+              const camNvr = nvrStatus.cameras[cam.id]
+              const isRec = camNvr?.state === 'recording'
+              return (
+                <button
+                  key={cam.id}
+                  type="button"
+                  className={`timeline-cam-pill ${isSelected ? 'active' : ''}`}
+                  onClick={() => handleSelectCamera(cam.id)}
+                >
+                  {cam.snapshot ? (
+                    <img
+                      src={cam.snapshot}
+                      alt={cam.name}
+                      className="timeline-cam-pill-thumb"
+                    />
+                  ) : (
+                    <div className="timeline-cam-pill-thumb placeholder">
+                      <Camera size={16} />
+                    </div>
+                  )}
+                  <div className="timeline-cam-pill-info">
+                    <div className="timeline-cam-pill-name">
+                      {isRec && <span className="timeline-rec-dot" title="Recording 24/7" />}
+                      <span>{cam.name}</span>
+                    </div>
+                    <div className="timeline-cam-pill-meta mono">
+                      <span>
+                        {camClipCount} clip{camClipCount === 1 ? '' : 's'} on {dateKey}
+                      </span>
+                      {isSelected && <span className="timeline-active-tag">VIEWING</span>}
+                    </div>
+                  </div>
+                </button>
+              )
+            })
+          )}
+        </div>
+      </section>
+
+      {/* Step 2: Active Camera Playback Monitor + Clip List */}
       <div className="timeline-stage-grid">
         <section className="panel" aria-label="Timeline video playback">
           <div className="panel-header">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <h3>
-                {activeClip ? activeClip.cameraName : 'Timeline Playback Monitor'}
+                {activeCameraTrack?.name ?? 'Timeline Playback Monitor'}
               </h3>
+              {activeCameraTrack && (
+                <span className="chip accent">Active Camera</span>
+              )}
               {activeClip && (
-                <span className="chip accent">{activeClip.trigger}</span>
+                <span className="chip">{activeClip.trigger}</span>
               )}
               {activeClip?.starred && (
                 <span className="chip warn">
@@ -416,22 +589,58 @@ export function TimelineView({
               ) : (
                 <div className="empty-state">
                   <Film size={28} />
-                  <strong>No local video clip selected for {dateKey}</strong>
+                  <strong>
+                    No clips for {activeCameraTrack?.name ?? 'this camera'} on {dateKey}
+                  </strong>
                   <span>
-                    Start <strong>Record All Cameras</strong> to continuously record every
-                    live stream onto the timeline, or click any clip bar below.
+                    Select another date, switch cameras above, or start 24/7 NVR recording.
                   </span>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
+                    {latestRecordingForActiveCamera && (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        onClick={() => selectClip(latestRecordingForActiveCamera)}
+                      >
+                        Jump to Latest Clip (
+                        {toLocalDateKey(new Date(latestRecordingForActiveCamera.createdAt))})
+                      </button>
+                    )}
+                    {activeCameraCanRecord && activeCameraTrack && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={capturing}
+                        onClick={async () => {
+                          setCapturing(true)
+                          try {
+                            await onCaptureRecording(
+                              activeCameraTrack.id,
+                              defaultCaptureSeconds,
+                            )
+                          } finally {
+                            setCapturing(false)
+                          }
+                        }}
+                      >
+                        <Film size={13} />
+                        {capturing
+                          ? 'Recording…'
+                          : `Capture ${defaultCaptureSeconds}s Clip`}
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
 
             {/* Transport Controls */}
             <div className="timeline-transport">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <button
                   type="button"
                   className="btn btn-icon"
-                  title="Jump to previous event or clip"
+                  title="Jump to previous event or clip on active camera"
                   onClick={() => jumpStop('prev')}
                 >
                   <SkipBack size={14} />
@@ -465,7 +674,7 @@ export function TimelineView({
                 <button
                   type="button"
                   className="btn btn-icon"
-                  title="Jump to next event or clip"
+                  title="Jump to next event or clip on active camera"
                   onClick={() => jumpStop('next')}
                 >
                   <SkipForward size={14} />
@@ -505,7 +714,7 @@ export function TimelineView({
               </div>
 
               {activeClip && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                   <button
                     type="button"
                     className={`btn btn-sm ${activeClip.starred ? 'btn-warn' : ''}`}
@@ -540,10 +749,10 @@ export function TimelineView({
           </div>
         </section>
 
-        {/* Right Side Inspector */}
+        {/* Right Side Inspector & Camera Clip List */}
         <aside className="panel">
           <div className="panel-header">
-            <h3>Day Summary &amp; Inspector</h3>
+            <h3>Clips &amp; Details</h3>
             <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
               {dateKey}
             </span>
@@ -557,11 +766,11 @@ export function TimelineView({
               }}
             >
               <div className="mini-stat-box">
-                <span className="telemetry-label">Clips</span>
-                <strong className="mono">{dayRecordings.length}</strong>
+                <span className="telemetry-label">Cam Clips</span>
+                <strong className="mono">{activeCameraRecordingsOnDay.length}</strong>
               </div>
               <div className="mini-stat-box">
-                <span className="telemetry-label">Events</span>
+                <span className="telemetry-label">Day Events</span>
                 <strong className="mono">{dayEvents.length}</strong>
               </div>
               <div className="mini-stat-box">
@@ -603,21 +812,43 @@ export function TimelineView({
                   {activeClip.fileName}
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
-                  Stored locally · {formatBytes(activeClip.sizeBytes)} · Trigger:{' '}
-                  {activeClip.trigger}
+                  {formatBytes(activeClip.sizeBytes)} · Trigger: {activeClip.trigger}
                 </div>
               </div>
             ) : null}
 
             <div className="field">
-              <label>Clips on {dateKey}</label>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+                <label style={{ margin: 0 }}>Recordings List</label>
+                <div className="segmented" role="group" aria-label="Filter clips list">
+                  <button
+                    type="button"
+                    style={{ padding: '3px 8px', fontSize: 11.5 }}
+                    className={clipListScope === 'camera' ? 'active' : ''}
+                    onClick={() => setClipListScope('camera')}
+                  >
+                    Active ({activeCameraRecordingsOnDay.length})
+                  </button>
+                  <button
+                    type="button"
+                    style={{ padding: '3px 8px', fontSize: 11.5 }}
+                    className={clipListScope === 'all' ? 'active' : ''}
+                    onClick={() => setClipListScope('all')}
+                  >
+                    All ({dayRecordings.length})
+                  </button>
+                </div>
+              </div>
+
               <div className="timeline-clip-list">
-                {dayRecordings.length === 0 ? (
+                {displayedClipList.length === 0 ? (
                   <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 0' }}>
-                    No local clips recorded on this date.
+                    {clipListScope === 'camera'
+                      ? `No clips recorded for ${activeCameraTrack?.name ?? 'this camera'} on ${dateKey}.`
+                      : `No local clips recorded on ${dateKey}.`}
                   </div>
                 ) : (
-                  dayRecordings.map((clip) => (
+                  displayedClipList.map((clip) => (
                     <button
                       key={clip.id}
                       type="button"
@@ -664,54 +895,40 @@ export function TimelineView({
                 ) : (
                   <>
                     <Circle size={12} fill="currentColor" />
-                    Record All Cameras Continuously
+                    Record All Cameras 24/7
                   </>
                 )}
               </button>
 
-              <button
-                type="button"
-                className="btn btn-sm"
-                disabled={syncingEvents}
-                onClick={async () => {
-                  setSyncingEvents(true)
-                  try {
-                    await onSyncCloudEvents()
-                  } finally {
-                    setSyncingEvents(false)
-                  }
-                }}
-              >
-                <RefreshCw size={13} className={syncingEvents ? 'spin' : ''} />
-                {syncingEvents ? 'Syncing Ring Events…' : 'Sync Ring Cloud Events'}
-              </button>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={syncingEvents}
+                  onClick={async () => {
+                    setSyncingEvents(true)
+                    try {
+                      await onSyncCloudEvents()
+                    } finally {
+                      setSyncingEvents(false)
+                    }
+                  }}
+                >
+                  <RefreshCw size={13} className={syncingEvents ? 'spin' : ''} />
+                  {syncingEvents ? 'Syncing…' : 'Sync Events'}
+                </button>
 
-              {cameras.length > 0 && (
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <select
-                    aria-label="Camera for quick clip"
-                    className="select"
-                    style={{ fontSize: 12, padding: '5px 8px' }}
-                    value={selectedQuickCameraId}
-                    onChange={(e) => setQuickCameraId(e.target.value)}
-                  >
-                    {cameras.map((cam) => (
-                      <option key={cam.id} value={cam.id}>
-                        {cam.name}
-                      </option>
-                    ))}
-                  </select>
+                {activeCameraCanRecord && activeCameraTrack && (
                   <button
                     type="button"
                     className="btn btn-sm"
-                    style={{ whiteSpace: 'nowrap' }}
-                    disabled={capturing || !selectedQuickCameraId}
+                    disabled={capturing}
+                    title={`Record a ${defaultCaptureSeconds}s MP4 clip from ${activeCameraTrack.name}`}
                     onClick={async () => {
-                      if (!selectedQuickCameraId) return
                       setCapturing(true)
                       try {
                         await onCaptureRecording(
-                          selectedQuickCameraId,
+                          activeCameraTrack.id,
                           defaultCaptureSeconds,
                         )
                       } finally {
@@ -720,16 +937,16 @@ export function TimelineView({
                     }}
                   >
                     <Film size={13} />
-                    {capturing ? 'Saving…' : `${defaultCaptureSeconds}s Clip`}
+                    {capturing ? 'Saving…' : `Clip ${defaultCaptureSeconds}s`}
                   </button>
-                </div>
-              )}
+                )}
+              </div>
             </div>
           </div>
         </aside>
       </div>
 
-      {/* Interactive Multi-Track Scrubber */}
+      {/* Step 3: Interactive Multi-Track Scrubber */}
       <section className="panel" aria-label="Interactive multi-camera timeline">
         <div className="timeline-controls-bar">
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
@@ -789,14 +1006,6 @@ export function TimelineView({
             >
               Today
             </button>
-
-            {nvrStatus.active && (
-              <span className="chip alert">
-                <span className="timeline-rec-dot" />
-                NVR Live ({nvrStatus.activeCameraCount}/{cameras.length}) ·{' '}
-                {nvrStatus.totalSegmentsCaptured} segs
-              </span>
-            )}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
@@ -870,146 +1079,238 @@ export function TimelineView({
           </div>
         </div>
 
-        {/* Ruler + Swimlanes */}
-        <div className="timeline-grid">
-          <div className="timeline-labels-col">
-            <div className="timeline-ruler-corner mono">TRACKS</div>
-            {cameraTracks.map((cam) => {
-              const camNvr = nvrStatus.cameras[cam.id]
-              const isCamRecording = camNvr?.state === 'recording'
-              const isCamConnecting =
-                camNvr?.state === 'connecting' || camNvr?.state === 'reconnecting'
-              return (
-                <div key={cam.id} className="timeline-track-label" title={cam.name}>
-                  {isCamRecording && (
-                    <span
-                      className="timeline-rec-dot"
-                      title="Continuously recording live stream"
-                    />
-                  )}
-                  {isCamConnecting && (
-                    <span
-                      className="timeline-rec-dot connecting"
-                      title={`NVR ${camNvr.state}`}
-                    />
-                  )}
-                  <span>{cam.name}</span>
-                </div>
-              )
-            })}
-            {showSensors && (
-              <div className="timeline-track-label">
-                <span>Ring Sensors</span>
-              </div>
-            )}
-          </div>
+        {/* Color Legend Bar */}
+        <div className="timeline-legend-bar">
+          <span>
+            <i className="legend-swatch continuous" />
+            24/7 Continuous
+          </span>
+          <span>
+            <i className="legend-swatch motion" />
+            Motion
+          </span>
+          <span>
+            <i className="legend-swatch ding" />
+            Doorbell
+          </span>
+          <span>
+            <i className="legend-swatch package" />
+            AI Package
+          </span>
+          <span>
+            <i className="legend-swatch sensor" />
+            Sensor Event
+          </span>
+          <span>
+            <i className="legend-swatch live" />
+            Recording Now
+          </span>
+          <span style={{ marginLeft: 'auto', color: 'var(--text-muted)' }}>
+            Click or drag any lane to scrub · Click a camera name to switch
+          </span>
+        </div>
 
-          <div
-            ref={tracksContainerRef}
-            className="timeline-lanes-col"
-            onMouseDown={(e) => {
-              setDragging(true)
-              handleTrackPointer(e.clientX)
-            }}
-            onMouseMove={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect()
-              const pct = ((e.clientX - rect.left) / Math.max(1, rect.width)) * 100
-              setHoverInfo({
-                pct: Math.max(0, Math.min(100, pct)),
-                tsMs: percentToMs(pct, windowStartMs, windowEndMs),
-              })
-            }}
-            onMouseLeave={() => setHoverInfo(null)}
-          >
-            {/* Time Ruler */}
-            <div className="timeline-ruler">
-              {rulerTicks.map((tick) => (
-                <div
-                  key={tick.ms}
-                  className={`timeline-tick ${tick.major ? 'major' : ''}`}
-                  style={{ left: `${tick.pct}%` }}
-                >
-                  <span>{tick.label}</span>
+        {/* Scrollable Ruler + Swimlanes */}
+        <div className="timeline-tracks-scroll">
+          <div className="timeline-grid">
+            <div className="timeline-labels-col">
+              <div className="timeline-ruler-corner mono">CAMERA TRACKS</div>
+              {cameraTracks.map((cam) => {
+                const isSelected = activeCameraTrack?.id === cam.id
+                const camClipCount = dayRecordings.filter((r) => r.cameraId === cam.id).length
+                const camNvr = nvrStatus.cameras[cam.id]
+                const isCamRecording = camNvr?.state === 'recording'
+                const isCamConnecting =
+                  camNvr?.state === 'connecting' || camNvr?.state === 'reconnecting'
+                return (
+                  <button
+                    key={cam.id}
+                    type="button"
+                    className={`timeline-track-label clickable ${isSelected ? 'active-track' : ''}`}
+                    title={`Select ${cam.name} as active timeline camera (${camClipCount} clips)`}
+                    onClick={() => handleSelectCamera(cam.id)}
+                  >
+                    {isCamRecording && (
+                      <span
+                        className="timeline-rec-dot"
+                        title="Continuously recording live stream"
+                      />
+                    )}
+                    {isCamConnecting && (
+                      <span
+                        className="timeline-rec-dot connecting"
+                        title={`NVR ${camNvr.state}`}
+                      />
+                    )}
+                    <span className="timeline-track-name">{cam.name}</span>
+                    <span className="timeline-track-count mono">{camClipCount}</span>
+                  </button>
+                )
+              })}
+              {showSensors && (
+                <div className="timeline-track-label">
+                  <span className="timeline-track-name">Ring Sensors</span>
+                  <span className="timeline-track-count mono">{sensorEvents.length}</span>
                 </div>
-              ))}
+              )}
             </div>
 
-            {/* Camera Tracks */}
-            {cameraTracks.map((cam) => {
-              const camClips = dayRecordings.filter((r) => r.cameraId === cam.id)
-              const camEvents = dayEvents.filter((e) => e.deviceId === cam.id)
-              const camPackages = dayPackageHits.filter((p) => p.cameraId === cam.id)
-              const camNvr = nvrStatus.cameras[cam.id]
-              const liveStartMs =
-                camNvr?.state === 'recording' && camNvr.currentSegmentStartedAt
-                  ? new Date(camNvr.currentSegmentStartedAt).getTime()
-                  : null
-              const showLiveBar =
-                liveStartMs !== null &&
-                nowMs >= windowStartMs &&
-                liveStartMs <= windowEndMs
+            <div
+              ref={tracksContainerRef}
+              className="timeline-lanes-col"
+              onMouseDown={(e) => {
+                setDragging(true)
+                handleTrackPointer(e.clientX)
+              }}
+              onMouseMove={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect()
+                const pct = ((e.clientX - rect.left) / Math.max(1, rect.width)) * 100
+                setHoverInfo({
+                  pct: Math.max(0, Math.min(100, pct)),
+                  tsMs: percentToMs(pct, windowStartMs, windowEndMs),
+                })
+              }}
+              onMouseLeave={() => setHoverInfo(null)}
+            >
+              {/* Time Ruler */}
+              <div className="timeline-ruler">
+                {rulerTicks.map((tick) => (
+                  <div
+                    key={tick.ms}
+                    className={`timeline-tick ${tick.major ? 'major' : ''}`}
+                    style={{ left: `${tick.pct}%` }}
+                  >
+                    <span>{tick.label}</span>
+                  </div>
+                ))}
+              </div>
 
-              return (
-                <div
-                  key={cam.id}
-                  className="timeline-lane"
-                  onMouseDown={(e) => {
-                    e.stopPropagation()
-                    setDragging(true)
-                    handleTrackPointer(e.clientX, cam.id)
-                  }}
-                >
-                  {camClips.map((clip) => {
-                    const start = new Date(clip.createdAt).getTime()
-                    const end = start + Math.max(15, clip.durationSeconds) * 1000
-                    if (end < windowStartMs || start > windowEndMs) return null
-                    const leftPct = Math.max(
-                      0,
-                      msToPercent(start, windowStartMs, windowEndMs),
-                    )
-                    const rightPct = Math.min(
-                      100,
-                      msToPercent(end, windowStartMs, windowEndMs),
-                    )
-                    const widthPct = Math.max(1.1, rightPct - leftPct)
+              {/* Camera Tracks */}
+              {cameraTracks.map((cam) => {
+                const isSelected = activeCameraTrack?.id === cam.id
+                const camClips = dayRecordings.filter((r) => r.cameraId === cam.id)
+                const camEvents = dayEvents.filter((e) => e.deviceId === cam.id)
+                const camPackages = dayPackageHits.filter((p) => p.cameraId === cam.id)
+                const camNvr = nvrStatus.cameras[cam.id]
+                const liveStartMs =
+                  camNvr?.state === 'recording' && camNvr.currentSegmentStartedAt
+                    ? new Date(camNvr.currentSegmentStartedAt).getTime()
+                    : null
+                const showLiveBar =
+                  liveStartMs !== null &&
+                  nowMs >= windowStartMs &&
+                  liveStartMs <= windowEndMs
 
-                    return (
-                      <button
-                        key={clip.id}
-                        type="button"
-                        className={`timeline-clip-bar trigger-${clip.trigger} ${
-                          activeClip?.id === clip.id ? 'active' : ''
-                        }`}
+                return (
+                  <div
+                    key={cam.id}
+                    className={`timeline-lane ${isSelected ? 'active-lane' : ''}`}
+                    onMouseDown={(e) => {
+                      e.stopPropagation()
+                      setDragging(true)
+                      handleTrackPointer(e.clientX, cam.id)
+                    }}
+                  >
+                    {camClips.map((clip) => {
+                      const start = new Date(clip.createdAt).getTime()
+                      const end = start + Math.max(15, clip.durationSeconds) * 1000
+                      if (end < windowStartMs || start > windowEndMs) return null
+                      const leftPct = Math.max(
+                        0,
+                        msToPercent(start, windowStartMs, windowEndMs),
+                      )
+                      const rightPct = Math.min(
+                        100,
+                        msToPercent(end, windowStartMs, windowEndMs),
+                      )
+                      const widthPct = Math.max(1.1, rightPct - leftPct)
+
+                      return (
+                        <button
+                          key={clip.id}
+                          type="button"
+                          className={`timeline-clip-bar trigger-${clip.trigger} ${
+                            activeClip?.id === clip.id ? 'active' : ''
+                          }`}
+                          style={{
+                            left: `${leftPct}%`,
+                            width: `${widthPct}%`,
+                          }}
+                          title={`${clip.cameraName} · ${formatTimestamp(clip.createdAt)} (${formatDuration(clip.durationSeconds)}) [${clip.trigger}]`}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            selectClip(clip)
+                          }}
+                        />
+                      )
+                    })}
+
+                    {showLiveBar && liveStartMs !== null && (
+                      <div
+                        className="timeline-live-recording-bar"
                         style={{
-                          left: `${leftPct}%`,
-                          width: `${widthPct}%`,
+                          left: `${Math.max(0, msToPercent(liveStartMs, windowStartMs, windowEndMs))}%`,
+                          width: `${Math.max(
+                            0.8,
+                            Math.min(100, msToPercent(nowMs, windowStartMs, windowEndMs)) -
+                              Math.max(0, msToPercent(liveStartMs, windowStartMs, windowEndMs)),
+                          )}%`,
                         }}
-                        title={`${clip.cameraName} · ${formatTimestamp(clip.createdAt)} (${formatDuration(clip.durationSeconds)}) [${clip.trigger}]`}
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          selectClip(clip)
-                        }}
+                        title={`${cam.name} — Recording live segment now (will appear for playback once segment rotates)`}
                       />
-                    )
-                  })}
+                    )}
 
-                  {showLiveBar && liveStartMs !== null && (
-                    <div
-                      className="timeline-live-recording-bar"
-                      style={{
-                        left: `${Math.max(0, msToPercent(liveStartMs, windowStartMs, windowEndMs))}%`,
-                        width: `${Math.max(
-                          0.8,
-                          Math.min(100, msToPercent(nowMs, windowStartMs, windowEndMs)) -
-                            Math.max(0, msToPercent(liveStartMs, windowStartMs, windowEndMs)),
-                        )}%`,
-                      }}
-                      title={`${cam.name} — Recording live segment now (will appear for playback once segment rotates or stops)`}
-                    />
-                  )}
+                    {camEvents.map((ev) => {
+                      const ts = new Date(ev.timestamp).getTime()
+                      if (ts < windowStartMs || ts > windowEndMs) return null
+                      const pct = msToPercent(ts, windowStartMs, windowEndMs)
+                      return (
+                        <button
+                          key={ev.id}
+                          type="button"
+                          className={`timeline-pin pin-${ev.kind}`}
+                          style={{ left: `${pct}%` }}
+                          title={`${ev.title} (${formatTimestamp(ev.timestamp)}) — Click to jump & play`}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            selectEventPin(ev, cam.id)
+                          }}
+                        />
+                      )
+                    })}
 
-                  {camEvents.map((ev) => {
+                    {camPackages.map((pkg) => {
+                      const ts = new Date(pkg.timestamp).getTime()
+                      if (ts < windowStartMs || ts > windowEndMs) return null
+                      const pct = msToPercent(ts, windowStartMs, windowEndMs)
+                      return (
+                        <button
+                          key={pkg.id}
+                          type="button"
+                          className="timeline-pin pin-package-detected"
+                          style={{ left: `${pct}%` }}
+                          title={`AI Package (${Math.round(pkg.confidence * 100)}%): ${pkg.summary} — Click to jump & play`}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            seekToTimestamp(ts, cam.id, {
+                              preRollSeconds: 3,
+                              autoPlay: true,
+                            })
+                          }}
+                        />
+                      )
+                    })}
+                  </div>
+                )
+              })}
+
+              {/* Dedicated Sensors Swimlane */}
+              {showSensors && (
+                <div className="timeline-lane">
+                  {sensorEvents.map((ev) => {
                     const ts = new Date(ev.timestamp).getTime()
                     if (ts < windowStartMs || ts > windowEndMs) return null
                     const pct = msToPercent(ts, windowStartMs, windowEndMs)
@@ -1017,88 +1318,40 @@ export function TimelineView({
                       <button
                         key={ev.id}
                         type="button"
-                        className={`timeline-pin pin-${ev.kind}`}
+                        className="timeline-pin pin-sensor"
                         style={{ left: `${pct}%` }}
                         title={`${ev.title} (${formatTimestamp(ev.timestamp)}) — Click to jump & play`}
                         onMouseDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation()
-                          selectEventPin(ev, cam.id)
-                        }}
-                      />
-                    )
-                  })}
-
-                  {camPackages.map((pkg) => {
-                    const ts = new Date(pkg.timestamp).getTime()
-                    if (ts < windowStartMs || ts > windowEndMs) return null
-                    const pct = msToPercent(ts, windowStartMs, windowEndMs)
-                    return (
-                      <button
-                        key={pkg.id}
-                        type="button"
-                        className="timeline-pin pin-package-detected"
-                        style={{ left: `${pct}%` }}
-                        title={`AI Package (${Math.round(pkg.confidence * 100)}%): ${pkg.summary} — Click to jump & play`}
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          seekToTimestamp(ts, cam.id, {
-                            preRollSeconds: 3,
-                            autoPlay: true,
-                          })
+                          selectEventPin(ev)
                         }}
                       />
                     )
                   })}
                 </div>
-              )
-            })}
+              )}
 
-            {/* Dedicated Sensors Swimlane */}
-            {showSensors && (
-              <div className="timeline-lane">
-                {sensorEvents.map((ev) => {
-                  const ts = new Date(ev.timestamp).getTime()
-                  if (ts < windowStartMs || ts > windowEndMs) return null
-                  const pct = msToPercent(ts, windowStartMs, windowEndMs)
-                  return (
-                    <button
-                      key={ev.id}
-                      type="button"
-                      className="timeline-pin pin-sensor"
-                      style={{ left: `${pct}%` }}
-                      title={`${ev.title} (${formatTimestamp(ev.timestamp)}) — Click to jump & play`}
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        selectEventPin(ev)
-                      }}
-                    />
-                  )
-                })}
-              </div>
-            )}
+              {/* Hover Ghost Line + Tooltip */}
+              {hoverInfo && (
+                <div
+                  className="timeline-hover-line"
+                  style={{ left: `${hoverInfo.pct}%` }}
+                >
+                  <span className="timeline-hover-badge mono">
+                    {formatTimestamp(new Date(hoverInfo.tsMs).toISOString())}
+                  </span>
+                </div>
+              )}
 
-            {/* Hover Ghost Line + Tooltip */}
-            {hoverInfo && (
-              <div
-                className="timeline-hover-line"
-                style={{ left: `${hoverInfo.pct}%` }}
-              >
-                <span className="timeline-hover-badge mono">
-                  {formatTimestamp(new Date(hoverInfo.tsMs).toISOString())}
-                </span>
-              </div>
-            )}
-
-            {/* Playhead Needle */}
-            {playheadPct >= 0 && playheadPct <= 100 && (
-              <div
-                className="timeline-playhead"
-                style={{ left: `${playheadPct}%` }}
-              />
-            )}
+              {/* Playhead Needle */}
+              {playheadPct >= 0 && playheadPct <= 100 && (
+                <div
+                  className="timeline-playhead"
+                  style={{ left: `${playheadPct}%` }}
+                />
+              )}
+            </div>
           </div>
         </div>
       </section>

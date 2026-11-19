@@ -353,6 +353,11 @@ export interface AlertSoundPayload {
   body: string
 }
 
+export interface SystemThemeInfo {
+  shouldUseDarkColors: boolean
+  accentColor: string | null
+}
+
 export interface RingWatchBootstrap {
   connection: ConnectionStatus
   settings: AppSettings
@@ -365,6 +370,7 @@ export interface RingWatchBootstrap {
   recordings: LocalRecordingItem[]
   packageDetections: PackageDetectionRecord[]
   activeStreams: LiveStreamSession[]
+  systemTheme?: SystemThemeInfo
 }
 
 export interface RingWatchApi {
@@ -475,4 +481,6 @@ export interface RingWatchApi {
   onPackageDetection: (cb: (record: PackageDetectionRecord) => void) => () => void
   onPlayAlertSound: (cb: (payload: AlertSoundPayload) => void) => () => void
   onFocusCamera: (cb: (cameraId: string) => void) => () => void
+  onStreamsUpdated: (cb: (streams: LiveStreamSession[]) => void) => () => void
+  onSystemThemeChanged: (cb: (theme: SystemThemeInfo) => void) => () => void
 }

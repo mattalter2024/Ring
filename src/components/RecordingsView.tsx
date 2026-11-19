@@ -126,7 +126,7 @@ export function RecordingsView({
       <section className="panel storage-banner" aria-label="Local video storage status">
         <div className="storage-banner-top">
           <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
-            <HardDrive size={20} color="#1998d5" />
+            <HardDrive size={20} color="var(--accent)" />
             <div style={{ minWidth: 0 }}>
               <div style={{ fontWeight: 600, fontSize: 14 }}>
                 Local Windows Video Storage

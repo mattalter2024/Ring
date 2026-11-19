@@ -13,8 +13,10 @@ import type {
   RingWatchApi,
   SecurityEvent,
   StorageStats,
+  SystemThemeInfo,
 } from '@shared/types'
 import { playAlertChime } from '@/utils/audioChime'
+import { applySystemTheme } from '@/utils/theme'
 
 declare global {
   interface Window {
@@ -325,8 +327,21 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
   )
 
   useEffect(() => {
+    // Immediate OS dark/light sync before Electron IPC resolves (also supports browser preview)
+    const mq =
+      typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        ? window.matchMedia('(prefers-color-scheme: dark)')
+        : null
+    if (mq) {
+      applySystemTheme({ shouldUseDarkColors: mq.matches, accentColor: null })
+    }
+
     const api = window.ringWatch
     if (!api) {
+      const onMqChange = (e: MediaQueryListEvent) => {
+        applySystemTheme({ shouldUseDarkColors: e.matches, accentColor: null })
+      }
+      mq?.addEventListener?.('change', onMqChange)
       const fallback = createBrowserPreviewFallback()
       setConnection(fallback.connection)
       setLocations(fallback.locations)
@@ -334,7 +349,9 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
       setSensors(fallback.sensors)
       setEvents(fallback.events)
       setLoading(false)
-      return
+      return () => {
+        mq?.removeEventListener?.('change', onMqChange)
+      }
     }
 
     let mounted = true
@@ -342,6 +359,9 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
       .getBootstrap()
       .then((boot) => {
         if (!mounted) return
+        if (boot.systemTheme) {
+          applySystemTheme(boot.systemTheme)
+        }
         setConnection(boot.connection)
         setSettings(boot.settings)
         setStorageStats(boot.storageStats)
@@ -391,6 +411,14 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
       }),
       api.onFocusCamera((camId: string) => {
         focusRef.current?.(camId)
+      }),
+      api.onStreamsUpdated((sessions: LiveStreamSession[]) => {
+        const next: Record<string, LiveStreamSession> = {}
+        for (const s of sessions) next[s.cameraId] = s
+        setStreamsByCamera(next)
+      }),
+      api.onSystemThemeChanged((theme: SystemThemeInfo) => {
+        applySystemTheme(theme)
       }),
     ]
 

@@ -6,9 +6,11 @@ import {
   dialog,
   ipcMain,
   nativeImage,
+  nativeTheme,
   powerSaveBlocker,
   safeStorage,
   shell,
+  systemPreferences,
 } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
@@ -18,6 +20,7 @@ import type {
   LocalRecordingItem,
   PackageDetectionRecord,
   RingWatchBootstrap,
+  SystemThemeInfo,
 } from '../shared/types'
 import { ConfigStore } from './services/configStore'
 import { NotificationService } from './services/notificationService'
@@ -29,6 +32,29 @@ import { RingService } from './services/ringService'
 // Ensure Windows 10/11 desktop notifications display RingWatch branding
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.ringwatch.desktop')
+}
+
+nativeTheme.themeSource = 'system'
+
+function getSystemThemeInfo(): SystemThemeInfo {
+  let accentColor: string | null = null
+  if (
+    (process.platform === 'win32' || process.platform === 'darwin') &&
+    typeof systemPreferences.getAccentColor === 'function'
+  ) {
+    try {
+      const raw = systemPreferences.getAccentColor()
+      if (raw && typeof raw === 'string' && raw.trim().length >= 6) {
+        accentColor = `#${raw.trim().replace(/^#/, '').slice(0, 6)}`
+      }
+    } catch {
+      // Ignore if platform accent color is unavailable
+    }
+  }
+  return {
+    shouldUseDarkColors: nativeTheme.shouldUseDarkColors,
+    accentColor,
+  }
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -194,14 +220,15 @@ function createMainWindow(): void {
   const settings = configStore.getPublicSettings()
   const launchedMinimized =
     settings.startMinimized || process.argv.includes('--minimized')
+  const theme = getSystemThemeInfo()
 
   mainWindow = new BrowserWindow({
     width: 1380,
     height: 880,
-    minWidth: 1020,
-    minHeight: 680,
+    minWidth: 960,
+    minHeight: 620,
     title: 'RingWatch — 24/7 NVR, Cameras, Sensors & AI Package Hub',
-    backgroundColor: '#0b0e13',
+    backgroundColor: theme.shouldUseDarkColors ? '#0b0e13' : '#f3f5f8',
     autoHideMenuBar: true,
     show: !launchedMinimized,
     icon: fs.existsSync(iconPath) ? iconPath : undefined,
@@ -247,6 +274,7 @@ function registerIpcHandlers(): void {
     recordings: recordingService.listRecordings(),
     packageDetections: aiPackageService.listDetections(),
     activeStreams: streamService.listActiveSessions(),
+    systemTheme: getSystemThemeInfo(),
   }))
 
   ipcMain.handle('ringwatch:connect-token', (_e, refreshToken: string) =>
@@ -574,6 +602,25 @@ if (!singleInstanceLock) {
       () => configStore.getPublicSettings().recordingsDir,
       () => (recordingService ? recordingService.getAllStorageRoots() : []),
     )
+    streamService.setOnStreamsChanged((sessions) => {
+      sendToRenderer('ringwatch:streams-updated', sessions)
+    })
+
+    const broadcastSystemTheme = () => {
+      const theme = getSystemThemeInfo()
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.setBackgroundColor(
+          theme.shouldUseDarkColors ? '#0b0e13' : '#f3f5f8',
+        )
+      }
+      sendToRenderer('ringwatch:system-theme-changed', theme)
+    }
+
+    nativeTheme.on('updated', broadcastSystemTheme)
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+      systemPreferences.on('accent-color-changed', broadcastSystemTheme)
+    }
+
     recordingService = new RecordingService(
       userDataDir,
       configStore,

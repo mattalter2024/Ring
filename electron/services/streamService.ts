@@ -46,6 +46,7 @@ export class StreamService {
   private readonly getRecordingsDir: () => string
   private readonly getAdditionalRecordingsDirs?: () => string[]
   private recordingPathResolver?: (id: string) => string | undefined
+  private onStreamsChanged?: (sessions: LiveStreamSession[]) => void
 
   constructor(
     getRecordingsDir: () => string,
@@ -59,6 +60,14 @@ export class StreamService {
 
   setRecordingPathResolver(resolver: (id: string) => string | undefined): void {
     this.recordingPathResolver = resolver
+  }
+
+  setOnStreamsChanged(cb: (sessions: LiveStreamSession[]) => void): void {
+    this.onStreamsChanged = cb
+  }
+
+  private notifyStreamsChanged(): void {
+    this.onStreamsChanged?.(this.listActiveSessions())
   }
 
   async startServer(): Promise<number> {
@@ -303,6 +312,7 @@ export class StreamService {
     const active = this.activeStreams.get(cameraId)
     if (active?.nvrBacked) {
       this.activeStreams.delete(cameraId)
+      this.notifyStreamsChanged()
       active.onEnded?.()
     }
 
@@ -373,9 +383,11 @@ export class StreamService {
           stopFn: () => {
             if (!this.activeStreams.has(cameraId)) return
             this.activeStreams.delete(cameraId)
+            this.notifyStreamsChanged()
             onEnded?.()
           },
         })
+        this.notifyStreamsChanged()
         return session
       }
     }
@@ -427,6 +439,7 @@ export class StreamService {
       setTimeout(() => {
         fs.rmSync(dirPath, { recursive: true, force: true })
       }, 1500)
+      this.notifyStreamsChanged()
       onEnded?.()
     }
 
@@ -459,6 +472,7 @@ export class StreamService {
       )
     }
 
+    this.notifyStreamsChanged()
     return session
   }
 
@@ -479,10 +493,13 @@ export class StreamService {
       session,
       dirPath: '',
       stopFn: () => {
+        if (!this.activeStreams.has(cameraId)) return
         this.activeStreams.delete(cameraId)
+        this.notifyStreamsChanged()
       },
     })
 
+    this.notifyStreamsChanged()
     return session
   }
 

@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   AppMode,
   AppSettingsPatch,
@@ -25,6 +25,12 @@ export function App() {
   const [focusedCameraId, setFocusedCameraId] = useState<string | null>(null)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [nvrBusy, setNvrBusy] = useState(false)
+  const [autoLiveEnabled, setAutoLiveEnabled] = useState(true)
+  const [connectingCameraIds, setConnectingCameraIds] = useState<Record<string, boolean>>({})
+
+  const connectingRef = useRef<Set<string>>(new Set())
+  const manuallyStoppedRef = useRef<Set<string>>(new Set())
+  const lastAutoFailRef = useRef<Record<string, number>>({})
 
   const handleFocusFromNotification = useCallback((cameraId: string) => {
     setActiveTab('cameras')
@@ -79,38 +85,150 @@ export function App() {
     }
   }
 
-  const handleStartStream = async (cameraId: string) => {
-    if (!api) {
-      setStreamsByCamera((prev) => ({
-        ...prev,
-        [cameraId]: {
-          cameraId,
-          mode: 'demo',
-          streamUrl: `demo://${cameraId}`,
-          startedAt: new Date().toISOString(),
-          audioEnabled: false,
-        },
-      }))
+  const startStreamInternal = useCallback(
+    async (cameraId: string, silent = false) => {
+      if (connectingRef.current.has(cameraId)) return
+      manuallyStoppedRef.current.delete(cameraId)
+
+      if (!api) {
+        setStreamsByCamera((prev) => ({
+          ...prev,
+          [cameraId]: {
+            cameraId,
+            mode: 'demo',
+            streamUrl: `demo://${cameraId}`,
+            startedAt: new Date().toISOString(),
+            audioEnabled: false,
+          },
+        }))
+        return
+      }
+
+      connectingRef.current.add(cameraId)
+      setConnectingCameraIds((prev) => ({ ...prev, [cameraId]: true }))
+      try {
+        const session = await api.startLiveStream(cameraId)
+        delete lastAutoFailRef.current[cameraId]
+        setStreamsByCamera((prev) => ({ ...prev, [cameraId]: session }))
+      } catch (err) {
+        lastAutoFailRef.current[cameraId] = Date.now()
+        if (!silent) {
+          pushToast('Stream Failed', err instanceof Error ? err.message : String(err), 'err')
+        }
+      } finally {
+        connectingRef.current.delete(cameraId)
+        setConnectingCameraIds((prev) => {
+          const next = { ...prev }
+          delete next[cameraId]
+          return next
+        })
+      }
+    },
+    [api, pushToast, setStreamsByCamera],
+  )
+
+  const handleStartStream = useCallback(
+    async (cameraId: string) => {
+      await startStreamInternal(cameraId, false)
+    },
+    [startStreamInternal],
+  )
+
+  const handleStopStream = useCallback(
+    async (cameraId: string) => {
+      manuallyStoppedRef.current.add(cameraId)
+      if (api) {
+        await api.stopLiveStream(cameraId)
+      }
+      setStreamsByCamera((prev) => {
+        const next = { ...prev }
+        delete next[cameraId]
+        return next
+      })
+    },
+    [api, setStreamsByCamera],
+  )
+
+  const handleStartAllLive = useCallback(async () => {
+    manuallyStoppedRef.current.clear()
+    lastAutoFailRef.current = {}
+    setAutoLiveEnabled(true)
+    const targets = cameras.filter((c) => c.online && !streamsByCamera[c.id])
+    await Promise.allSettled(targets.map((cam) => startStreamInternal(cam.id, true)))
+  }, [cameras, streamsByCamera, startStreamInternal])
+
+  const handleStopAllLive = useCallback(async () => {
+    setAutoLiveEnabled(false)
+    for (const cam of cameras) {
+      manuallyStoppedRef.current.add(cam.id)
+    }
+    await Promise.allSettled(
+      Object.keys(streamsByCamera).map((id) =>
+        api ? api.stopLiveStream(id) : Promise.resolve(),
+      ),
+    )
+    setStreamsByCamera({})
+  }, [api, cameras, streamsByCamera, setStreamsByCamera])
+
+  const handleSelectFocusCamera = useCallback(
+    (cameraId: string | null) => {
+      setFocusedCameraId(cameraId)
+      if (cameraId && !streamsByCamera[cameraId]) {
+        void startStreamInternal(cameraId, false)
+      }
+    },
+    [streamsByCamera, startStreamInternal],
+  )
+
+  // Automatically keep all online cameras streaming live when viewing the Live Cameras tab
+  useEffect(() => {
+    if (loading || activeTab !== 'cameras' || !autoLiveEnabled || cameras.length === 0) {
       return
     }
-    try {
-      const session = await api.startLiveStream(cameraId)
-      setStreamsByCamera((prev) => ({ ...prev, [cameraId]: session }))
-    } catch (err) {
-      pushToast('Stream Failed', err instanceof Error ? err.message : String(err), 'err')
-    }
-  }
 
-  const handleStopStream = async (cameraId: string) => {
-    if (api) {
-      await api.stopLiveStream(cameraId)
-    }
-    setStreamsByCamera((prev) => {
-      const next = { ...prev }
-      delete next[cameraId]
-      return next
+    const now = Date.now()
+    const eligible = cameras.filter((cam) => {
+      if (!cam.online) return false
+      if (streamsByCamera[cam.id]) return false
+      if (connectingRef.current.has(cam.id)) return false
+      if (manuallyStoppedRef.current.has(cam.id)) return false
+      const nvrRecording = nvrStatus.cameras[cam.id]?.state === 'recording'
+      const lastFail = lastAutoFailRef.current[cam.id] ?? 0
+      // Attach immediately if NVR already has a live feed; otherwise respect a 20s retry cooldown
+      if (!nvrRecording && now - lastFail < 20_000) return false
+      return true
     })
-  }
+
+    if (eligible.length === 0) return
+
+    const timers: Array<ReturnType<typeof setTimeout>> = []
+    eligible.forEach((cam, idx) => {
+      const nvrRecording = nvrStatus.cameras[cam.id]?.state === 'recording'
+      const delayMs = connection.mode === 'demo' || nvrRecording ? 0 : idx * 350
+      if (delayMs === 0) {
+        void startStreamInternal(cam.id, true)
+      } else {
+        timers.push(
+          setTimeout(() => {
+            void startStreamInternal(cam.id, true)
+          }, delayMs),
+        )
+      }
+    })
+
+    return () => {
+      for (const t of timers) clearTimeout(t)
+    }
+  }, [
+    loading,
+    activeTab,
+    autoLiveEnabled,
+    cameras,
+    streamsByCamera,
+    nvrStatus.cameras,
+    connection.mode,
+    startStreamInternal,
+  ])
 
   const handleCaptureRecording = async (
     cameraId: string,
@@ -744,13 +862,24 @@ export function App() {
             <CamerasView
               cameras={cameras}
               streamsByCamera={streamsByCamera}
+              connectingCameraIds={connectingCameraIds}
+              autoLiveEnabled={autoLiveEnabled}
               nvrStatus={nvrStatus}
               nvrBusy={nvrBusy}
               recordingsCount={recordings.length}
               packageDetections={packageDetections}
               defaultCaptureSeconds={settings.defaultCaptureSeconds}
               focusedCameraId={focusedCameraId}
-              onSelectFocusCamera={setFocusedCameraId}
+              onSelectFocusCamera={handleSelectFocusCamera}
+              onToggleAutoLive={(enabled) => {
+                setAutoLiveEnabled(enabled)
+                if (enabled) {
+                  manuallyStoppedRef.current.clear()
+                  lastAutoFailRef.current = {}
+                }
+              }}
+              onStartAllLive={handleStartAllLive}
+              onStopAllLive={handleStopAllLive}
               onStartStream={handleStartStream}
               onStopStream={handleStopStream}
               onCaptureRecording={handleCaptureRecording}

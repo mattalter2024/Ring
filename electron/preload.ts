@@ -4,6 +4,7 @@ import type {
   AppMode,
   AppSettingsPatch,
   ConnectionStatus,
+  LiveStreamSession,
   LocalRecordingItem,
   NvrStatus,
   PackageDetectionRecord,
@@ -13,6 +14,7 @@ import type {
   RingWatchApi,
   SecurityEvent,
   StorageStats,
+  SystemThemeInfo,
 } from '../shared/types'
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -130,6 +132,10 @@ const api: RingWatchApi = {
     subscribe('ringwatch:play-alert-sound', cb),
   onFocusCamera: (cb: (cameraId: string) => void) =>
     subscribe('ringwatch:focus-camera', cb),
+  onStreamsUpdated: (cb: (streams: LiveStreamSession[]) => void) =>
+    subscribe('ringwatch:streams-updated', cb),
+  onSystemThemeChanged: (cb: (theme: SystemThemeInfo) => void) =>
+    subscribe('ringwatch:system-theme-changed', cb),
 }
 
 contextBridge.exposeInMainWorld('ringWatch', api)

@@ -844,4 +844,50 @@ describe('Autonomous 24/7 UNVR & Storage Management', () => {
   })
 })
 
+describe('Windows System Theme & Live Stream Sync', () => {
+  it('normalizes Windows 8-char RGBA accent hex and computes accessible dark/light variables', async () => {
+    const { normalizeAccentHex, computeThemeCssVars } = await import('../src/utils/theme')
+
+    expect(normalizeAccentHex('0078d4ff')).toBe('#0078d4')
+    expect(normalizeAccentHex('#E74856FF')).toBe('#e74856')
+    expect(normalizeAccentHex('not-a-hex')).toBeNull()
+    expect(normalizeAccentHex(null)).toBeNull()
+
+    const darkRed = computeThemeCssVars({
+      shouldUseDarkColors: true,
+      accentColor: 'e74856ff',
+    })
+    expect(darkRed.mode).toBe('dark')
+    expect(darkRed.vars['--accent']).toBe('#e74856')
+    expect(darkRed.vars['--accent-contrast']).toBe('#ffffff')
+
+    // Bright yellow Windows accent automatically picks dark button text for readability
+    const lightYellow = computeThemeCssVars({
+      shouldUseDarkColors: false,
+      accentColor: '#facc15ff',
+    })
+    expect(lightYellow.mode).toBe('light')
+    expect(lightYellow.vars['--accent']).toBe('#facc15')
+    expect(lightYellow.vars['--accent-contrast']).toBe('#0b0e13')
+  })
+
+  it('notifies listeners when live streams start and stop', () => {
+    const tmpDir = makeTempDir()
+    const streamService = new StreamService(() => tmpDir)
+    const snapshots: number[] = []
+    streamService.setOnStreamsChanged((sessions) => {
+      snapshots.push(sessions.length)
+    })
+
+    streamService.startDemoStream('cam-1')
+    streamService.startDemoStream('cam-2')
+    streamService.stopStream('cam-1')
+    streamService.stopAll()
+
+    expect(snapshots).toEqual([1, 2, 1, 0])
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+})
+
+
 

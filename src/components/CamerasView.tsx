@@ -25,6 +25,8 @@ import { LiveVideoPlayer } from './LiveVideoPlayer'
 interface CamerasViewProps {
   cameras: RingCameraInfo[]
   streamsByCamera: Record<string, LiveStreamSession>
+  connectingCameraIds: Record<string, boolean>
+  autoLiveEnabled: boolean
   nvrStatus: NvrStatus
   nvrBusy: boolean
   recordingsCount: number
@@ -32,6 +34,9 @@ interface CamerasViewProps {
   defaultCaptureSeconds: number
   focusedCameraId: string | null
   onSelectFocusCamera: (cameraId: string | null) => void
+  onToggleAutoLive: (enabled: boolean) => void
+  onStartAllLive: () => Promise<void>
+  onStopAllLive: () => Promise<void>
   onStartStream: (cameraId: string) => Promise<void>
   onStopStream: (cameraId: string) => Promise<void>
   onCaptureRecording: (cameraId: string, durationSeconds: number) => Promise<void>
@@ -47,6 +52,8 @@ interface CamerasViewProps {
 export function CamerasView({
   cameras,
   streamsByCamera,
+  connectingCameraIds,
+  autoLiveEnabled,
   nvrStatus,
   nvrBusy,
   recordingsCount,
@@ -54,6 +61,9 @@ export function CamerasView({
   defaultCaptureSeconds,
   focusedCameraId,
   onSelectFocusCamera,
+  onToggleAutoLive,
+  onStartAllLive,
+  onStopAllLive,
   onStartStream,
   onStopStream,
   onCaptureRecording,
@@ -86,6 +96,7 @@ export function CamerasView({
   }
 
   const onlineCount = cameras.filter((c) => c.online).length
+  const liveCount = Object.keys(streamsByCamera).length
   const positivePackages = packageDetections.filter((d) => d.packageDetected).length
 
   const focusedCamera = focusedCameraId
@@ -96,17 +107,19 @@ export function CamerasView({
     <div>
       <section className="telemetry-strip" aria-label="System telemetry">
         <div className="telemetry-card">
-          <span className="telemetry-label">Cameras Online</span>
+          <span className="telemetry-label">Live Feeds</span>
           <span className="telemetry-value">
-            {onlineCount}/{cameras.length}
+            {liveCount}/{onlineCount}
           </span>
-          <span className="telemetry-note">Connected Ring devices</span>
+          <span className="telemetry-note">
+            {liveCount > 0 ? 'Streaming live video' : `${onlineCount} camera(s) online`}
+          </span>
         </div>
         <div className="telemetry-card">
           <span className="telemetry-label">Continuous NVR</span>
           <span
             className="telemetry-value"
-            style={{ color: nvrStatus.active ? '#f87171' : undefined }}
+            style={{ color: nvrStatus.active ? 'var(--text-alert)' : undefined }}
           >
             {nvrStatus.activeCameraCount}/{cameras.length}
           </span>
@@ -129,39 +142,67 @@ export function CamerasView({
       </section>
 
       {cameras.length > 0 && (
-        <section className="panel nvr-banner" aria-label="All-camera NVR recording controls">
+        <section className="panel nvr-banner" aria-label="Live wall and all-camera NVR controls">
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span className={`chip ${liveCount > 0 ? 'ok' : ''}`}>
+              <Circle
+                size={8}
+                fill="currentColor"
+              />
+              {liveCount > 0 ? `${liveCount}/${cameras.length} LIVE` : 'CONNECTING LIVE'}
+            </span>
             <span className={`chip ${nvrStatus.active ? 'alert' : ''}`}>
               <Circle
                 size={9}
                 fill={nvrStatus.active ? '#ef4444' : 'currentColor'}
                 color={nvrStatus.active ? '#ef4444' : 'currentColor'}
               />
-              {nvrStatus.active ? 'NVR RECORDING LIVE' : 'NVR STANDBY'}
+              {nvrStatus.active ? '24/7 NVR RECORDING' : 'NVR STANDBY'}
             </span>
             <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
               {nvrStatus.active ? (
                 <>
-                  Continuously recording{' '}
-                  <strong>
-                    {nvrStatus.activeCameraCount} of {cameras.length} camera(s)
-                  </strong>{' '}
-                  in rolling {Math.round(nvrStatus.segmentSeconds / 60 * 10) / 10}m MP4
-                  segments ({nvrStatus.totalSegmentsCaptured} saved this session) — live
-                  view shares the same stream with zero extra delay.
+                  Recording <strong>{nvrStatus.activeCameraCount}/{cameras.length}</strong>{' '}
+                  camera(s) in {Math.round((nvrStatus.segmentSeconds / 60) * 10) / 10}m segments
+                  — Live Wall shares the same NVR feed with zero extra Ring connection.
                 </>
               ) : (
                 <>
-                  Record live streams across <strong>all {cameras.length} camera(s)</strong>{' '}
-                  into rolling {Math.round(nvrStatus.segmentSeconds / 60 * 10) / 10}-minute
-                  local MP4 segments so every motion, doorbell, and sensor event is playable on
-                  the Timeline.
+                  Cameras stream live automatically while you view this page. Enable{' '}
+                  <strong>Record All Cameras</strong> for 24/7 Timeline coverage.
                 </>
               )}
             </div>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', flexShrink: 0 }}>
+            <button
+              type="button"
+              className={`btn btn-sm ${autoLiveEnabled ? 'btn-primary' : ''}`}
+              onClick={() => onToggleAutoLive(!autoLiveEnabled)}
+              title="Automatically keep all cameras streaming live while on Live Cameras"
+            >
+              Auto-Live: {autoLiveEnabled ? 'ON' : 'OFF'}
+            </button>
+            {liveCount < onlineCount ? (
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => void onStartAllLive()}
+              >
+                <Play size={12} />
+                Stream All Live
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => void onStopAllLive()}
+              >
+                <Square size={11} />
+                Pause All Live
+              </button>
+            )}
             <button
               type="button"
               className="btn btn-sm"
@@ -199,11 +240,14 @@ export function CamerasView({
               <LiveVideoPlayer
                 camera={focusedCamera}
                 session={streamsByCamera[focusedCamera.id]}
+                isConnecting={Boolean(connectingCameraIds[focusedCamera.id])}
               />
               <div className="viewport-hud-top">
                 <div style={{ display: 'flex', gap: 6 }}>
                   {streamsByCamera[focusedCamera.id] ? (
                     <span className="hud-pill live-dot">LIVE</span>
+                  ) : connectingCameraIds[focusedCamera.id] ? (
+                    <span className="hud-pill">CONNECTING…</span>
                   ) : (
                     <span className="hud-pill">SNAPSHOT</span>
                   )}
@@ -419,6 +463,7 @@ export function CamerasView({
           {cameras.map((cam) => {
             const session = streamsByCamera[cam.id]
             const busy = busyByCamera[cam.id]
+            const isConnecting = Boolean(connectingCameraIds[cam.id] || busy === 'stream')
             const camNvr = nvrStatus.cameras[cam.id]
             const isNvrOn = Boolean(
               camNvr &&
@@ -429,14 +474,20 @@ export function CamerasView({
             return (
               <article key={cam.id} className="camera-card">
                 <div className="camera-viewport">
-                  <LiveVideoPlayer camera={cam} session={session} />
+                  <LiveVideoPlayer
+                    camera={cam}
+                    session={session}
+                    isConnecting={isConnecting}
+                  />
                   <div className="viewport-hud-top">
                     <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                       {session ? (
                         <span className="hud-pill live-dot">LIVE</span>
+                      ) : isConnecting ? (
+                        <span className="hud-pill">CONNECTING…</span>
                       ) : (
                         <span className="hud-pill">
-                          {cam.online ? 'READY' : 'OFFLINE'}
+                          {cam.online ? 'PAUSED' : 'OFFLINE'}
                         </span>
                       )}
                       {isNvrOn ? (
@@ -457,7 +508,7 @@ export function CamerasView({
                     <button
                       type="button"
                       className="btn btn-icon"
-                      style={{ background: 'rgba(9,13,19,0.75)' }}
+                      style={{ background: 'rgba(9,13,19,0.75)', color: '#edf2f7', borderColor: 'rgba(255,255,255,0.16)' }}
                       onClick={() => onSelectFocusCamera(cam.id)}
                       title="Expand into Live Theater view"
                     >
@@ -474,7 +525,7 @@ export function CamerasView({
                         {cam.model} · Last motion {formatRelativeTime(cam.lastMotionAt)}
                       </div>
                       {camNvr?.lastError && isNvrOn && (
-                        <div style={{ fontSize: 11, color: '#fbbf24', marginTop: 2 }}>
+                        <div style={{ fontSize: 11, color: 'var(--text-warn)', marginTop: 2 }}>
                           {camNvr.lastError}
                         </div>
                       )}
@@ -513,7 +564,7 @@ export function CamerasView({
                       <button
                         type="button"
                         className="btn btn-primary btn-sm"
-                        disabled={Boolean(busy)}
+                        disabled={Boolean(busy) || isConnecting}
                         onClick={() =>
                           void runBusy(cam.id, 'stream', () =>
                             onStartStream(cam.id),
@@ -521,7 +572,7 @@ export function CamerasView({
                         }
                       >
                         <Play size={12} />
-                        {busy === 'stream' ? 'Starting…' : 'Live View'}
+                        {isConnecting ? 'Connecting…' : 'Go Live'}
                       </button>
                     )}
 
