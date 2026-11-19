@@ -188,179 +188,170 @@ export function PackageAiView({
           </div>
 
           <div className="field">
-            <label htmlFor="ai-interval">Periodic Background Scan Interval</label>
-            <select
-              id="ai-interval"
-              className="select"
-              value={ai.intervalMinutes}
-              onChange={(e) =>
-                void onUpdateSettings({
-                  packageAi: { intervalMinutes: Number(e.target.value) },
-                })
-              }
-            >
-              <option value={0}>Event-triggered only (Off)</option>
-              <option value={5}>Every 5 minutes</option>
-              <option value={10}>Every 10 minutes</option>
-              <option value={15}>Every 15 minutes</option>
-              <option value={30}>Every 30 minutes</option>
-            </select>
-          </div>
-
-          <div className="field">
-            <label htmlFor="ai-confidence">
-              Minimum Confidence Threshold:{' '}
-              <span className="mono">{Math.round(ai.minConfidence * 100)}%</span>
-            </label>
-            <input
-              id="ai-confidence"
-              type="range"
-              min={50}
-              max={95}
-              step={5}
-              value={Math.round(ai.minConfidence * 100)}
-              onChange={(e) =>
-                void onUpdateSettings({
-                  packageAi: { minConfidence: Number(e.target.value) / 100 },
-                })
-              }
-            />
-          </div>
-
-          <div className="field">
-            <label htmlFor="ai-cooldown">
-              Notification Cooldown:{' '}
-              <span className="mono">{ai.cooldownMinutes} min</span>
-            </label>
-            <input
-              id="ai-cooldown"
-              type="range"
-              min={1}
-              max={30}
-              step={1}
-              value={ai.cooldownMinutes}
-              onChange={(e) =>
-                void onUpdateSettings({
-                  packageAi: { cooldownMinutes: Number(e.target.value) },
-                })
-              }
-            />
-          </div>
-
-          <div
-            style={{
-              paddingTop: 8,
-              borderTop: '1px solid var(--border-subtle)',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 11,
-            }}
-          >
-            <div style={{ fontWeight: 600, fontSize: 13 }}>
-              Windows Alerts &amp; Sound Chime
-            </div>
-
-            <div className="toggle-row" style={{ padding: '4px 0' }}>
-              <div>
-                <div className="toggle-label-main">Windows Desktop Toast</div>
-                <div className="toggle-label-sub">
-                  Native Windows Action Center notification on detection
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={ai.desktopNotifications}
-                className={`switch ${ai.desktopNotifications ? 'on' : ''}`}
-                onClick={() =>
+            <label htmlFor="ai-sound">Alert Sound</label>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <select
+                id="ai-sound"
+                className="select"
+                value={ai.alertSound}
+                onChange={(e) =>
                   void onUpdateSettings({
                     packageAi: {
-                      desktopNotifications: !ai.desktopNotifications,
+                      alertSound: e.target.value as AlertSoundProfile,
                     },
                   })
                 }
-              />
+              >
+                {SOUND_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => playAlertChime(ai.alertSound, ai.alertVolume)}
+                title="Preview alert chime"
+              >
+                <Volume2 size={14} />
+                Preview
+              </button>
             </div>
+          </div>
 
-            <div className="field">
-              <label htmlFor="ai-sound">Alert Sound Profile</label>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <select
-                  id="ai-sound"
-                  className="select"
-                  value={ai.alertSound}
+          <button
+            id="btn-test-package-alert"
+            type="button"
+            className="btn btn-primary"
+            onClick={() => void onTestAlert()}
+          >
+            <Bell size={14} />
+            Test Alert &amp; Sound
+          </button>
+
+          <details className="advanced-drawer">
+            <summary>Advanced Detection Options</summary>
+            <div className="advanced-drawer-body">
+              <div className="field">
+                <label htmlFor="ai-hint">Custom Porch / Drop-Zone Hint (optional)</label>
+                <input
+                  id="ai-hint"
+                  type="text"
+                  className="input"
+                  placeholder="e.g. Couriers leave boxes beside the brick pillar or steps"
+                  value={ai.customPromptHint}
                   onChange={(e) =>
                     void onUpdateSettings({
-                      packageAi: {
-                        alertSound: e.target.value as AlertSoundProfile,
-                      },
+                      packageAi: { customPromptHint: e.target.value },
+                    })
+                  }
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="ai-interval">Periodic Background Scan Interval</label>
+                <select
+                  id="ai-interval"
+                  className="select"
+                  value={ai.intervalMinutes}
+                  onChange={(e) =>
+                    void onUpdateSettings({
+                      packageAi: { intervalMinutes: Number(e.target.value) },
                     })
                   }
                 >
-                  {SOUND_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
+                  <option value={0}>Event-triggered only (Recommended)</option>
+                  <option value={5}>Every 5 minutes</option>
+                  <option value={10}>Every 10 minutes</option>
+                  <option value={15}>Every 15 minutes</option>
+                  <option value={30}>Every 30 minutes</option>
                 </select>
+              </div>
+
+              <div className="field">
+                <label htmlFor="ai-confidence">
+                  Minimum Confidence:{' '}
+                  <span className="mono">{Math.round(ai.minConfidence * 100)}%</span>
+                </label>
+                <input
+                  id="ai-confidence"
+                  type="range"
+                  min={50}
+                  max={95}
+                  step={5}
+                  value={Math.round(ai.minConfidence * 100)}
+                  onChange={(e) =>
+                    void onUpdateSettings({
+                      packageAi: { minConfidence: Number(e.target.value) / 100 },
+                    })
+                  }
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="ai-cooldown">
+                  Alert Cooldown:{' '}
+                  <span className="mono">{ai.cooldownMinutes} min</span>
+                </label>
+                <input
+                  id="ai-cooldown"
+                  type="range"
+                  min={1}
+                  max={30}
+                  step={1}
+                  value={ai.cooldownMinutes}
+                  onChange={(e) =>
+                    void onUpdateSettings({
+                      packageAi: { cooldownMinutes: Number(e.target.value) },
+                    })
+                  }
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="ai-volume">
+                  Alert Volume:{' '}
+                  <span className="mono">{Math.round(ai.alertVolume * 100)}%</span>
+                </label>
+                <input
+                  id="ai-volume"
+                  type="range"
+                  min={10}
+                  max={100}
+                  step={5}
+                  value={Math.round(ai.alertVolume * 100)}
+                  onChange={(e) =>
+                    void onUpdateSettings({
+                      packageAi: { alertVolume: Number(e.target.value) / 100 },
+                    })
+                  }
+                />
+              </div>
+
+              <div className="toggle-row" style={{ padding: '4px 0' }}>
+                <div>
+                  <div className="toggle-label-main">Windows Desktop Toast</div>
+                  <div className="toggle-label-sub">
+                    Show native Windows notification on package detection
+                  </div>
+                </div>
                 <button
                   type="button"
-                  className="btn btn-sm"
-                  onClick={() => playAlertChime(ai.alertSound, ai.alertVolume)}
-                  title="Preview alert chime"
-                >
-                  <Volume2 size={14} />
-                  Preview
-                </button>
+                  role="switch"
+                  aria-checked={ai.desktopNotifications}
+                  className={`switch ${ai.desktopNotifications ? 'on' : ''}`}
+                  onClick={() =>
+                    void onUpdateSettings({
+                      packageAi: {
+                        desktopNotifications: !ai.desktopNotifications,
+                      },
+                    })
+                  }
+                />
               </div>
             </div>
-
-            <div className="field">
-              <label htmlFor="ai-volume">
-                Alert Volume:{' '}
-                <span className="mono">{Math.round(ai.alertVolume * 100)}%</span>
-              </label>
-              <input
-                id="ai-volume"
-                type="range"
-                min={10}
-                max={100}
-                step={5}
-                value={Math.round(ai.alertVolume * 100)}
-                onChange={(e) =>
-                  void onUpdateSettings({
-                    packageAi: { alertVolume: Number(e.target.value) / 100 },
-                  })
-                }
-              />
-            </div>
-
-            <div className="field">
-              <label htmlFor="ai-hint">Custom Porch / Drop-Zone Hint (optional)</label>
-              <input
-                id="ai-hint"
-                type="text"
-                className="input"
-                placeholder="e.g. Couriers place boxes behind the brick pillar or on the mat"
-                value={ai.customPromptHint}
-                onChange={(e) =>
-                  void onUpdateSettings({
-                    packageAi: { customPromptHint: e.target.value },
-                  })
-                }
-              />
-            </div>
-
-            <button
-              id="btn-test-package-alert"
-              type="button"
-              className="btn btn-primary"
-              onClick={() => void onTestAlert()}
-            >
-              <Bell size={14} />
-              Test Windows Notification &amp; Sound
-            </button>
-          </div>
+          </details>
         </div>
       </section>
 

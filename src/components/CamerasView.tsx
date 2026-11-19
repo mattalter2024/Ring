@@ -56,9 +56,6 @@ export function CamerasView({
   connectingCameraIds,
   autoLiveEnabled,
   nvrStatus,
-  nvrBusy,
-  recordingsCount,
-  packageDetections,
   defaultCaptureSeconds,
   focusedCameraId,
   onSelectFocusCamera,
@@ -69,8 +66,6 @@ export function CamerasView({
   onStopStream,
   onStreamStalled,
   onCaptureRecording,
-  onToggleAllRecording,
-  onToggleCameraContinuous,
   onOpenTimeline,
   onCaptureSnapshot,
   onScanPackages,
@@ -99,7 +94,6 @@ export function CamerasView({
 
   const onlineCount = cameras.filter((c) => c.online).length
   const liveCount = Object.keys(streamsByCamera).length
-  const positivePackages = packageDetections.filter((d) => d.packageDetected).length
 
   const focusedCamera = focusedCameraId
     ? cameras.find((c) => c.id === focusedCameraId) ?? cameras[0] ?? null
@@ -107,132 +101,57 @@ export function CamerasView({
 
   return (
     <div>
-      <section className="telemetry-strip" aria-label="System telemetry">
-        <div className="telemetry-card">
-          <span className="telemetry-label">Live Feeds</span>
-          <span className="telemetry-value">
-            {liveCount}/{onlineCount}
-          </span>
-          <span className="telemetry-note">
-            {liveCount > 0 ? 'Streaming live video' : `${onlineCount} camera(s) online`}
-          </span>
-        </div>
-        <div className="telemetry-card">
-          <span className="telemetry-label">Continuous NVR</span>
-          <span
-            className="telemetry-value"
-            style={{ color: nvrStatus.active ? 'var(--text-alert)' : undefined }}
-          >
-            {nvrStatus.activeCameraCount}/{cameras.length}
-          </span>
-          <span className="telemetry-note">
-            {nvrStatus.active
-              ? `${nvrStatus.totalSegmentsCaptured} rolling MP4 segment(s) saved`
-              : 'All-camera timeline recorder idle'}
-          </span>
-        </div>
-        <div className="telemetry-card">
-          <span className="telemetry-label">Local MP4 Vault</span>
-          <span className="telemetry-value">{recordingsCount}</span>
-          <span className="telemetry-note">Saved to Windows folder</span>
-        </div>
-        <div className="telemetry-card">
-          <span className="telemetry-label">AI Package Alerts</span>
-          <span className="telemetry-value">{positivePackages}</span>
-          <span className="telemetry-note">Detected across scans</span>
-        </div>
-      </section>
-
       {cameras.length > 0 && (
-        <section className="panel nvr-banner" aria-label="Live wall and all-camera NVR controls">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <div className="wall-toolbar" aria-label="Live wall controls">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <span className={`chip ${liveCount > 0 ? 'ok' : ''}`}>
-              <Circle
-                size={8}
-                fill="currentColor"
-              />
-              {liveCount > 0 ? `${liveCount}/${cameras.length} LIVE` : 'CONNECTING LIVE'}
+              <Circle size={8} fill="currentColor" />
+              {liveCount}/{onlineCount} Live
             </span>
-            <span className={`chip ${nvrStatus.active ? 'alert' : ''}`}>
-              <Circle
-                size={9}
-                fill={nvrStatus.active ? '#ef4444' : 'currentColor'}
-                color={nvrStatus.active ? '#ef4444' : 'currentColor'}
-              />
-              {nvrStatus.active ? '24/7 NVR RECORDING' : 'NVR STANDBY'}
-            </span>
-            <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
-              {nvrStatus.active ? (
+            {nvrStatus.active && (
+              <span className="chip alert">
+                <Circle size={8} fill="#ef4444" color="#ef4444" />
+                Recording 24/7
+              </span>
+            )}
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => {
+                if (autoLiveEnabled && liveCount > 0) {
+                  void onStopAllLive()
+                } else {
+                  onToggleAutoLive(true)
+                  void onStartAllLive()
+                }
+              }}
+              title="Toggle live streaming across all cameras"
+            >
+              {autoLiveEnabled && liveCount > 0 ? (
                 <>
-                  Recording <strong>{nvrStatus.activeCameraCount}/{cameras.length}</strong>{' '}
-                  camera(s) in {Math.round((nvrStatus.segmentSeconds / 60) * 10) / 10}m segments
-                  — Live Wall shares the same NVR feed with zero extra Ring connection.
+                  <Square size={11} />
+                  Pause Live
                 </>
               ) : (
                 <>
-                  Cameras stream live automatically while you view this page. Enable{' '}
-                  <strong>Record All Cameras</strong> for 24/7 Timeline coverage.
+                  <Play size={12} />
+                  Resume Live
                 </>
               )}
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', flexShrink: 0 }}>
-            <button
-              type="button"
-              className={`btn btn-sm ${autoLiveEnabled ? 'btn-primary' : ''}`}
-              onClick={() => onToggleAutoLive(!autoLiveEnabled)}
-              title="Automatically keep all cameras streaming live while on Live Cameras"
-            >
-              Auto-Live: {autoLiveEnabled ? 'ON' : 'OFF'}
             </button>
-            {liveCount < onlineCount ? (
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={() => void onStartAllLive()}
-              >
-                <Play size={12} />
-                Stream All Live
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="btn btn-sm"
-                onClick={() => void onStopAllLive()}
-              >
-                <Square size={11} />
-                Pause All Live
-              </button>
-            )}
             <button
               type="button"
               className="btn btn-sm"
               onClick={onOpenTimeline}
             >
               <Clock size={13} />
-              Open Timeline
-            </button>
-            <button
-              type="button"
-              className={`btn btn-sm ${nvrStatus.active ? 'btn-danger' : 'btn-primary'}`}
-              disabled={nvrBusy}
-              onClick={() => void onToggleAllRecording()}
-            >
-              {nvrStatus.active ? (
-                <>
-                  <Square size={12} fill="currentColor" />
-                  {nvrBusy ? 'Stopping…' : 'Stop All Recording'}
-                </>
-              ) : (
-                <>
-                  <Circle size={11} fill="#ef4444" color="#ef4444" />
-                  {nvrBusy ? 'Starting…' : 'Record All Cameras'}
-                </>
-              )}
+              Timeline
             </button>
           </div>
-        </section>
+        </div>
       )}
 
       {focusedCamera ? (
@@ -552,17 +471,30 @@ export function CamerasView({
                   </div>
 
                   <div className="camera-actions">
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      disabled={Boolean(busy)}
+                      onClick={() =>
+                        void runBusy(cam.id, 'ai', () => onScanPackages(cam.id))
+                      }
+                      title="Scan this camera for delivered packages with AI Vision"
+                    >
+                      <PackageSearch size={13} />
+                      {busy === 'ai' ? 'Scanning…' : 'AI Scan'}
+                    </button>
+
                     {session ? (
                       <button
                         type="button"
-                        className="btn btn-danger btn-sm"
+                        className="btn btn-icon"
                         disabled={Boolean(busy)}
                         onClick={() =>
                           void runBusy(cam.id, 'stop', () => onStopStream(cam.id))
                         }
+                        title="Pause live video feed"
                       >
                         <Square size={12} />
-                        Stop
                       </button>
                     ) : (
                       <button
@@ -576,66 +508,9 @@ export function CamerasView({
                         }
                       >
                         <Play size={12} />
-                        {isConnecting ? 'Connecting…' : 'Go Live'}
+                        {isConnecting ? 'Connecting…' : 'Play Live'}
                       </button>
                     )}
-
-                    <button
-                      type="button"
-                      className={`btn btn-sm ${isNvrOn ? 'btn-danger' : ''}`}
-                      disabled={Boolean(busy)}
-                      onClick={() =>
-                        void runBusy(cam.id, 'nvr', () =>
-                          onToggleCameraContinuous(cam.id, !isNvrOn),
-                        )
-                      }
-                      title={
-                        isNvrOn
-                          ? 'Stop continuous NVR recording for this camera'
-                          : 'Start continuous rolling MP4 recording for this camera'
-                      }
-                    >
-                      {isNvrOn ? (
-                        <>
-                          <Square size={11} fill="currentColor" />
-                          Stop NVR
-                        </>
-                      ) : (
-                        <>
-                          <Circle size={11} fill="#ef4444" color="#ef4444" />
-                          {busy === 'nvr' ? 'Starting…' : 'Continuous'}
-                        </>
-                      )}
-                    </button>
-
-                    {!isNvrOn && (
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        disabled={cam.isRecording || Boolean(busy)}
-                        onClick={() =>
-                          void runBusy(cam.id, 'rec', () =>
-                            onCaptureRecording(cam.id, defaultCaptureSeconds),
-                          )
-                        }
-                      >
-                        {cam.isRecording
-                          ? 'Capturing…'
-                          : `Clip ${defaultCaptureSeconds}s`}
-                      </button>
-                    )}
-
-                    <button
-                      type="button"
-                      className="btn btn-warn btn-sm"
-                      disabled={Boolean(busy)}
-                      onClick={() =>
-                        void runBusy(cam.id, 'ai', () => onScanPackages(cam.id))
-                      }
-                    >
-                      <PackageSearch size={13} />
-                      {busy === 'ai' ? 'Scanning…' : 'Scan Packages'}
-                    </button>
 
                     {cam.hasLight && (
                       <button

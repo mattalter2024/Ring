@@ -4,7 +4,6 @@ import {
   Camera,
   ChevronLeft,
   ChevronRight,
-  Circle,
   Crosshair,
   Download,
   FastForward,
@@ -18,7 +17,6 @@ import {
   Rewind,
   SkipBack,
   SkipForward,
-  Square,
   Star,
   ZoomIn,
   ZoomOut,
@@ -78,9 +76,7 @@ export function TimelineView({
   events,
   packageDetections,
   nvrStatus,
-  nvrBusy,
   defaultCaptureSeconds,
-  onToggleAllRecording,
   onSyncCloudEvents,
   onCaptureRecording,
   onToggleStar,
@@ -1295,32 +1291,30 @@ export function TimelineView({
         <aside className="panel">
           <div className="panel-header">
             <h3>Clips &amp; Details</h3>
-            <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
-              {dateKey}
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                {dateKey}
+              </span>
+              <button
+                type="button"
+                className="btn btn-icon"
+                title="Sync Ring cloud events"
+                aria-label="Sync Ring cloud events"
+                disabled={syncingEvents}
+                onClick={async () => {
+                  setSyncingEvents(true)
+                  try {
+                    await onSyncCloudEvents()
+                  } finally {
+                    setSyncingEvents(false)
+                  }
+                }}
+              >
+                <RefreshCw size={13} className={syncingEvents ? 'spin' : ''} />
+              </button>
+            </div>
           </div>
           <div className="panel-body form-stack">
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(3, 1fr)',
-                gap: 8,
-              }}
-            >
-              <div className="mini-stat-box">
-                <span className="telemetry-label">Cam Clips</span>
-                <strong className="mono">{activeCameraRecordingsOnDay.length}</strong>
-              </div>
-              <div className="mini-stat-box">
-                <span className="telemetry-label">Day Events</span>
-                <strong className="mono">{dayEvents.length}</strong>
-              </div>
-              <div className="mini-stat-box">
-                <span className="telemetry-label">Packages</span>
-                <strong className="mono">{dayPackageHits.length}</strong>
-              </div>
-            </div>
-
             {selectedEvent ? (
               <div className="inspector-box">
                 <span className="chip warn">{selectedEvent.kind}</span>
@@ -1354,14 +1348,14 @@ export function TimelineView({
                   {activeClip.fileName}
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
-                  {formatBytes(activeClip.sizeBytes)} · Trigger: {activeClip.trigger}
+                  {formatBytes(activeClip.sizeBytes)} · {activeClip.trigger}
                 </div>
               </div>
             ) : null}
 
             <div className="field">
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
-                <label style={{ margin: 0 }}>Recordings List</label>
+                <label style={{ margin: 0 }}>Recordings</label>
                 <div className="segmented" role="group" aria-label="Filter clips list">
                   <button
                     type="button"
@@ -1386,8 +1380,8 @@ export function TimelineView({
                 {displayedClipList.length === 0 ? (
                   <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 0' }}>
                     {clipListScope === 'camera'
-                      ? `No clips recorded for ${activeCameraTrack?.name ?? 'this camera'} on ${dateKey}.`
-                      : `No local clips recorded on ${dateKey}.`}
+                      ? `No clips for ${activeCameraTrack?.name ?? 'this camera'} on ${dateKey}.`
+                      : `No local clips on ${dateKey}.`}
                   </div>
                 ) : (
                   displayedClipList.map((clip) => (
@@ -1418,69 +1412,6 @@ export function TimelineView({
                       <span className="chip">{clip.trigger}</span>
                     </button>
                   ))
-                )}
-              </div>
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <button
-                type="button"
-                className={`btn btn-sm ${nvrStatus.active ? 'btn-danger' : 'btn-primary'}`}
-                disabled={nvrBusy}
-                onClick={() => void onToggleAllRecording()}
-              >
-                {nvrStatus.active ? (
-                  <>
-                    <Square size={12} fill="currentColor" />
-                    Stop All-Camera NVR ({nvrStatus.activeCameraCount}/{cameras.length})
-                  </>
-                ) : (
-                  <>
-                    <Circle size={12} fill="currentColor" />
-                    Record All Cameras 24/7
-                  </>
-                )}
-              </button>
-
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  disabled={syncingEvents}
-                  onClick={async () => {
-                    setSyncingEvents(true)
-                    try {
-                      await onSyncCloudEvents()
-                    } finally {
-                      setSyncingEvents(false)
-                    }
-                  }}
-                >
-                  <RefreshCw size={13} className={syncingEvents ? 'spin' : ''} />
-                  {syncingEvents ? 'Syncing…' : 'Sync Events'}
-                </button>
-
-                {activeCameraCanRecord && activeCameraTrack && (
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    disabled={capturing}
-                    title={`Record a ${defaultCaptureSeconds}s MP4 clip from ${activeCameraTrack.name}`}
-                    onClick={async () => {
-                      setCapturing(true)
-                      try {
-                        await onCaptureRecording(
-                          activeCameraTrack.id,
-                          defaultCaptureSeconds,
-                        )
-                      } finally {
-                        setCapturing(false)
-                      }
-                    }}
-                  >
-                    <Film size={13} />
-                    {capturing ? 'Saving…' : `Clip ${defaultCaptureSeconds}s`}
-                  </button>
                 )}
               </div>
             </div>

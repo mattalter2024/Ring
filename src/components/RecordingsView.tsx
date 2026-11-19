@@ -8,7 +8,6 @@ import {
   Package,
   PlayCircle,
   RefreshCw,
-  Scissors,
   ShieldCheck,
   Star,
   Trash2,
@@ -52,8 +51,6 @@ export function RecordingsView({
   onExportRecording,
   onExportEvidenceBundle,
   onImportVideos,
-  onRescanStorage,
-  onPruneStorage,
   onOpenInFolder,
   onOpenRootFolder,
   onListCloudRecordings,
@@ -70,7 +67,6 @@ export function RecordingsView({
   const [loadingCloud, setLoadingCloud] = useState(false)
   const [downloadingId, setDownloadingId] = useState<string | null>(null)
   const [capturing, setCapturing] = useState(false)
-  const [storageBusy, setStorageBusy] = useState(false)
 
   useEffect(() => {
     if (!cloudCameraId && cameras[0]?.id) {
@@ -111,25 +107,20 @@ export function RecordingsView({
   const selectedLocal =
     filteredLocal.find((r) => r.id === selectedLocalId) ?? filteredLocal[0] ?? null
 
-  const quotaBytes =
-    storageStats.maxStorageGb > 0
-      ? storageStats.maxStorageGb * 1024 * 1024 * 1024
-      : 0
-  const usedPct =
-    quotaBytes > 0
-      ? Math.min(100, (storageStats.totalBytes / quotaBytes) * 100)
-      : 0
-
   return (
     <div>
-      {/* Local Video Storage Health & Quota Bar */}
+      {/* Compact Vault Summary Bar */}
       <section className="panel storage-banner" aria-label="Local video storage status">
         <div className="storage-banner-top">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 11, minWidth: 0 }}>
-            <HardDrive size={20} color="var(--accent)" />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+            <HardDrive size={18} color="var(--accent)" />
             <div style={{ minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 14 }}>
-                Local Windows Video Storage
+              <div style={{ fontWeight: 600, fontSize: 13.5 }}>
+                {formatBytes(storageStats.totalBytes)} used
+                {storageStats.maxStorageGb > 0 ? ` / ${storageStats.maxStorageGb} GB` : ''}
+                {storageStats.freeDiskBytes !== null
+                  ? ` · ${formatBytes(storageStats.freeDiskBytes)} free`
+                  : ''}
               </div>
               <div
                 className="mono"
@@ -160,74 +151,11 @@ export function RecordingsView({
             <button
               type="button"
               className="btn btn-sm"
-              disabled={storageBusy}
-              onClick={async () => {
-                setStorageBusy(true)
-                try {
-                  await onRescanStorage()
-                } finally {
-                  setStorageBusy(false)
-                }
-              }}
-            >
-              <RefreshCw size={13} />
-              Rescan Disk
-            </button>
-            <button
-              type="button"
-              className="btn btn-sm"
-              disabled={storageBusy}
-              onClick={async () => {
-                setStorageBusy(true)
-                try {
-                  await onPruneStorage()
-                } finally {
-                  setStorageBusy(false)
-                }
-              }}
-              title="Enforce retention days and storage quota cap (keeps starred clips)"
-            >
-              <Scissors size={13} />
-              Prune Old Clips
-            </button>
-            <button
-              type="button"
-              className="btn btn-sm"
               onClick={() => void onOpenRootFolder()}
             >
               <FolderOpen size={13} />
               Open Folder
             </button>
-          </div>
-        </div>
-
-        <div className="storage-meter-row">
-          <div className="storage-progress-track">
-            <div
-              className={`storage-progress-fill ${usedPct > 85 ? 'warn' : ''}`}
-              style={{ width: `${Math.max(storageStats.totalBytes > 0 ? 2 : 0, usedPct)}%` }}
-            />
-          </div>
-          <div className="storage-meta-row mono">
-            <span>
-              Used: {formatBytes(storageStats.totalBytes)}
-              {storageStats.maxStorageGb > 0
-                ? ` / ${storageStats.maxStorageGb} GB quota`
-                : ' (Unlimited quota)'}
-            </span>
-            <span>
-              {storageStats.totalClips} clip{storageStats.totalClips === 1 ? '' : 's'} ·{' '}
-              {storageStats.starredClips} protected
-            </span>
-            <span>
-              Retention:{' '}
-              {storageStats.retentionDays > 0
-                ? `${storageStats.retentionDays} days`
-                : 'Keep forever'}
-            </span>
-            {storageStats.freeDiskBytes !== null && (
-              <span>Drive free: {formatBytes(storageStats.freeDiskBytes)}</span>
-            )}
           </div>
         </div>
       </section>

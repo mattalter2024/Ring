@@ -1,15 +1,11 @@
 import {
   AlertTriangle,
-  BellRing,
   Circle,
-  DoorOpen,
   HardDrive,
   PackageCheck,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
-  Square,
-  Zap,
 } from 'lucide-react'
 import type {
   ConnectionStatus,
@@ -39,31 +35,31 @@ interface TopBarProps {
 const TAB_COPY: Record<NavTab, { title: string; subtitle: string }> = {
   cameras: {
     title: 'Live Cameras',
-    subtitle: 'Real-time HLS video streams, continuous all-camera NVR recording, and instant snapshots',
-  },
-  nvr: {
-    title: '24/7 NVR & Storage Console',
-    subtitle: 'Autonomous continuous recording, external USB/HDD/NAS drive pool, failover, and health watchdog',
+    subtitle: 'Live camera wall and quick controls',
   },
   timeline: {
-    title: 'Video & Event Timeline',
-    subtitle: 'Scrub across continuous recordings, camera motion, doorbell rings, AI packages, and sensor events',
+    title: 'Timeline',
+    subtitle: 'Scrub recordings and security events',
   },
   recordings: {
-    title: 'Local Video Storage & Cloud Vault',
-    subtitle: 'Manage local MP4 storage, disk quotas, retention rules, exports, and Ring Cloud downloads',
+    title: 'Recordings',
+    subtitle: 'Saved MP4 clips and Ring Cloud events',
   },
-  sensors: {
-    title: 'Sensors & Event Stream',
-    subtitle: 'Ring Alarm modes, door/window contacts, motion sensors, and live activity feed',
+  nvr: {
+    title: 'NVR & Storage',
+    subtitle: '24/7 recording, drives, and retention',
   },
   'package-ai': {
-    title: 'AI Package Automation',
-    subtitle: 'Cloud Vision package detection rules, Windows toast alerts, and sound chimes',
+    title: 'AI Packages',
+    subtitle: 'Automatic box detection and alerts',
+  },
+  sensors: {
+    title: 'Sensors',
+    subtitle: 'Ring Alarm mode, sensors, and activity',
   },
   settings: {
-    title: 'Settings & Connections',
-    subtitle: 'Ring 2FA / Refresh Token auth, continuous NVR rules, Vision keys, and Windows preferences',
+    title: 'Settings',
+    subtitle: 'Ring account, Vision AI, and app preferences',
   },
 }
 
@@ -74,9 +70,7 @@ export function TopBar({
   nvrStatus,
   storageStats,
   cameraCount,
-  nvrBusy,
   isRefreshing,
-  onToggleAllRecording,
   onOpenNvr,
   onRefresh,
   onSimulateDemoEvent,
@@ -90,7 +84,7 @@ export function TopBar({
         ? 'Armed Home'
         : primaryLocation?.alarmMode === 'none'
           ? 'Disarmed'
-          : 'No Alarm'
+          : null
 
   const showStorageAlert =
     storageStats.usingFailover || storageStats.diskHealth !== 'healthy'
@@ -123,7 +117,7 @@ export function TopBar({
                 : 'btn-warn'
             }`}
             onClick={onOpenNvr}
-            title="Open NVR & Storage Console to inspect drive status and free space"
+            title="Open NVR & Storage to inspect drive status"
           >
             {storageStats.usingFailover ? (
               <HardDrive size={13} />
@@ -136,69 +130,37 @@ export function TopBar({
 
         {cameraCount > 0 && (
           <button
-            id="btn-topbar-nvr-toggle"
+            id="btn-topbar-nvr-status"
             type="button"
-            className={`btn btn-sm ${nvrStatus.active ? 'btn-danger' : 'btn-primary'}`}
-            disabled={nvrBusy}
-            onClick={onToggleAllRecording}
-            title={
-              nvrStatus.active
-                ? `Stop continuous live-stream recording (${nvrStatus.activeCameraCount} camera(s), ${nvrStatus.totalSegmentsCaptured} segments saved)`
-                : 'Continuously record live streams from all cameras into local MP4 segments for the Timeline'
-            }
+            className="btn btn-sm"
+            onClick={onOpenNvr}
+            title="Open NVR & Storage to manage 24/7 recording"
           >
-            {nvrStatus.active ? (
-              <>
-                <Square size={12} fill="currentColor" />
-                {nvrBusy
-                  ? 'Stopping…'
-                  : `Stop NVR (${nvrStatus.activeCameraCount}/${cameraCount})`}
-              </>
-            ) : (
-              <>
-                <Circle size={11} fill="#ef4444" color="#ef4444" />
-                {nvrBusy ? 'Starting…' : 'Record All Cameras'}
-              </>
-            )}
+            <Circle
+              size={8}
+              fill={nvrStatus.active ? '#ef4444' : 'currentColor'}
+              color={nvrStatus.active ? '#ef4444' : 'currentColor'}
+            />
+            {nvrStatus.active
+              ? `24/7 NVR (${nvrStatus.activeCameraCount}/${cameraCount})`
+              : 'NVR Standby'}
           </button>
         )}
 
         {connection.mode === 'demo' && (
-          <>
-            <button
-              id="btn-sim-package"
-              type="button"
-              className="btn btn-warn btn-sm"
-              onClick={() => onSimulateDemoEvent('package-delivery')}
-              title="Simulate delivery motion + run AI package detection"
-            >
-              <PackageCheck size={14} />
-              Simulate Package
-            </button>
-            <button
-              id="btn-sim-doorbell"
-              type="button"
-              className="btn btn-sm"
-              onClick={() => onSimulateDemoEvent('doorbell')}
-              title="Simulate front doorbell press"
-            >
-              <BellRing size={14} />
-              Ring Bell
-            </button>
-            <button
-              id="btn-sim-contact"
-              type="button"
-              className="btn btn-sm"
-              onClick={() => onSimulateDemoEvent('contact-open')}
-              title="Toggle Front Door contact sensor"
-            >
-              <DoorOpen size={14} />
-              Toggle Door
-            </button>
-          </>
+          <button
+            id="btn-sim-package"
+            type="button"
+            className="btn btn-warn btn-sm"
+            onClick={() => onSimulateDemoEvent('package-delivery')}
+            title="Simulate a package delivery event in Demo Mode"
+          >
+            <PackageCheck size={14} />
+            Test Delivery
+          </button>
         )}
 
-        {primaryLocation?.hasAlarm && (
+        {primaryLocation?.hasAlarm && alarmLabel && (
           <span
             className={`chip ${
               primaryLocation.alarmMode === 'none' ? '' : 'ok'
@@ -213,22 +175,15 @@ export function TopBar({
           </span>
         )}
 
-        {connection.mode === 'live' && (
-          <span className="chip accent">
-            <Zap size={12} />
-            Live Ring API
-          </span>
-        )}
-
         <button
           id="btn-refresh-devices"
           type="button"
-          className="btn btn-sm"
+          className="btn btn-icon"
           onClick={onRefresh}
           disabled={isRefreshing}
+          title="Refresh Ring devices"
         >
-          <RefreshCw size={14} />
-          {isRefreshing ? 'Syncing…' : 'Sync'}
+          <RefreshCw size={14} className={isRefreshing ? 'spin' : ''} />
         </button>
       </div>
     </header>

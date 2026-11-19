@@ -67,6 +67,17 @@ export function Sidebar({
       badgeTone: 'live',
     },
     {
+      id: 'timeline',
+      label: 'Timeline',
+      icon: Clock,
+    },
+    {
+      id: 'recordings',
+      label: 'Recordings',
+      icon: Film,
+      badge: recordingsCount > 0 ? String(recordingsCount) : undefined,
+    },
+    {
       id: 'nvr',
       label: 'NVR & Storage',
       icon: HardDrive,
@@ -74,29 +85,18 @@ export function Sidebar({
       badgeTone: nvrBadge?.tone,
     },
     {
-      id: 'timeline',
-      label: 'Timeline',
-      icon: Clock,
-    },
-    {
-      id: 'recordings',
-      label: 'Local Videos',
-      icon: Film,
-      badge: recordingsCount > 0 ? String(recordingsCount) : undefined,
-    },
-    {
-      id: 'sensors',
-      label: 'Sensors & Events',
-      icon: Radio,
-      badge: faultedSensorCount > 0 ? `${faultedSensorCount} OPEN` : undefined,
-      badgeTone: 'alert',
-    },
-    {
       id: 'package-ai',
-      label: 'AI Package Watch',
+      label: 'AI Packages',
       icon: Package,
       badge: detectedPackagesCount > 0 ? String(detectedPackagesCount) : undefined,
       badgeTone: detectedPackagesCount > 0 ? 'alert' : undefined,
+    },
+    {
+      id: 'sensors',
+      label: 'Sensors',
+      icon: Radio,
+      badge: faultedSensorCount > 0 ? `${faultedSensorCount} OPEN` : undefined,
+      badgeTone: 'alert',
     },
     {
       id: 'settings',

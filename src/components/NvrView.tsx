@@ -5,12 +5,10 @@ import {
   Bell,
   CheckCircle2,
   Circle,
-  Cpu,
   FolderOpen,
   HardDrive,
   Moon,
   Network,
-  Power,
   RefreshCw,
   Scissors,
   ShieldAlert,
@@ -122,15 +120,15 @@ export function NvrView({
 
   return (
     <div className="nvr-console">
-      {/* Failover / Disk Alert Banners */}
+      {/* Failover / Disk Alert Banners (only shown when action is needed) */}
       {storageStats.usingFailover && (
         <div className="nvr-alert-banner critical" role="alert">
           <ShieldAlert size={18} />
           <div style={{ flex: 1, minWidth: 0 }}>
-            <strong>Primary Storage Drive Offline — Automatic Failover Active</strong>
+            <strong>Primary Drive Offline — Failover Active</strong>
             <div className="mono" style={{ fontSize: 12, opacity: 0.9, marginTop: 2 }}>
-              Primary ({storageStats.recordingsDir}) is unreachable. Recording seamlessly to{' '}
-              {storageStats.activeRecordingsDir}. Reconnect your primary drive to auto-restore.
+              Recording to {storageStats.activeRecordingsDir}. Reconnect{' '}
+              {storageStats.recordingsDir} to auto-restore.
             </div>
           </div>
           <button
@@ -157,14 +155,14 @@ export function NvrView({
             <div style={{ flex: 1, minWidth: 0 }}>
               <strong>
                 {storageStats.diskHealth === 'critical'
-                  ? 'Critical Disk Space — Ring Buffer Floor Reached'
+                  ? 'Critical Disk Space — Auto-Pruning Old Clips'
                   : 'Low Disk Space Warning'}
               </strong>
               <div style={{ fontSize: 12, opacity: 0.9, marginTop: 2 }}>
                 {storageStats.freeDiskBytes !== null
-                  ? `${formatBytes(storageStats.freeDiskBytes)} free on active drive.`
+                  ? `${formatBytes(storageStats.freeDiskBytes)} free.`
                   : 'Low available storage.'}{' '}
-                RingWatch automatically recycles oldest unstarred segments to keep at least{' '}
+                Oldest unstarred clips are recycled automatically to keep at least{' '}
                 {storageStats.minFreeDiskGb} GB free.
               </div>
             </div>
@@ -187,7 +185,7 @@ export function NvrView({
           </div>
         )}
 
-      {/* UNVR System Status Hero */}
+      {/* NVR Status Hero & Drive Utilization */}
       <section className={`panel nvr-hero ${nvrStatus.active ? 'active' : ''}`}>
         <div className="nvr-hero-main">
           <div className="nvr-hero-left">
@@ -197,7 +195,7 @@ export function NvrView({
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <h2 style={{ margin: 0, fontSize: 16 }}>
-                  RingWatch Autonomous 24/7 NVR
+                  24/7 Continuous NVR
                 </h2>
                 <span className={`chip ${nvrStatus.active ? 'alert' : ''}`}>
                   <Circle
@@ -206,8 +204,8 @@ export function NvrView({
                     color={nvrStatus.active ? '#ef4444' : 'currentColor'}
                   />
                   {nvrStatus.active
-                    ? `24/7 RECORDING (${nvrStatus.activeCameraCount}/${cameras.length})`
-                    : 'STANDBY'}
+                    ? `Recording (${nvrStatus.activeCameraCount}/${cameras.length})`
+                    : 'Standby'}
                 </span>
                 <span className={`chip ${healthMeta.cls}`}>
                   {storageStats.diskHealth === 'healthy' ? (
@@ -217,27 +215,10 @@ export function NvrView({
                   )}
                   {healthMeta.label}
                 </span>
-                {nvrStatus.powerSaveBlocked && (
-                  <span className="chip accent" title="Windows sleep suspension is prevented while 24/7 recording is active">
-                    <Moon size={11} />
-                    Awake Lock Active
-                  </span>
-                )}
               </div>
               <div className="nvr-hero-sub mono">
-                <span>
-                  Vault: {storageStats.activeRecordingsDir}
-                </span>
-                <span>·</span>
-                <span>
-                  {nvrStatus.totalSegmentsCaptured} segments this session
-                </span>
-                <span>·</span>
-                <span>
-                  Watchdog: {nvrStatus.watchdogChecks} check{nvrStatus.watchdogChecks === 1 ? '' : 's'}
-                  {nvrStatus.lastHealthCheckAt
-                    ? ` (${formatRelativeTime(nvrStatus.lastHealthCheckAt)})`
-                    : ''}
+                <span title={storageStats.activeRecordingsDir}>
+                  {storageStats.activeRecordingsDir}
                 </span>
               </div>
             </div>
@@ -266,23 +247,6 @@ export function NvrView({
             <button
               type="button"
               className="btn"
-              disabled={actionBusy}
-              onClick={async () => {
-                setActionBusy(true)
-                try {
-                  await onRescanStorage()
-                  await refreshDrives()
-                } finally {
-                  setActionBusy(false)
-                }
-              }}
-            >
-              <RefreshCw size={14} />
-              Rescan
-            </button>
-            <button
-              type="button"
-              className="btn"
               onClick={() => void onOpenRootFolder()}
             >
               <FolderOpen size={14} />
@@ -291,15 +255,15 @@ export function NvrView({
           </div>
         </div>
 
-        {/* UniFi-style Segmented Drive Utilization Bar */}
+        {/* Segmented Drive Utilization Bar */}
         <div className="nvr-capacity-section">
           <div className="nvr-capacity-header">
             <span style={{ fontWeight: 600, fontSize: 13 }}>
-              Drive Allocation &amp; Retention Capacity
+              Drive Usage
             </span>
             <span className="mono" style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
               {totalDisk > 0
-                ? `${formatBytes(usedDisk)} used of ${formatBytes(totalDisk)} (${formatBytes(freeDisk)} free)`
+                ? `${formatBytes(usedDisk)} / ${formatBytes(totalDisk)} (${formatBytes(freeDisk)} free)`
                 : `${formatBytes(storageStats.totalBytes)} recorded`}
             </span>
           </div>
@@ -329,138 +293,49 @@ export function NvrView({
             </span>
             <span>
               <i className="dot protected" />
-              Protected Clips ({formatBytes(storageStats.protectedBytes)})
-            </span>
-            <span>
-              <i className="dot other" />
-              Other Drive Data ({formatBytes(otherDiskBytes)})
+              Protected ({formatBytes(storageStats.protectedBytes)})
             </span>
             <span>
               <i className="dot free" />
-              Free Space ({storageStats.freeDiskBytes !== null ? formatBytes(storageStats.freeDiskBytes) : '—'})
+              Free ({storageStats.freeDiskBytes !== null ? formatBytes(storageStats.freeDiskBytes) : '—'})
             </span>
-          </div>
-
-          {/* 4 UNVR Telemetry Metrics */}
-          <div className="nvr-kpi-grid">
-            <div className="nvr-kpi-card">
-              <span className="nvr-kpi-label">Estimated Capacity</span>
-              <strong className="nvr-kpi-value mono">
-                {storageStats.estimatedDaysRemaining !== null
-                  ? `${storageStats.estimatedDaysRemaining} days`
-                  : 'Calculating…'}
-              </strong>
-              <span className="nvr-kpi-sub">
-                {storageStats.maxStorageGb > 0
-                  ? `${storageStats.maxStorageGb} GB quota cap`
-                  : 'Full drive ring buffer'}
-              </span>
-            </div>
-            <div className="nvr-kpi-card">
-              <span className="nvr-kpi-label">24h Write Rate</span>
-              <strong className="nvr-kpi-value mono">
+            {storageStats.estimatedDaysRemaining !== null && (
+              <span className="mono" style={{ marginLeft: 'auto', color: 'var(--text-secondary)' }}>
+                Est. ~{storageStats.estimatedDaysRemaining}d capacity
                 {storageStats.writeRateBytesPerHour > 0
-                  ? `${formatBytes(storageStats.writeRateBytesPerHour)}/hr`
-                  : '0 B/hr'}
-              </strong>
-              <span className="nvr-kpi-sub">
-                {storageStats.totalClips} total clip{storageStats.totalClips === 1 ? '' : 's'} indexed
+                  ? ` · ${formatBytes(storageStats.writeRateBytesPerHour)}/hr`
+                  : ''}
+                {' · '}
+                {storageStats.totalClips} clip{storageStats.totalClips === 1 ? '' : 's'}
               </span>
-            </div>
-            <div className="nvr-kpi-card">
-              <span className="nvr-kpi-label">Free Disk Safety Floor</span>
-              <strong className="nvr-kpi-value mono">
-                {storageStats.freeDiskBytes !== null
-                  ? formatBytes(storageStats.freeDiskBytes)
-                  : '—'}
-              </strong>
-              <span className="nvr-kpi-sub">
-                Warn &lt; {storageStats.lowDiskWarningGb} GB · Prune &lt; {storageStats.minFreeDiskGb} GB
-              </span>
-            </div>
-            <div className="nvr-kpi-card">
-              <span className="nvr-kpi-label">Retention Window</span>
-              <strong className="nvr-kpi-value mono">
-                {storageStats.retentionDays > 0
-                  ? `${storageStats.retentionDays} days`
-                  : 'Unlimited'}
-              </strong>
-              <span className="nvr-kpi-sub">
-                {storageStats.starredClips} starred clip{storageStats.starredClips === 1 ? '' : 's'} locked
-              </span>
-            </div>
+            )}
           </div>
         </div>
       </section>
 
-      {/* Main 2-Column UNVR Grid */}
+      {/* Main 2-Column NVR Grid */}
       <div className="nvr-main-grid">
-        {/* Left Column: External Drives & Storage Pool + Per-Camera NVR Matrix */}
+        {/* Left Column: Storage Drives + Per-Camera Channels */}
         <div className="form-stack">
           <section className="panel">
             <div className="panel-header">
-              <div>
-                <h3>Storage Pool &amp; External Drives (USB / HDD / NAS)</h3>
-              </div>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() => void onChoosePrimaryFolder()}
-                >
-                  <FolderOpen size={13} />
-                  Custom Primary
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() => void onChooseFailoverFolder()}
-                >
-                  <FolderOpen size={13} />
-                  Custom Failover
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  disabled={loadingDrives}
-                  onClick={() => void refreshDrives()}
-                >
-                  <RefreshCw size={13} />
-                  {loadingDrives ? 'Scanning…' : 'Detect Drives'}
-                </button>
-              </div>
+              <h3>Storage Drives</h3>
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={loadingDrives}
+                onClick={() => void refreshDrives()}
+              >
+                <RefreshCw size={13} />
+                {loadingDrives ? 'Scanning…' : 'Detect Drives'}
+              </button>
             </div>
 
             <div className="panel-body form-stack">
-              <div className="nvr-paths-box mono">
-                <div>
-                  <span className="nvr-path-tag primary">PRIMARY</span>
-                  <span title={settings.recordingsDir}>{settings.recordingsDir}</span>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                  <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    <span className="nvr-path-tag failover">FAILOVER</span>
-                    <span title={settings.failoverRecordingsDir || 'Built-in local fallback'}>
-                      {settings.failoverRecordingsDir || 'Built-in Videos\\RingWatch fallback (automatic)'}
-                    </span>
-                  </div>
-                  {settings.failoverRecordingsDir && (
-                    <button
-                      type="button"
-                      className="btn btn-sm"
-                      style={{ padding: '2px 8px', fontSize: 11 }}
-                      onClick={() => void onClearFailover()}
-                    >
-                      Reset
-                    </button>
-                  )}
-                </div>
-              </div>
-
               {drives.length === 0 ? (
-                <div className="empty-state" style={{ padding: 24 }}>
-                  <HardDrive size={22} />
-                  <span>Click &ldquo;Detect Drives&rdquo; to inspect connected internal, USB, and network volumes.</span>
+                <div className="empty-state" style={{ padding: 20 }}>
+                  <HardDrive size={20} />
+                  <span>Click &ldquo;Detect Drives&rdquo; to see connected internal, USB, and NAS drives.</span>
                 </div>
               ) : (
                 <div className="drive-grid">
@@ -519,7 +394,7 @@ export function NvrView({
                                   ? 'External USB'
                                   : drive.driveType === 'network'
                                     ? 'Network / NAS'
-                                    : 'Internal Disk'}
+                                    : 'Internal'}
                               </div>
                             </div>
                           </div>
@@ -574,7 +449,7 @@ export function NvrView({
                                   await refreshDrives()
                                 }}
                               >
-                                Set Failover
+                                Failover
                               </button>
                             )}
                           </div>
@@ -584,21 +459,69 @@ export function NvrView({
                   })}
                 </div>
               )}
+
+              <details className="advanced-drawer">
+                <summary>Failover &amp; Custom Folders</summary>
+                <div className="advanced-drawer-body">
+                  <div className="nvr-paths-box mono">
+                    <div>
+                      <span className="nvr-path-tag primary">PRIMARY</span>
+                      <span title={settings.recordingsDir}>{settings.recordingsDir}</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                      <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        <span className="nvr-path-tag failover">FAILOVER</span>
+                        <span title={settings.failoverRecordingsDir || 'Built-in local fallback'}>
+                          {settings.failoverRecordingsDir || 'Automatic local fallback'}
+                        </span>
+                      </div>
+                      {settings.failoverRecordingsDir && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          style={{ padding: '2px 8px', fontSize: 11 }}
+                          onClick={() => void onClearFailover()}
+                        >
+                          Reset
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => void onChoosePrimaryFolder()}
+                    >
+                      <FolderOpen size={13} />
+                      Choose Primary Folder
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => void onChooseFailoverFolder()}
+                    >
+                      <FolderOpen size={13} />
+                      Choose Failover Folder
+                    </button>
+                  </div>
+                </div>
+              </details>
             </div>
           </section>
 
-          {/* Per-Camera 24/7 NVR Telemetry Matrix */}
+          {/* Per-Camera 24/7 Channels */}
           <section className="panel">
             <div className="panel-header">
-              <h3>Camera Recording Channels ({cameras.length})</h3>
+              <h3>Camera Channels ({cameras.length})</h3>
               <span className="chip">
                 <Activity size={12} />
-                {settings.continuousSegmentSeconds}s Segments
+                {settings.continuousSegmentSeconds}s clips
               </span>
             </div>
             <div className="panel-body">
               {cameras.length === 0 ? (
-                <div className="empty-state" style={{ padding: 28 }}>
+                <div className="empty-state" style={{ padding: 24 }}>
                   <span>Connect your Ring account in Settings to start 24/7 recording.</span>
                 </div>
               ) : (
@@ -615,10 +538,6 @@ export function NvrView({
                           : worker?.state === 'reconnecting' || worker?.state === 'connecting'
                             ? 'warn'
                             : ''
-                    const sharePct =
-                      storageStats.totalBytes > 0 && usage
-                        ? Math.round((usage.totalBytes / storageStats.totalBytes) * 100)
-                        : 0
                     return (
                       <div key={cam.id} className="nvr-cam-row">
                         <div style={{ minWidth: 0 }}>
@@ -628,29 +547,21 @@ export function NvrView({
                               {worker?.state ? worker.state.toUpperCase() : 'IDLE'}
                             </span>
                             {cam.batteryPercent !== null && (
-                              <span className="chip">Battery {cam.batteryPercent}%</span>
+                              <span className="chip">{cam.batteryPercent}%</span>
                             )}
                           </div>
                           <div className="mono nvr-cam-meta">
-                            <span>
-                              {worker?.segmentsCaptured ?? 0} segs
-                            </span>
+                            <span>{worker?.segmentsCaptured ?? 0} clips</span>
                             <span>·</span>
                             <span>
-                              {worker?.estimatedBitrateKbps
-                                ? `${worker.estimatedBitrateKbps} kbps`
-                                : '— kbps'}
+                              {usage ? formatBytes(usage.totalBytes) : '0 B'} stored
                             </span>
-                            <span>·</span>
-                            <span>
-                              Vault: {usage ? formatBytes(usage.totalBytes) : '0 B'} ({sharePct}%)
-                            </span>
-                            {worker && worker.reconnectCount > 0 && (
+                            {worker?.estimatedBitrateKbps ? (
                               <>
                                 <span>·</span>
-                                <span>{worker.reconnectCount} reconnects</span>
+                                <span>{worker.estimatedBitrateKbps} kbps</span>
                               </>
-                            )}
+                            ) : null}
                           </div>
                           {worker?.lastError && (
                             <div style={{ fontSize: 11.5, color: '#fca5a5', marginTop: 3 }}>
@@ -675,24 +586,20 @@ export function NvrView({
           </section>
         </div>
 
-        {/* Right Column: Autonomous Policies, Thresholds & Health Alerts */}
+        {/* Right Column: Core Recording & Storage Policy */}
         <div className="form-stack">
           <section className="panel">
             <div className="panel-header">
-              <h3>24/7 Autonomous &amp; Storage Policy</h3>
-              <span className="chip accent">
-                <Cpu size={12} />
-                UNVR Engine
-              </span>
+              <h3>Recording &amp; Retention Policy</h3>
             </div>
             <div className="panel-body form-stack">
               <div className="toggle-row">
                 <div>
                   <div className="toggle-label-main">
-                    Zero-Touch 24/7 Recording on Connect
+                    Auto-Start 24/7 Recording
                   </div>
                   <div className="toggle-label-sub">
-                    Automatically record all cameras 24/7 with no manual input required
+                    Record all cameras continuously as soon as Ring connects
                   </div>
                 </div>
                 <button
@@ -711,32 +618,11 @@ export function NvrView({
               <div className="toggle-row">
                 <div>
                   <div className="toggle-label-main">
-                    <Power size={13} style={{ verticalAlign: -2, marginRight: 5 }} />
-                    Launch RingWatch at Windows Startup
-                  </div>
-                  <div className="toggle-label-sub">
-                    Auto-resume 24/7 NVR silently in system tray after Windows reboots
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={settings.launchAtLogin}
-                  className={`switch ${settings.launchAtLogin ? 'on' : ''}`}
-                  onClick={() =>
-                    void onUpdateSettings({ launchAtLogin: !settings.launchAtLogin })
-                  }
-                />
-              </div>
-
-              <div className="toggle-row">
-                <div>
-                  <div className="toggle-label-main">
                     <Moon size={13} style={{ verticalAlign: -2, marginRight: 5 }} />
-                    Prevent Windows Sleep While Recording
+                    Keep PC Awake While Recording
                   </div>
                   <div className="toggle-label-sub">
-                    Holds OS power-save lock so overnight recording never pauses
+                    Prevent Windows sleep so overnight recording never pauses
                   </div>
                 </div>
                 <button
@@ -752,54 +638,9 @@ export function NvrView({
                 />
               </div>
 
-              <div className="toggle-row">
-                <div>
-                  <div className="toggle-label-main">
-                    Date &amp; Camera Folder Structure
-                  </div>
-                  <div className="toggle-label-sub">
-                    Organize MP4s cleanly into <code className="mono">YYYY-MM-DD/camera/</code> folders
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={settings.organizeByDateFolder}
-                  className={`switch ${settings.organizeByDateFolder ? 'on' : ''}`}
-                  onClick={() =>
-                    void onUpdateSettings({
-                      organizeByDateFolder: !settings.organizeByDateFolder,
-                    })
-                  }
-                />
-              </div>
-
-              <div className="toggle-row">
-                <div>
-                  <div className="toggle-label-main">
-                    <Bell size={13} style={{ verticalAlign: -2, marginRight: 5 }} />
-                    NVR Health &amp; Low Disk Notifications
-                  </div>
-                  <div className="toggle-label-sub">
-                    Windows desktop alerts for low disk space, drive failover, and offline cameras
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={settings.nvrNotificationsEnabled}
-                  className={`switch ${settings.nvrNotificationsEnabled ? 'on' : ''}`}
-                  onClick={() =>
-                    void onUpdateSettings({
-                      nvrNotificationsEnabled: !settings.nvrNotificationsEnabled,
-                    })
-                  }
-                />
-              </div>
-
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                 <div className="field">
-                  <label htmlFor="nvr-quota-select">Vault Quota Cap</label>
+                  <label htmlFor="nvr-quota-select">Storage Limit</label>
                   <select
                     id="nvr-quota-select"
                     className="select"
@@ -813,16 +654,16 @@ export function NvrView({
                     <option value={100}>100 GB</option>
                     <option value={250}>250 GB</option>
                     <option value={500}>500 GB</option>
-                    <option value={1000}>1 TB (1000 GB)</option>
-                    <option value={2000}>2 TB (2000 GB)</option>
-                    <option value={4000}>4 TB (4000 GB)</option>
-                    <option value={8000}>8 TB (8000 GB)</option>
-                    <option value={0}>Unlimited (Use full drive)</option>
+                    <option value={1000}>1 TB</option>
+                    <option value={2000}>2 TB</option>
+                    <option value={4000}>4 TB</option>
+                    <option value={8000}>8 TB</option>
+                    <option value={0}>Unlimited (Full drive)</option>
                   </select>
                 </div>
 
                 <div className="field">
-                  <label htmlFor="nvr-retention-select">Retention Window</label>
+                  <label htmlFor="nvr-retention-select">Keep Footage For</label>
                   <select
                     id="nvr-retention-select"
                     className="select"
@@ -837,94 +678,214 @@ export function NvrView({
                     <option value={60}>60 days</option>
                     <option value={90}>90 days</option>
                     <option value={180}>180 days</option>
-                    <option value={0}>Ring buffer only (No age limit)</option>
+                    <option value={0}>Until storage is full</option>
                   </select>
                 </div>
-
-                <div className="field">
-                  <label htmlFor="nvr-low-warn-gb">Low Disk Warning (GB)</label>
-                  <input
-                    id="nvr-low-warn-gb"
-                    type="number"
-                    min={2}
-                    max={500}
-                    className="input mono"
-                    value={settings.lowDiskWarningGb}
-                    onChange={(e) =>
-                      void onUpdateSettings({
-                        lowDiskWarningGb: Number(e.target.value) || 20,
-                      })
-                    }
-                  />
-                </div>
-
-                <div className="field">
-                  <label htmlFor="nvr-min-free-gb">Min Free Disk Floor (GB)</label>
-                  <input
-                    id="nvr-min-free-gb"
-                    type="number"
-                    min={1}
-                    max={250}
-                    className="input mono"
-                    value={settings.minFreeDiskGb}
-                    onChange={(e) =>
-                      void onUpdateSettings({
-                        minFreeDiskGb: Number(e.target.value) || 10,
-                      })
-                    }
-                  />
-                </div>
               </div>
-            </div>
-          </section>
 
-          {/* NVR Watchdog & Storage Health Alerts Feed */}
-          <section className="panel">
-            <div className="panel-header">
-              <h3>NVR Watchdog &amp; Storage Alerts</h3>
-              <span className="chip">{nvrHealthEvents.length}</span>
-            </div>
-            <div className="panel-body">
-              {nvrHealthEvents.length === 0 ? (
-                <div className="empty-state" style={{ padding: 24 }}>
-                  <CheckCircle2 size={22} color="#4ade80" />
-                  <strong>All NVR Systems Nominal</strong>
-                  <span>
-                    No low-disk warnings, drive failovers, or stream stalls detected.
-                  </span>
-                </div>
-              ) : (
-                <div className="event-list">
-                  {nvrHealthEvents.map((ev) => (
-                    <div key={ev.id} className="event-item">
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <span
-                            className={`chip ${
-                              ev.severity === 'alert'
-                                ? 'alert'
-                                : ev.severity === 'warning'
-                                  ? 'warn'
-                                  : ev.severity === 'success'
-                                    ? 'ok'
-                                    : ''
-                            }`}
-                          >
-                            {ev.kind === 'storage-alert' ? 'STORAGE' : 'WATCHDOG'}
-                          </span>
-                          <strong style={{ fontSize: 12.5 }}>{ev.title}</strong>
-                        </div>
-                        <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-                          {ev.detail}
-                        </div>
-                        <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
-                          {formatRelativeTime(ev.timestamp)}
-                        </div>
+              <details className="advanced-drawer">
+                <summary>Advanced NVR &amp; Disk Settings</summary>
+                <div className="advanced-drawer-body">
+                  <div className="field">
+                    <label htmlFor="nvr-segment-seconds">Rolling Clip Length</label>
+                    <select
+                      id="nvr-segment-seconds"
+                      className="select"
+                      value={settings.continuousSegmentSeconds}
+                      onChange={(e) =>
+                        void onUpdateSettings({
+                          continuousSegmentSeconds: Number(e.target.value),
+                        })
+                      }
+                    >
+                      <option value={60}>60 seconds (Fastest timeline refresh)</option>
+                      <option value={120}>120 seconds (Recommended — 2 min)</option>
+                      <option value={180}>180 seconds (3 min)</option>
+                      <option value={300}>300 seconds (5 min)</option>
+                    </select>
+                  </div>
+
+                  <div className="toggle-row">
+                    <div>
+                      <div className="toggle-label-main">Skip Battery Cameras</div>
+                      <div className="toggle-label-sub">
+                        Only auto-record wired cameras to save battery
                       </div>
                     </div>
-                  ))}
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={settings.continuousSkipBatteryCams}
+                      className={`switch ${settings.continuousSkipBatteryCams ? 'on' : ''}`}
+                      onClick={() =>
+                        void onUpdateSettings({
+                          continuousSkipBatteryCams: !settings.continuousSkipBatteryCams,
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div className="toggle-row">
+                    <div>
+                      <div className="toggle-label-main">Date &amp; Camera Folders</div>
+                      <div className="toggle-label-sub">
+                        Save clips into <code className="mono">YYYY-MM-DD/camera/</code>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={settings.organizeByDateFolder}
+                      className={`switch ${settings.organizeByDateFolder ? 'on' : ''}`}
+                      onClick={() =>
+                        void onUpdateSettings({
+                          organizeByDateFolder: !settings.organizeByDateFolder,
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div className="toggle-row">
+                    <div>
+                      <div className="toggle-label-main">
+                        <Bell size={13} style={{ verticalAlign: -2, marginRight: 5 }} />
+                        Low Disk &amp; Health Alerts
+                      </div>
+                      <div className="toggle-label-sub">
+                        Windows alerts for low disk space, failover, or camera drops
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={settings.nvrNotificationsEnabled}
+                      className={`switch ${settings.nvrNotificationsEnabled ? 'on' : ''}`}
+                      onClick={() =>
+                        void onUpdateSettings({
+                          nvrNotificationsEnabled: !settings.nvrNotificationsEnabled,
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                    <div className="field">
+                      <label htmlFor="nvr-low-warn-gb">Low Disk Warning (GB)</label>
+                      <input
+                        id="nvr-low-warn-gb"
+                        type="number"
+                        min={2}
+                        max={500}
+                        className="input mono"
+                        value={settings.lowDiskWarningGb}
+                        onChange={(e) =>
+                          void onUpdateSettings({
+                            lowDiskWarningGb: Number(e.target.value) || 20,
+                          })
+                        }
+                      />
+                    </div>
+
+                    <div className="field">
+                      <label htmlFor="nvr-min-free-gb">Min Free Floor (GB)</label>
+                      <input
+                        id="nvr-min-free-gb"
+                        type="number"
+                        min={1}
+                        max={250}
+                        className="input mono"
+                        value={settings.minFreeDiskGb}
+                        onChange={(e) =>
+                          void onUpdateSettings({
+                            minFreeDiskGb: Number(e.target.value) || 10,
+                          })
+                        }
+                      />
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      disabled={actionBusy}
+                      onClick={async () => {
+                        setActionBusy(true)
+                        try {
+                          await onRescanStorage()
+                          await refreshDrives()
+                        } finally {
+                          setActionBusy(false)
+                        }
+                      }}
+                    >
+                      <RefreshCw size={13} />
+                      Rescan Disk
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      disabled={actionBusy}
+                      onClick={async () => {
+                        setActionBusy(true)
+                        try {
+                          await onPruneStorage()
+                        } finally {
+                          setActionBusy(false)
+                        }
+                      }}
+                    >
+                      <Scissors size={13} />
+                      Prune Old Clips
+                    </button>
+                  </div>
                 </div>
-              )}
+              </details>
+
+              <details className="advanced-drawer" open={nvrHealthEvents.length > 0}>
+                <summary>
+                  System Health Log ({nvrHealthEvents.length})
+                </summary>
+                <div className="advanced-drawer-body">
+                  {nvrHealthEvents.length === 0 ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: 'var(--text-secondary)' }}>
+                      <CheckCircle2 size={16} color="#4ade80" />
+                      <span>All NVR systems healthy — no warnings or stalls.</span>
+                    </div>
+                  ) : (
+                    <div className="event-list">
+                      {nvrHealthEvents.map((ev) => (
+                        <div key={ev.id} className="event-item">
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <span
+                                className={`chip ${
+                                  ev.severity === 'alert'
+                                    ? 'alert'
+                                    : ev.severity === 'warning'
+                                      ? 'warn'
+                                      : ev.severity === 'success'
+                                        ? 'ok'
+                                        : ''
+                                }`}
+                              >
+                                {ev.kind === 'storage-alert' ? 'STORAGE' : 'WATCHDOG'}
+                              </span>
+                              <strong style={{ fontSize: 12.5 }}>{ev.title}</strong>
+                            </div>
+                            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
+                              {ev.detail}
+                            </div>
+                            <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3 }}>
+                              {formatRelativeTime(ev.timestamp)}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </details>
             </div>
           </section>
         </div>

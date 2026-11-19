@@ -1,8 +1,6 @@
 import { useState } from 'react'
 import {
   CheckCircle2,
-  Circle,
-  FolderOpen,
   KeyRound,
   Link2,
   PlugZap,
@@ -44,14 +42,11 @@ interface SettingsViewProps {
 export function SettingsView({
   connection,
   settings,
-  cameras,
   onSwitchMode,
   onLoginCredentials,
   onConnectToken,
   onDisconnectRing,
   onUpdateSettings,
-  onChooseRecordingsFolder,
-  onChooseFailoverFolder,
   onTestAiConnection,
 }: SettingsViewProps) {
   const [email, setEmail] = useState('')
@@ -103,16 +98,17 @@ export function SettingsView({
 
   return (
     <div className="settings-grid">
+      {/* Column 1: Ring Account */}
       <section className="panel">
         <div className="panel-header">
-          <h3>Ring Account &amp; Device Connection</h3>
+          <h3>Ring Account</h3>
           <div className="segmented">
             <button
               type="button"
               className={settings.mode === 'demo' ? 'active' : ''}
               onClick={() => void onSwitchMode('demo')}
             >
-              Demo Mode
+              Demo
             </button>
             <button
               type="button"
@@ -150,9 +146,9 @@ export function SettingsView({
               >
                 {connection.mode === 'live'
                   ? connection.connected
-                    ? `${connection.accountLabel ?? 'Ring Account Active'} (${connection.cameraCount} camera(s), ${connection.sensorCount} sensor(s))`
-                    : 'Live Ring Disconnected — Action Needed'
-                  : 'Demo Mode Active (3 simulated cameras, 5 sensors)'}
+                    ? `${connection.accountLabel ?? 'Ring Connected'} (${connection.cameraCount} cams, ${connection.sensorCount} sensors)`
+                    : 'Ring Disconnected'
+                  : 'Demo Mode (Simulated devices)'}
               </div>
               <div
                 style={{
@@ -163,7 +159,7 @@ export function SettingsView({
               >
                 {connection.error
                   ? connection.error
-                  : 'Refresh tokens are encrypted locally via Windows DPAPI safeStorage and auto-rotated.'}
+                  : 'Credentials are stored locally using Windows encryption.'}
               </div>
             </div>
             {settings.hasRingToken && (
@@ -179,12 +175,8 @@ export function SettingsView({
           </div>
 
           <form className="form-stack" onSubmit={(e) => void handleRingLogin(e)}>
-            <div style={{ fontWeight: 600, fontSize: 13 }}>
-              Sign In with Ring Credentials (2FA Supported)
-            </div>
-
             <div className="field">
-              <label htmlFor="ring-email">Ring Account Email</label>
+              <label htmlFor="ring-email">Ring Email</label>
               <input
                 id="ring-email"
                 type="email"
@@ -238,70 +230,65 @@ export function SettingsView({
             >
               <Link2 size={14} />
               {authBusy
-                ? 'Authenticating…'
+                ? 'Signing in…'
                 : twoFactorPrompt
                   ? 'Verify 2FA & Connect'
                   : 'Sign In to Ring'}
             </button>
           </form>
 
-          <div
-            style={{
-              borderTop: '1px solid var(--border-subtle)',
-              paddingTop: 14,
-            }}
-            className="form-stack"
-          >
-            <div style={{ fontWeight: 600, fontSize: 13 }}>
-              Or Connect with Ring Refresh Token
+          <details className="advanced-drawer">
+            <summary>Sign in with Refresh Token (Advanced)</summary>
+            <div className="advanced-drawer-body">
+              <div className="field">
+                <label htmlFor="ring-token">
+                  Token from <code className="mono">npx -p ring-client-api ring-auth-cli</code>
+                </label>
+                <input
+                  id="ring-token"
+                  type="password"
+                  className="input mono"
+                  placeholder="Paste refresh token…"
+                  value={refreshTokenInput}
+                  onChange={(e) => setRefreshTokenInput(e.target.value)}
+                />
+              </div>
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={tokenBusy || !refreshTokenInput.trim()}
+                onClick={async () => {
+                  setTokenBusy(true)
+                  try {
+                    await onConnectToken(refreshTokenInput.trim())
+                    setRefreshTokenInput('')
+                  } finally {
+                    setTokenBusy(false)
+                  }
+                }}
+              >
+                <PlugZap size={13} />
+                {tokenBusy ? 'Connecting…' : 'Connect Token'}
+              </button>
             </div>
-            <div className="field">
-              <label htmlFor="ring-token">
-                Token from <code className="mono">npx -p ring-client-api ring-auth-cli</code>
-              </label>
-              <input
-                id="ring-token"
-                type="password"
-                className="input mono"
-                placeholder="Paste refresh token…"
-                value={refreshTokenInput}
-                onChange={(e) => setRefreshTokenInput(e.target.value)}
-              />
-            </div>
-            <button
-              type="button"
-              className="btn"
-              disabled={tokenBusy || !refreshTokenInput.trim()}
-              onClick={async () => {
-                setTokenBusy(true)
-                try {
-                  await onConnectToken(refreshTokenInput.trim())
-                  setRefreshTokenInput('')
-                } finally {
-                  setTokenBusy(false)
-                }
-              }}
-            >
-              <PlugZap size={14} />
-              {tokenBusy ? 'Connecting…' : 'Connect Using Refresh Token'}
-            </button>
-          </div>
+          </details>
         </div>
       </section>
 
+      {/* Column 2: Cloud Vision AI + App Preferences */}
       <div className="form-stack">
         <section className="panel">
           <div className="panel-header">
-            <h3>Cloud Vision AI (Package Detection)</h3>
+            <h3>Cloud Vision AI</h3>
             <span className="chip accent">
               <ShieldCheck size={12} />
-              DPAPI Encrypted
+              Encrypted
             </span>
           </div>
 
           <div className="panel-body form-stack">
             <div className="field">
-              <label htmlFor="ai-provider">Vision Provider</label>
+              <label htmlFor="ai-provider">Provider</label>
               <select
                 id="ai-provider"
                 className="select"
@@ -313,14 +300,14 @@ export function SettingsView({
                 }
               >
                 <option value="openai">OpenAI Vision (GPT-4o / 4.1)</option>
-                <option value="gemini">Google Gemini Vision (Gemini 3 / 4)</option>
+                <option value="gemini">Google Gemini Vision</option>
               </select>
             </div>
 
             {ai.provider === 'openai' ? (
               <>
                 <div className="field">
-                  <label htmlFor="openai-model">OpenAI Vision Model</label>
+                  <label htmlFor="openai-model">Model</label>
                   <select
                     id="openai-model"
                     className="select"
@@ -380,7 +367,7 @@ export function SettingsView({
             ) : (
               <>
                 <div className="field">
-                  <label htmlFor="gemini-model">Google Gemini Model</label>
+                  <label htmlFor="gemini-model">Model</label>
                   <select
                     id="gemini-model"
                     className="select"
@@ -392,19 +379,19 @@ export function SettingsView({
                     }
                   >
                     <option value="gemini-3-flash-preview">
-                      gemini-3-flash-preview (Recommended — Best box &amp; parcel accuracy)
+                      gemini-3-flash-preview (Recommended)
                     </option>
                     <option value="gemini-3.5-flash-lite">
-                      gemini-3.5-flash-lite (Fastest &amp; lowest cost)
+                      gemini-3.5-flash-lite (Fastest)
                     </option>
                     <option value="gemini-3.8-flash">
-                      gemini-3.8-flash (High-intelligence Flash)
+                      gemini-3.8-flash (High accuracy)
                     </option>
                     <option value="gemini-3.1-pro-preview">
                       gemini-3.1-pro-preview (Maximum precision)
                     </option>
                     <option value="gemini-4-hydrogen">
-                      gemini-4-hydrogen (Next-gen fast multimodal)
+                      gemini-4-hydrogen (Next-gen fast)
                     </option>
                     {![
                       'gemini-3.5-flash-lite',
@@ -420,7 +407,7 @@ export function SettingsView({
 
                 <div className="field">
                   <label htmlFor="gemini-key">
-                    Google Gemini API Key{' '}
+                    Gemini API Key{' '}
                     {ai.hasGeminiKey && (
                       <span className="chip ok" style={{ marginLeft: 6 }}>
                         <CheckCircle2 size={11} />
@@ -476,7 +463,7 @@ export function SettingsView({
                   }
                 }}
               >
-                {testingAi ? 'Testing…' : 'Test Vision API Connection'}
+                {testingAi ? 'Testing…' : 'Test Connection'}
               </button>
               {aiTestResult && (
                 <span
@@ -495,482 +482,15 @@ export function SettingsView({
 
         <section className="panel">
           <div className="panel-header">
-            <h3>Continuous All-Camera Recording (NVR)</h3>
-            <span className="chip accent">
-              <Circle size={10} fill="currentColor" />
-              Rolling MP4
-            </span>
+            <h3>Windows &amp; App Preferences</h3>
           </div>
 
           <div className="panel-body form-stack">
-            <div className="field">
-              <label htmlFor="nvr-segment-seconds">
-                Rolling Segment Length (how often each camera writes a Timeline MP4)
-              </label>
-              <select
-                id="nvr-segment-seconds"
-                className="select"
-                value={settings.continuousSegmentSeconds}
-                onChange={(e) =>
-                  void onUpdateSettings({
-                    continuousSegmentSeconds: Number(e.target.value),
-                  })
-                }
-              >
-                <option value={60}>60 seconds (Fastest timeline appearance)</option>
-                <option value={120}>120 seconds (Recommended — 2 min segments)</option>
-                <option value={180}>180 seconds (3 min segments)</option>
-                <option value={300}>300 seconds (5 min segments)</option>
-              </select>
-            </div>
-
             <div className="toggle-row">
               <div>
-                <div className="toggle-label-main">
-                  Auto-Start All-Camera Recording on Launch
-                </div>
+                <div className="toggle-label-main">Launch on Windows Startup</div>
                 <div className="toggle-label-sub">
-                  Automatically start continuous NVR across cameras as soon as Ring connects
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.continuousAutoStart}
-                className={`switch ${settings.continuousAutoStart ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    continuousAutoStart: !settings.continuousAutoStart,
-                  })
-                }
-              />
-            </div>
-
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">
-                  Skip Battery-Only Cameras in &ldquo;Record All&rdquo;
-                </div>
-                <div className="toggle-label-sub">
-                  Continuous live streaming drains battery cameras quickly. Leave off to record all cameras (wired &amp; battery).
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.continuousSkipBatteryCams}
-                className={`switch ${settings.continuousSkipBatteryCams ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    continuousSkipBatteryCams: !settings.continuousSkipBatteryCams,
-                  })
-                }
-              />
-            </div>
-
-            {cameras.length > 0 && (
-              <div className="field">
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: 8,
-                  }}
-                >
-                  <label>
-                    Cameras Included in &ldquo;Record All&rdquo; (
-                    {settings.continuousCameraIds.length === 0
-                      ? `All ${cameras.length}`
-                      : `${settings.continuousCameraIds.length} of ${cameras.length}`}
-                    )
-                  </label>
-                  {settings.continuousCameraIds.length > 0 && (
-                    <button
-                      type="button"
-                      className="btn btn-sm"
-                      style={{ padding: '2px 8px', fontSize: 11.5 }}
-                      onClick={() =>
-                        void onUpdateSettings({ continuousCameraIds: [] })
-                      }
-                    >
-                      Select All
-                    </button>
-                  )}
-                </div>
-                <div
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 6,
-                    marginTop: 4,
-                  }}
-                >
-                  {cameras.map((cam) => {
-                    const allSelected = settings.continuousCameraIds.length === 0
-                    const checked =
-                      allSelected || settings.continuousCameraIds.includes(cam.id)
-                    return (
-                      <label
-                        key={cam.id}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: 8,
-                          padding: '6px 10px',
-                          borderRadius: 6,
-                          background: 'var(--bg-elevated)',
-                          border: '1px solid var(--border-subtle)',
-                          cursor: 'pointer',
-                          fontSize: 12.5,
-                        }}
-                      >
-                        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(e) => {
-                              const currentSet = new Set(
-                                allSelected
-                                  ? cameras.map((c) => c.id)
-                                  : settings.continuousCameraIds,
-                              )
-                              if (e.target.checked) {
-                                currentSet.add(cam.id)
-                              } else {
-                                currentSet.delete(cam.id)
-                              }
-                              const nextIds =
-                                currentSet.size === cameras.length
-                                  ? []
-                                  : Array.from(currentSet)
-                              void onUpdateSettings({ continuousCameraIds: nextIds })
-                            }}
-                          />
-                          <span>{cam.name}</span>
-                        </span>
-                        <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                          {cam.batteryPercent !== null
-                            ? `Battery ${cam.batteryPercent}%`
-                            : 'Wired'}
-                        </span>
-                      </label>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-        </section>
-
-        <section className="panel">
-          <div className="panel-header">
-            <h3>Windows Storage &amp; Tray Preferences</h3>
-          </div>
-
-          <div className="panel-body form-stack">
-            <div className="field">
-              <label htmlFor="rec-dir">Primary Recordings Folder (Local / External USB / NAS)</label>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <input
-                  id="rec-dir"
-                  type="text"
-                  className="input mono"
-                  value={settings.recordingsDir}
-                  readOnly
-                />
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() => void onChooseRecordingsFolder()}
-                >
-                  <FolderOpen size={14} />
-                  Browse
-                </button>
-              </div>
-            </div>
-
-            <div className="field">
-              <label htmlFor="failover-dir">
-                Failover Recordings Folder (used automatically if Primary drive disconnects)
-              </label>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <input
-                  id="failover-dir"
-                  type="text"
-                  className="input mono"
-                  value={settings.failoverRecordingsDir || 'Built-in local Videos\\RingWatch fallback'}
-                  readOnly
-                />
-                <button
-                  type="button"
-                  className="btn btn-sm"
-                  onClick={() => void onChooseFailoverFolder()}
-                >
-                  <FolderOpen size={14} />
-                  Browse
-                </button>
-                {settings.failoverRecordingsDir && (
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    onClick={() => void onUpdateSettings({ failoverRecordingsDir: '' })}
-                  >
-                    Clear
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <div className="field">
-              <label htmlFor="default-duration">Default Capture Clip Length</label>
-              <select
-                id="default-duration"
-                className="select"
-                value={settings.defaultCaptureSeconds}
-                onChange={(e) =>
-                  void onUpdateSettings({
-                    defaultCaptureSeconds: Number(e.target.value),
-                  })
-                }
-              >
-                <option value={15}>15 seconds</option>
-                <option value={30}>30 seconds</option>
-                <option value={45}>45 seconds</option>
-                <option value={60}>60 seconds</option>
-                <option value={120}>120 seconds</option>
-              </select>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-              <div className="field">
-                <label htmlFor="max-storage-gb">Local Storage Quota Cap</label>
-                <select
-                  id="max-storage-gb"
-                  className="select"
-                  value={settings.maxStorageGb}
-                  onChange={(e) =>
-                    void onUpdateSettings({ maxStorageGb: Number(e.target.value) })
-                  }
-                >
-                  <option value={25}>25 GB</option>
-                  <option value={50}>50 GB</option>
-                  <option value={100}>100 GB (Recommended)</option>
-                  <option value={250}>250 GB</option>
-                  <option value={500}>500 GB</option>
-                  <option value={1000}>1 TB (1000 GB)</option>
-                  <option value={2000}>2 TB (2000 GB)</option>
-                  <option value={4000}>4 TB (4000 GB)</option>
-                  <option value={8000}>8 TB (8000 GB)</option>
-                  <option value={0}>Unlimited (Drive-Floor Managed)</option>
-                  {![0, 25, 50, 100, 250, 500, 1000, 2000, 4000, 8000].includes(
-                    settings.maxStorageGb,
-                  ) && <option value={settings.maxStorageGb}>{settings.maxStorageGb} GB</option>}
-                </select>
-              </div>
-
-              <div className="field">
-                <label htmlFor="retention-days">Auto-Delete Older Than</label>
-                <select
-                  id="retention-days"
-                  className="select"
-                  value={settings.retentionDays}
-                  onChange={(e) =>
-                    void onUpdateSettings({ retentionDays: Number(e.target.value) })
-                  }
-                >
-                  <option value={7}>7 days</option>
-                  <option value={14}>14 days</option>
-                  <option value={30}>30 days (Recommended)</option>
-                  <option value={60}>60 days</option>
-                  <option value={90}>90 days</option>
-                  <option value={180}>180 days</option>
-                  <option value={365}>365 days</option>
-                  <option value={0}>Keep until quota / floor</option>
-                </select>
-              </div>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-              <div className="field">
-                <label htmlFor="low-disk-warning-gb">Low Disk Alert Threshold (GB)</label>
-                <input
-                  id="low-disk-warning-gb"
-                  type="number"
-                  min={2}
-                  max={500}
-                  className="input mono"
-                  value={settings.lowDiskWarningGb}
-                  onChange={(e) => {
-                    const val = Number(e.target.value)
-                    if (Number.isFinite(val)) {
-                      void onUpdateSettings({ lowDiskWarningGb: val })
-                    }
-                  }}
-                />
-              </div>
-
-              <div className="field">
-                <label htmlFor="min-free-disk-gb">Free-Disk Floor Auto-Prune (GB)</label>
-                <input
-                  id="min-free-disk-gb"
-                  type="number"
-                  min={1}
-                  max={250}
-                  className="input mono"
-                  value={settings.minFreeDiskGb}
-                  onChange={(e) => {
-                    const val = Number(e.target.value)
-                    if (Number.isFinite(val)) {
-                      void onUpdateSettings({ minFreeDiskGb: val })
-                    }
-                  }}
-                />
-              </div>
-            </div>
-
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">Organize Recordings into Date &amp; Camera Folders</div>
-                <div className="toggle-label-sub">
-                  Store clips as <code className="mono">YYYY-MM-DD/camera-name/</code> for clean multi-terabyte browsing
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.organizeByDateFolder}
-                className={`switch ${settings.organizeByDateFolder ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    organizeByDateFolder: !settings.organizeByDateFolder,
-                  })
-                }
-              />
-            </div>
-
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">Auto-Record Locally on Motion</div>
-                <div className="toggle-label-sub">
-                  Save MP4 clip to local storage whenever a camera detects motion
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.autoRecordOnMotion}
-                className={`switch ${settings.autoRecordOnMotion ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    autoRecordOnMotion: !settings.autoRecordOnMotion,
-                  })
-                }
-              />
-            </div>
-
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">Auto-Record Locally on Doorbell Press</div>
-                <div className="toggle-label-sub">
-                  Capture doorbell ring clips directly into your local vault
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.autoRecordOnDoorbell}
-                className={`switch ${settings.autoRecordOnDoorbell ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    autoRecordOnDoorbell: !settings.autoRecordOnDoorbell,
-                  })
-                }
-              />
-            </div>
-
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">Auto-Record on AI Package Detection</div>
-                <div className="toggle-label-sub">
-                  Save a local MP4 clip whenever Cloud Vision detects a package
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.autoRecordOnPackage}
-                className={`switch ${settings.autoRecordOnPackage ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    autoRecordOnPackage: !settings.autoRecordOnPackage,
-                  })
-                }
-              />
-            </div>
-
-            <div className="field">
-              <label htmlFor="ffmpeg-path">
-                Custom FFmpeg Path (optional — bundled binary used by default)
-              </label>
-              <input
-                id="ffmpeg-path"
-                type="text"
-                className="input mono"
-                placeholder="Leave blank to use built-in / PATH ffmpeg.exe"
-                value={settings.ffmpegPath}
-                onChange={(e) =>
-                  void onUpdateSettings({ ffmpegPath: e.target.value })
-                }
-              />
-            </div>
-
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">NVR Health &amp; Low-Disk Alerts</div>
-                <div className="toggle-label-sub">
-                  Windows notifications when disk space is low, failover triggers, or a camera disconnects
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.nvrNotificationsEnabled}
-                className={`switch ${settings.nvrNotificationsEnabled ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    nvrNotificationsEnabled: !settings.nvrNotificationsEnabled,
-                  })
-                }
-              />
-            </div>
-
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">Keep PC Awake While 24/7 NVR Is Recording</div>
-                <div className="toggle-label-sub">
-                  Blocks Windows standby sleep so unattended continuous recording never interrupts
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.preventSleepWhileRecording}
-                className={`switch ${settings.preventSleepWhileRecording ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    preventSleepWhileRecording: !settings.preventSleepWhileRecording,
-                  })
-                }
-              />
-            </div>
-
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">Launch Automatically on Windows Sign-In</div>
-                <div className="toggle-label-sub">
-                  Start RingWatch in the tray after reboot and resume 24/7 recording hands-free
+                  Resume 24/7 recording automatically after reboot
                 </div>
               </div>
               <button
@@ -988,9 +508,9 @@ export function SettingsView({
 
             <div className="toggle-row">
               <div>
-                <div className="toggle-label-main">Minimize to Windows System Tray</div>
+                <div className="toggle-label-main">Minimize to System Tray</div>
                 <div className="toggle-label-sub">
-                  Keep 24/7 NVR recording, sensors &amp; AI package alerts running when window closes
+                  Keep recording and alerts active when the window closes
                 </div>
               </div>
               <button
@@ -1008,7 +528,7 @@ export function SettingsView({
               <div>
                 <div className="toggle-label-main">Start Minimized in Tray</div>
                 <div className="toggle-label-sub">
-                  Launch quietly in background on Windows startup
+                  Start quietly in the background on launch
                 </div>
               </div>
               <button
@@ -1021,6 +541,110 @@ export function SettingsView({
                 }
               />
             </div>
+
+            <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+              External drives, failover folders, and 24/7 retention rules are managed in{' '}
+              <strong>NVR &amp; Storage</strong>.
+            </p>
+
+            <details className="advanced-drawer">
+              <summary>Advanced Recording &amp; FFmpeg Options</summary>
+              <div className="advanced-drawer-body">
+                <div className="field">
+                  <label htmlFor="default-duration">Manual Clip Length</label>
+                  <select
+                    id="default-duration"
+                    className="select"
+                    value={settings.defaultCaptureSeconds}
+                    onChange={(e) =>
+                      void onUpdateSettings({
+                        defaultCaptureSeconds: Number(e.target.value),
+                      })
+                    }
+                  >
+                    <option value={15}>15 seconds</option>
+                    <option value={30}>30 seconds</option>
+                    <option value={45}>45 seconds</option>
+                    <option value={60}>60 seconds</option>
+                    <option value={120}>120 seconds</option>
+                  </select>
+                </div>
+
+                <div className="toggle-row">
+                  <div>
+                    <div className="toggle-label-main">Auto-Record on Motion</div>
+                    <div className="toggle-label-sub">
+                      Save an extra clip when motion triggers
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={settings.autoRecordOnMotion}
+                    className={`switch ${settings.autoRecordOnMotion ? 'on' : ''}`}
+                    onClick={() =>
+                      void onUpdateSettings({
+                        autoRecordOnMotion: !settings.autoRecordOnMotion,
+                      })
+                    }
+                  />
+                </div>
+
+                <div className="toggle-row">
+                  <div>
+                    <div className="toggle-label-main">Auto-Record on Doorbell</div>
+                    <div className="toggle-label-sub">
+                      Save a clip when someone rings the doorbell
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={settings.autoRecordOnDoorbell}
+                    className={`switch ${settings.autoRecordOnDoorbell ? 'on' : ''}`}
+                    onClick={() =>
+                      void onUpdateSettings({
+                        autoRecordOnDoorbell: !settings.autoRecordOnDoorbell,
+                      })
+                    }
+                  />
+                </div>
+
+                <div className="toggle-row">
+                  <div>
+                    <div className="toggle-label-main">Auto-Record on Package Alert</div>
+                    <div className="toggle-label-sub">
+                      Save a clip whenever AI detects a package
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={settings.autoRecordOnPackage}
+                    className={`switch ${settings.autoRecordOnPackage ? 'on' : ''}`}
+                    onClick={() =>
+                      void onUpdateSettings({
+                        autoRecordOnPackage: !settings.autoRecordOnPackage,
+                      })
+                    }
+                  />
+                </div>
+
+                <div className="field">
+                  <label htmlFor="ffmpeg-path">Custom FFmpeg Path (optional)</label>
+                  <input
+                    id="ffmpeg-path"
+                    type="text"
+                    className="input mono"
+                    placeholder="Leave blank to use bundled ffmpeg"
+                    value={settings.ffmpegPath}
+                    onChange={(e) =>
+                      void onUpdateSettings({ ffmpegPath: e.target.value })
+                    }
+                  />
+                </div>
+              </div>
+            </details>
           </div>
         </section>
       </div>
