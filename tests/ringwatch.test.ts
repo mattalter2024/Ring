@@ -661,9 +661,18 @@ describe('Autonomous 24/7 UNVR & Storage Management', () => {
     const failoverDir = path.join(tmpDir, 'failover-usb')
     fs.mkdirSync(failoverDir, { recursive: true })
 
+    const offlinePrimaryPath =
+      process.platform === 'win32'
+        ? `${
+            ['Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'].find(
+              (l) => !fs.existsSync(`${l}:\\`),
+            ) ?? 'Z'
+          }:\\RingWatch`
+        : '/mnt/unplugged-ringwatch-external-drive/RingWatch'
+
     const store = new ConfigStore(tmpDir, defaultDir)
     store.updateSettings({
-      recordingsDir: '/mnt/unplugged-ringwatch-external-drive/RingWatch',
+      recordingsDir: offlinePrimaryPath,
       failoverRecordingsDir: failoverDir,
     })
 
