@@ -11,6 +11,7 @@ interface StoredSecrets {
   ringRefreshToken?: string
   openaiApiKey?: string
   geminiApiKey?: string
+  authPasswordHash?: string
 }
 
 const CURRENT_CONFIG_VERSION = 3
@@ -480,5 +481,18 @@ export class ConfigStore {
 
   getGeminiApiKey(): string | undefined {
     return this.secrets.geminiApiKey
+  }
+
+  getAuthPasswordHash(): string | undefined {
+    return this.secrets.authPasswordHash
+  }
+
+  setAuthPasswordHash(hash: string | null): void {
+    if (hash && hash.trim()) {
+      this.secrets.authPasswordHash = hash.trim()
+    } else {
+      delete this.secrets.authPasswordHash
+    }
+    this.persist()
   }
 }

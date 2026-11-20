@@ -1,8 +1,11 @@
 import { useState } from 'react'
 import {
+  Bell,
   CheckCircle2,
   KeyRound,
   Link2,
+  Lock,
+  LogOut,
   PlugZap,
   ShieldCheck,
   Unplug,
@@ -12,6 +15,7 @@ import type {
   AppMode,
   AppSettings,
   AppSettingsPatch,
+  AuthStatus,
   ConnectionStatus,
   RingAuthStepResult,
   RingCameraInfo,
@@ -21,6 +25,7 @@ interface SettingsViewProps {
   connection: ConnectionStatus
   settings: AppSettings
   cameras: RingCameraInfo[]
+  authStatus: AuthStatus
   onSwitchMode: (mode: AppMode) => Promise<void>
   onLoginCredentials: (params: {
     email: string
@@ -37,17 +42,25 @@ interface SettingsViewProps {
     message: string
     latencyMs?: number
   }>
+  onUpdateAuthPassword: (params: {
+    currentPassword?: string
+    newPassword: string
+  }) => Promise<{ ok: boolean; authEnabled: boolean; error?: string }>
+  onLogout: () => Promise<void>
 }
 
 export function SettingsView({
   connection,
   settings,
+  authStatus,
   onSwitchMode,
   onLoginCredentials,
   onConnectToken,
   onDisconnectRing,
   onUpdateSettings,
   onTestAiConnection,
+  onUpdateAuthPassword,
+  onLogout,
 }: SettingsViewProps) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -67,6 +80,14 @@ export function SettingsView({
     latencyMs?: number
   } | null>(null)
   const [testingAi, setTestingAi] = useState(false)
+
+  const [currentWebPassword, setCurrentWebPassword] = useState('')
+  const [newWebPassword, setNewWebPassword] = useState('')
+  const [webAuthMsg, setWebAuthMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  const [webAuthBusy, setWebAuthBusy] = useState(false)
+  const [notifPerm, setNotifPerm] = useState<string>(() =>
+    typeof Notification !== 'undefined' ? Notification.permission : 'unsupported',
+  )
 
   const ai = settings.packageAi
 
@@ -482,65 +503,155 @@ export function SettingsView({
 
         <section className="panel">
           <div className="panel-header">
-            <h3>Windows &amp; App Preferences</h3>
+            <h3>Web Access &amp; Notifications</h3>
+            <span className={`chip ${authStatus.authEnabled ? 'ok' : ''}`}>
+              <Lock size={11} />
+              {authStatus.authEnabled ? 'Login Enabled' : 'Open (No Password)'}
+            </span>
           </div>
 
           <div className="panel-body form-stack">
             <div className="toggle-row">
               <div>
-                <div className="toggle-label-main">Launch on Windows Startup</div>
+                <div className="toggle-label-main">Browser Desktop Alerts</div>
                 <div className="toggle-label-sub">
-                  Resume 24/7 recording automatically after reboot
+                  {notifPerm === 'granted'
+                    ? 'Enabled — package & NVR alerts will pop up in this browser'
+                    : notifPerm === 'denied'
+                      ? 'Blocked in browser site settings'
+                      : 'Allow native browser notifications for package deliveries'}
                 </div>
               </div>
               <button
                 type="button"
-                role="switch"
-                aria-checked={settings.launchAtLogin}
-                className={`switch ${settings.launchAtLogin ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({
-                    launchAtLogin: !settings.launchAtLogin,
-                  })
-                }
-              />
+                className={`btn btn-sm ${notifPerm === 'granted' ? '' : 'btn-primary'}`}
+                disabled={notifPerm === 'granted' || notifPerm === 'unsupported'}
+                onClick={async () => {
+                  if (typeof Notification === 'undefined') return
+                  const perm = await Notification.requestPermission()
+                  setNotifPerm(perm)
+                }}
+              >
+                <Bell size={13} />
+                {notifPerm === 'granted' ? 'Enabled' : 'Enable Alerts'}
+              </button>
             </div>
 
-            <div className="toggle-row">
-              <div>
-                <div className="toggle-label-main">Minimize to System Tray</div>
-                <div className="toggle-label-sub">
-                  Keep recording and alerts active when the window closes
-                </div>
+            {authStatus.managedByEnv ? (
+              <div
+                style={{
+                  padding: '9px 11px',
+                  borderRadius: 7,
+                  background: 'var(--bg-subtle)',
+                  border: '1px solid var(--border-subtle)',
+                  fontSize: 12,
+                  color: 'var(--text-secondary)',
+                }}
+              >
+                Web login password is active via the{' '}
+                <code className="mono">RINGWATCH_AUTH_PASSWORD</code> environment
+                variable.
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.minimizeToTray}
-                className={`switch ${settings.minimizeToTray ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({ minimizeToTray: !settings.minimizeToTray })
-                }
-              />
-            </div>
+            ) : (
+              <div className="form-stack" style={{ gap: 8 }}>
+                {authStatus.authEnabled && (
+                  <div className="field">
+                    <label htmlFor="web-auth-current">Current Web Password</label>
+                    <input
+                      id="web-auth-current"
+                      type="password"
+                      className="input"
+                      placeholder="Required to change or disable login"
+                      value={currentWebPassword}
+                      onChange={(e) => setCurrentWebPassword(e.target.value)}
+                    />
+                  </div>
+                )}
+                <div className="field">
+                  <label htmlFor="web-auth-new">
+                    {authStatus.authEnabled
+                      ? 'New Web Password (leave blank to disable login)'
+                      : 'Optional Web Login Password'}
+                  </label>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <input
+                      id="web-auth-new"
+                      type="password"
+                      className="input"
+                      placeholder={
+                        authStatus.authEnabled
+                          ? 'New password or empty to disable…'
+                          : 'Set a password to protect LAN access…'
+                      }
+                      value={newWebPassword}
+                      onChange={(e) => setNewWebPassword(e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      disabled={
+                        webAuthBusy || (!authStatus.authEnabled && !newWebPassword.trim())
+                      }
+                      onClick={async () => {
+                        setWebAuthBusy(true)
+                        setWebAuthMsg(null)
+                        try {
+                          const res = await onUpdateAuthPassword({
+                            currentPassword: currentWebPassword || undefined,
+                            newPassword: newWebPassword,
+                          })
+                          if (res.ok) {
+                            setCurrentWebPassword('')
+                            setNewWebPassword('')
+                            setWebAuthMsg({
+                              ok: true,
+                              text: res.authEnabled
+                                ? 'Web login password saved.'
+                                : 'Web login gate disabled.',
+                            })
+                          } else {
+                            setWebAuthMsg({
+                              ok: false,
+                              text: res.error ?? 'Failed to update password.',
+                            })
+                          }
+                        } finally {
+                          setWebAuthBusy(false)
+                        }
+                      }}
+                    >
+                      <Lock size={13} />
+                      {authStatus.authEnabled && !newWebPassword.trim()
+                        ? 'Disable'
+                        : 'Save'}
+                    </button>
+                  </div>
+                </div>
+                {webAuthMsg && (
+                  <div
+                    style={{
+                      fontSize: 12,
+                      color: webAuthMsg.ok ? '#4ade80' : '#fca5a5',
+                    }}
+                  >
+                    {webAuthMsg.text}
+                  </div>
+                )}
+              </div>
+            )}
 
-            <div className="toggle-row">
+            {authStatus.authEnabled && (
               <div>
-                <div className="toggle-label-main">Start Minimized in Tray</div>
-                <div className="toggle-label-sub">
-                  Start quietly in the background on launch
-                </div>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => void onLogout()}
+                >
+                  <LogOut size={13} />
+                  Sign Out of Web UI
+                </button>
               </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={settings.startMinimized}
-                className={`switch ${settings.startMinimized ? 'on' : ''}`}
-                onClick={() =>
-                  void onUpdateSettings({ startMinimized: !settings.startMinimized })
-                }
-              />
-            </div>
+            )}
 
             <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
               External drives, failover folders, and 24/7 retention rules are managed in{' '}

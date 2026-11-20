@@ -351,11 +351,19 @@ export interface AlertSoundPayload {
   volume: number
   title: string
   body: string
+  cameraId?: string
+  desktopEnabled?: boolean
 }
 
 export interface SystemThemeInfo {
   shouldUseDarkColors: boolean
   accentColor: string | null
+}
+
+export interface AuthStatus {
+  authEnabled: boolean
+  authenticated: boolean
+  managedByEnv: boolean
 }
 
 export interface RingWatchBootstrap {
@@ -370,10 +378,19 @@ export interface RingWatchBootstrap {
   recordings: LocalRecordingItem[]
   packageDetections: PackageDetectionRecord[]
   activeStreams: LiveStreamSession[]
+  authStatus?: AuthStatus
   systemTheme?: SystemThemeInfo
 }
 
 export interface RingWatchApi {
+  getAuthStatus: () => Promise<AuthStatus>
+  login: (password: string) => Promise<{ ok: boolean; error?: string }>
+  logout: () => Promise<void>
+  setAuthPassword: (params: {
+    currentPassword?: string
+    newPassword: string
+  }) => Promise<{ ok: boolean; authEnabled: boolean; error?: string }>
+
   getBootstrap: () => Promise<RingWatchBootstrap>
   connectWithToken: (refreshToken: string) => Promise<ConnectionStatus>
   loginWithCredentials: (params: {

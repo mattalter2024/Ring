@@ -42,6 +42,7 @@ const ALLOWED_DEV_ORIGINS = new Set([
 
 export class StreamService {
   private server: http.Server | null = null
+  private externalServer = false
   private port = 0
   private sessionSeq = 0
   private readonly authToken: string
@@ -72,6 +73,15 @@ export class StreamService {
     fs.mkdirSync(this.hlsRoot, { recursive: true, mode: 0o700 })
   }
 
+  /**
+   * Mount media routes (/media/<token>/...) directly onto the unified RingWatch backend HTTP server.
+   * Uses same-origin relative URLs so live HLS & recorded MP4 playback work seamlessly over
+   * localhost, LAN IPs, Tailscale, and reverse proxies.
+   */
+  attachToExternalServer(): void {
+    this.externalServer = true
+  }
+
   private tryRemoveSync(targetPath: string): void {
     try {
       fs.rmSync(targetPath, {
@@ -82,7 +92,7 @@ export class StreamService {
       })
     } catch {
       // On Windows, NTFS/FFmpeg/Defender may briefly hold a handle (ENOTEMPTY/EBUSY/EPERM).
-      // Never crash the main process over temp HLS folder cleanup.
+      // Never crash the server process over temp HLS folder cleanup.
     }
   }
 
@@ -122,6 +132,7 @@ export class StreamService {
   }
 
   async startServer(): Promise<number> {
+    if (this.externalServer) return this.port
     if (this.server && this.port > 0) return this.port
 
     return new Promise((resolve, reject) => {
@@ -142,17 +153,24 @@ export class StreamService {
     })
   }
 
+  private isServerReady(): boolean {
+    return this.externalServer || this.port > 0
+  }
+
   private buildAuthenticatedBaseUrl(): string {
+    if (this.externalServer) {
+      return `/media/${this.authToken}`
+    }
     return `http://127.0.0.1:${this.port}/media/${this.authToken}`
   }
 
   getRecordingPlaybackUrl(fileName: string): string {
-    if (!this.port) return ''
+    if (!this.isServerReady()) return ''
     return `${this.buildAuthenticatedBaseUrl()}/recordings/${encodeURIComponent(fileName)}`
   }
 
   getRecordingPlaybackUrlById(recordingId: string, fallbackFileName?: string): string {
-    if (!this.port) return ''
+    if (!this.isServerReady()) return ''
     if (this.recordingPathResolver) {
       return `${this.buildAuthenticatedBaseUrl()}/recording-id/${encodeURIComponent(recordingId)}`
     }
@@ -180,6 +198,7 @@ export class StreamService {
   }
 
   private isValidHostHeader(hostHeader: string | undefined): boolean {
+    if (this.externalServer) return true
     if (!hostHeader) return true
     const lower = hostHeader.trim().toLowerCase()
     return (
@@ -197,6 +216,13 @@ export class StreamService {
     return crypto.timingSafeEqual(candidateBuf, this.authTokenBuf)
   }
 
+  handleMediaRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): void {
+    this.handleHttpRequest(req, res)
+  }
+
   private handleHttpRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -204,16 +230,19 @@ export class StreamService {
     res.setHeader('X-Content-Type-Options', 'nosniff')
     res.setHeader('Vary', 'Origin')
 
-    // Reject DNS rebinding attempts using non-loopback Host headers
+    // Reject DNS rebinding attempts when running in standalone loopback mode
     if (!this.isValidHostHeader(req.headers.host)) {
       res.writeHead(403)
       res.end('Forbidden')
       return
     }
 
-    // Restrict CORS to Electron's file:// renderer ("null") and local Vite dev server only
+    // Restrict CORS in standalone mode to local dev origins only (mounted mode is same-origin)
     const origin = req.headers.origin
-    if (origin === 'null' || (origin && ALLOWED_DEV_ORIGINS.has(origin))) {
+    if (
+      !this.externalServer &&
+      (origin === 'null' || (origin && ALLOWED_DEV_ORIGINS.has(origin)))
+    ) {
       res.setHeader('Access-Control-Allow-Origin', origin)
       res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
       res.setHeader('Access-Control-Allow-Headers', 'Range')

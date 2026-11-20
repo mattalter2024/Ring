@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   AlertSoundPayload,
   AppSettings,
+  AuthStatus,
   ConnectionStatus,
   LiveStreamSession,
   LocalRecordingItem,
@@ -10,19 +11,12 @@ import type {
   RingCameraInfo,
   RingLocationInfo,
   RingSensorInfo,
-  RingWatchApi,
   SecurityEvent,
   StorageStats,
-  SystemThemeInfo,
 } from '@shared/types'
+import { webRingWatchApi } from '@/api/webClient'
 import { playAlertChime } from '@/utils/audioChime'
 import { applySystemTheme } from '@/utils/theme'
-
-declare global {
-  interface Window {
-    ringWatch?: RingWatchApi
-  }
-}
 
 export interface UiToast {
   id: string
@@ -109,190 +103,15 @@ const DEFAULT_NVR_STATUS: NvrStatus = {
   cameras: {},
 }
 
-function createBrowserPreviewFallback(): {
-  connection: ConnectionStatus
-  locations: RingLocationInfo[]
-  cameras: RingCameraInfo[]
-  sensors: RingSensorInfo[]
-  events: SecurityEvent[]
-} {
-  const now = new Date().toISOString()
-  return {
-    connection: {
-      connected: true,
-      mode: 'demo',
-      accountLabel: 'Browser Preview (Demo Mode)',
-      locationCount: 1,
-      cameraCount: 3,
-      sensorCount: 5,
-      lastSyncAt: now,
-    },
-    locations: [
-      { id: 'demo-loc-home', name: 'Maple Street Home', hasAlarm: true, alarmMode: 'none' },
-    ],
-    cameras: [
-      {
-        id: 'demo-cam-front',
-        name: 'Front Porch Doorbell Pro',
-        locationId: 'demo-loc-home',
-        locationName: 'Maple Street Home',
-        model: 'Video Doorbell Pro 2',
-        kind: 'doorbot_v4',
-        online: true,
-        batteryPercent: null,
-        rssi: -46,
-        hasLight: false,
-        lightOn: false,
-        hasSiren: false,
-        sirenOn: false,
-        isDoorbell: true,
-        isStreaming: false,
-        isRecording: false,
-        lastSnapshotDataUrl: './demo/front_porch.jpg',
-        lastSnapshotAt: now,
-        lastMotionAt: new Date(Date.now() - 4 * 60 * 1000).toISOString(),
-        demoImage: 'front_porch.jpg',
-      },
-      {
-        id: 'demo-cam-driveway',
-        name: 'Driveway Floodlight Cam',
-        locationId: 'demo-loc-home',
-        locationName: 'Maple Street Home',
-        model: 'Floodlight Cam Wired Pro',
-        kind: 'floodlight_v2',
-        online: true,
-        batteryPercent: null,
-        rssi: -53,
-        hasLight: true,
-        lightOn: false,
-        hasSiren: true,
-        sirenOn: false,
-        isDoorbell: false,
-        isStreaming: false,
-        isRecording: false,
-        lastSnapshotDataUrl: './demo/driveway.jpg',
-        lastSnapshotAt: now,
-        demoImage: 'driveway.jpg',
-      },
-      {
-        id: 'demo-cam-patio',
-        name: 'Back Patio Stick Up Cam',
-        locationId: 'demo-loc-home',
-        locationName: 'Maple Street Home',
-        model: 'Stick Up Cam Battery',
-        kind: 'stickup_cam_v4',
-        online: true,
-        batteryPercent: 84,
-        rssi: -60,
-        hasLight: false,
-        lightOn: false,
-        hasSiren: true,
-        sirenOn: false,
-        isDoorbell: false,
-        isStreaming: false,
-        isRecording: false,
-        lastSnapshotDataUrl: './demo/back_patio.jpg',
-        lastSnapshotAt: now,
-        demoImage: 'back_patio.jpg',
-      },
-    ],
-    sensors: [
-      {
-        id: 'demo-sensor-front-door',
-        zid: 'demo-sensor-front-door',
-        name: 'Front Door Contact',
-        locationId: 'demo-loc-home',
-        locationName: 'Maple Street Home',
-        deviceType: 'sensor.contact',
-        category: 'contact',
-        faulted: false,
-        tamper: false,
-        batteryPercent: 96,
-        online: true,
-        statusLabel: 'Closed',
-        lastUpdatedAt: now,
-      },
-      {
-        id: 'demo-sensor-living-motion',
-        zid: 'demo-sensor-living-motion',
-        name: 'Living Room Motion',
-        locationId: 'demo-loc-home',
-        locationName: 'Maple Street Home',
-        deviceType: 'sensor.motion',
-        category: 'motion',
-        faulted: false,
-        tamper: false,
-        batteryPercent: 91,
-        online: true,
-        statusLabel: 'Clear',
-        lastUpdatedAt: now,
-      },
-      {
-        id: 'demo-sensor-garage',
-        zid: 'demo-sensor-garage',
-        name: 'Garage Entry Door',
-        locationId: 'demo-loc-home',
-        locationName: 'Maple Street Home',
-        deviceType: 'sensor.contact',
-        category: 'contact',
-        faulted: false,
-        tamper: false,
-        batteryPercent: 88,
-        online: true,
-        statusLabel: 'Closed',
-        lastUpdatedAt: now,
-      },
-      {
-        id: 'demo-sensor-basement-flood',
-        zid: 'demo-sensor-basement-flood',
-        name: 'Basement Flood & Freeze',
-        locationId: 'demo-loc-home',
-        locationName: 'Maple Street Home',
-        deviceType: 'sensor.flood-freeze',
-        category: 'flood',
-        faulted: false,
-        tamper: false,
-        batteryPercent: 100,
-        online: true,
-        statusLabel: 'Dry',
-        lastUpdatedAt: now,
-      },
-      {
-        id: 'demo-sensor-keypad',
-        zid: 'demo-sensor-keypad',
-        name: 'Hallway Alarm Keypad',
-        locationId: 'demo-loc-home',
-        locationName: 'Maple Street Home',
-        deviceType: 'security-keypad',
-        category: 'keypad',
-        faulted: false,
-        tamper: false,
-        batteryPercent: 78,
-        online: true,
-        statusLabel: 'Ready',
-        lastUpdatedAt: now,
-      },
-    ],
-    events: [
-      {
-        id: 'preview-ev-1',
-        timestamp: new Date(Date.now() - 4 * 60 * 1000).toISOString(),
-        sourceType: 'camera',
-        deviceId: 'demo-cam-front',
-        deviceName: 'Front Porch Doorbell Pro',
-        kind: 'motion',
-        title: 'Motion Detected — Front Porch',
-        detail: 'Person approached porch entrance; snapshot refreshed.',
-        severity: 'warning',
-        snapshotDataUrl: './demo/front_porch.jpg',
-      },
-    ],
-  }
+const DEFAULT_AUTH_STATUS: AuthStatus = {
+  authEnabled: false,
+  authenticated: true,
+  managedByEnv: false,
 }
 
 export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void) {
-  const isElectron = Boolean(window.ringWatch)
   const [loading, setLoading] = useState(true)
+  const [authStatus, setAuthStatus] = useState<AuthStatus>(DEFAULT_AUTH_STATUS)
   const [connection, setConnection] = useState<ConnectionStatus>({
     connected: false,
     mode: 'demo',
@@ -326,112 +145,170 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     [],
   )
 
+  const loadBootstrap = useCallback(async () => {
+    const boot = await webRingWatchApi.getBootstrap()
+    if (boot.authStatus) {
+      setAuthStatus(boot.authStatus)
+    }
+    setConnection(boot.connection)
+    setSettings(boot.settings)
+    setStorageStats(boot.storageStats)
+    setNvrStatus(boot.nvrStatus ?? DEFAULT_NVR_STATUS)
+    setLocations(boot.locations)
+    setCameras(boot.cameras)
+    setSensors(boot.sensors)
+    setEvents(boot.events)
+    setRecordings(boot.recordings)
+    setPackageDetections(boot.packageDetections)
+    const streamMap: Record<string, LiveStreamSession> = {}
+    for (const s of boot.activeStreams) streamMap[s.cameraId] = s
+    setStreamsByCamera(streamMap)
+  }, [])
+
+  // Follow browser OS dark/light theme automatically
   useEffect(() => {
-    // Immediate OS dark/light sync before Electron IPC resolves (also supports browser preview)
     const mq =
       typeof window !== 'undefined' && typeof window.matchMedia === 'function'
         ? window.matchMedia('(prefers-color-scheme: dark)')
         : null
-    if (mq) {
-      applySystemTheme({ shouldUseDarkColors: mq.matches, accentColor: null })
+    if (!mq) return
+    applySystemTheme({ shouldUseDarkColors: mq.matches, accentColor: null })
+    const onMqChange = (e: MediaQueryListEvent) => {
+      applySystemTheme({ shouldUseDarkColors: e.matches, accentColor: null })
     }
-
-    const api = window.ringWatch
-    if (!api) {
-      const onMqChange = (e: MediaQueryListEvent) => {
-        applySystemTheme({ shouldUseDarkColors: e.matches, accentColor: null })
-      }
-      mq?.addEventListener?.('change', onMqChange)
-      const fallback = createBrowserPreviewFallback()
-      setConnection(fallback.connection)
-      setLocations(fallback.locations)
-      setCameras(fallback.cameras)
-      setSensors(fallback.sensors)
-      setEvents(fallback.events)
-      setLoading(false)
-      return () => {
-        mq?.removeEventListener?.('change', onMqChange)
-      }
+    mq.addEventListener?.('change', onMqChange)
+    return () => {
+      mq.removeEventListener?.('change', onMqChange)
     }
+  }, [])
 
+  // Check optional login gate on initial mount
+  useEffect(() => {
     let mounted = true
-    void api
-      .getBootstrap()
-      .then((boot) => {
+    void webRingWatchApi
+      .getAuthStatus()
+      .then(async (status) => {
         if (!mounted) return
-        if (boot.systemTheme) {
-          applySystemTheme(boot.systemTheme)
+        setAuthStatus(status)
+        if (!status.authEnabled || status.authenticated) {
+          await loadBootstrap()
         }
-        setConnection(boot.connection)
-        setSettings(boot.settings)
-        setStorageStats(boot.storageStats)
-        setNvrStatus(boot.nvrStatus ?? DEFAULT_NVR_STATUS)
-        setLocations(boot.locations)
-        setCameras(boot.cameras)
-        setSensors(boot.sensors)
-        setEvents(boot.events)
-        setRecordings(boot.recordings)
-        setPackageDetections(boot.packageDetections)
-        const streamMap: Record<string, LiveStreamSession> = {}
-        for (const s of boot.activeStreams) streamMap[s.cameraId] = s
-        setStreamsByCamera(streamMap)
-        setLoading(false)
+        if (mounted) setLoading(false)
       })
       .catch((err) => {
         if (!mounted) return
         pushToast(
-          'Bootstrap Error',
-          err instanceof Error ? err.message : String(err),
+          'Backend Unavailable',
+          err instanceof Error
+            ? err.message
+            : 'Could not connect to RingWatch NVR & AI backend.',
           'err',
         )
         setLoading(false)
       })
+    return () => {
+      mounted = false
+    }
+  }, [loadBootstrap, pushToast])
+
+  // Subscribe to real-time SSE updates whenever authenticated
+  useEffect(() => {
+    if (authStatus.authEnabled && !authStatus.authenticated) return
 
     const unsubs = [
-      api.onConnectionChanged((status) => setConnection(status)),
-      api.onSettingsUpdated((nextSettings) => setSettings(nextSettings)),
-      api.onLocationsUpdated((locs) => setLocations(locs)),
-      api.onCamerasUpdated((cams) => setCameras(cams)),
-      api.onSensorsUpdated((sens) => setSensors(sens)),
-      api.onSecurityEvent((ev) =>
+      webRingWatchApi.onConnectionChanged((status) => setConnection(status)),
+      webRingWatchApi.onSettingsUpdated((nextSettings) => setSettings(nextSettings)),
+      webRingWatchApi.onLocationsUpdated((locs) => setLocations(locs)),
+      webRingWatchApi.onCamerasUpdated((cams) => setCameras(cams)),
+      webRingWatchApi.onSensorsUpdated((sens) => setSensors(sens)),
+      webRingWatchApi.onSecurityEvent((ev) =>
         setEvents((prev) =>
           prev.some((e) => e.id === ev.id) ? prev : [ev, ...prev].slice(0, 500),
         ),
       ),
-      api.onEventsUpdated((nextEvents) => setEvents(nextEvents)),
-      api.onNvrStatusUpdated((nextNvr) => setNvrStatus(nextNvr)),
-      api.onRecordingsUpdated((recs) => setRecordings(recs)),
-      api.onStorageStatsUpdated((stats) => setStorageStats(stats)),
-      api.onPackageDetection((rec) =>
+      webRingWatchApi.onEventsUpdated((nextEvents) => setEvents(nextEvents)),
+      webRingWatchApi.onNvrStatusUpdated((nextNvr) => setNvrStatus(nextNvr)),
+      webRingWatchApi.onRecordingsUpdated((recs) => setRecordings(recs)),
+      webRingWatchApi.onStorageStatsUpdated((stats) => setStorageStats(stats)),
+      webRingWatchApi.onPackageDetection((rec) =>
         setPackageDetections((prev) => [rec, ...prev].slice(0, 150)),
       ),
-      api.onPlayAlertSound((payload: AlertSoundPayload) => {
-        playAlertChime(payload.profile, payload.volume)
+      webRingWatchApi.onPlayAlertSound((payload: AlertSoundPayload) => {
+        if (payload.profile !== 'none') {
+          playAlertChime(payload.profile, payload.volume)
+        }
         pushToast(payload.title, payload.body, 'warn')
+        if (
+          payload.desktopEnabled &&
+          typeof Notification !== 'undefined' &&
+          Notification.permission === 'granted'
+        ) {
+          try {
+            const n = new Notification(payload.title, { body: payload.body })
+            n.onclick = () => {
+              window.focus()
+              if (payload.cameraId) {
+                focusRef.current?.(payload.cameraId)
+              }
+            }
+          } catch {
+            // Ignore browser notification errors
+          }
+        }
       }),
-      api.onFocusCamera((camId: string) => {
+      webRingWatchApi.onFocusCamera((camId: string) => {
         focusRef.current?.(camId)
       }),
-      api.onStreamsUpdated((sessions: LiveStreamSession[]) => {
+      webRingWatchApi.onStreamsUpdated((sessions: LiveStreamSession[]) => {
         const next: Record<string, LiveStreamSession> = {}
         for (const s of sessions) next[s.cameraId] = s
         setStreamsByCamera(next)
       }),
-      api.onSystemThemeChanged((theme: SystemThemeInfo) => {
-        applySystemTheme(theme)
-      }),
     ]
 
     return () => {
-      mounted = false
       for (const unsub of unsubs) unsub()
     }
-  }, [pushToast])
+  }, [authStatus.authEnabled, authStatus.authenticated, pushToast])
+
+  const login = useCallback(
+    async (password: string) => {
+      const res = await webRingWatchApi.login(password)
+      if (res.ok) {
+        const status = await webRingWatchApi.getAuthStatus()
+        setAuthStatus(status)
+        await loadBootstrap()
+      }
+      return res
+    },
+    [loadBootstrap],
+  )
+
+  const logout = useCallback(async () => {
+    await webRingWatchApi.logout()
+    const status = await webRingWatchApi.getAuthStatus()
+    setAuthStatus(status)
+  }, [])
+
+  const setAuthPassword = useCallback(
+    async (params: { currentPassword?: string; newPassword: string }) => {
+      const res = await webRingWatchApi.setAuthPassword(params)
+      if (res.ok) {
+        const status = await webRingWatchApi.getAuthStatus()
+        setAuthStatus(status)
+      }
+      return res
+    },
+    [],
+  )
 
   return {
-    isElectron,
-    api: window.ringWatch,
+    api: webRingWatchApi,
     loading,
+    authStatus,
+    login,
+    logout,
+    setAuthPassword,
     connection,
     setConnection,
     settings,

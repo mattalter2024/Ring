@@ -3,20 +3,28 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { ConfigStore, type SecretCryptoAdapter } from '../electron/services/configStore'
+import { ConfigStore, type SecretCryptoAdapter } from '../server/services/configStore'
 import {
   AiPackageService,
   parseVisionResponse,
   type SnapshotSource,
-} from '../electron/services/aiPackageService'
-import { StreamService } from '../electron/services/streamService'
+} from '../server/services/aiPackageService'
+import { StreamService } from '../server/services/streamService'
 import {
   computeLumaSceneChange,
   MOTION_GRID_PIXELS,
   RecordingService,
-} from '../electron/services/recordingService'
-import { RingService } from '../electron/services/ringService'
-import type { NotificationService } from '../electron/services/notificationService'
+} from '../server/services/recordingService'
+import { RingService } from '../server/services/ringService'
+import type { NotificationService } from '../server/services/notificationService'
+import {
+  FileKeyCryptoAdapter,
+  createSessionToken,
+  hashPassword,
+  verifyPassword,
+  verifySessionToken,
+} from '../server/services/secretCrypto'
+import { RingWatchServer } from '../server/httpServer'
 
 function makeTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'ringwatch-test-'))
@@ -1857,6 +1865,165 @@ describe('Enhanced Delivery Detection (Baseline Diff, Ground Crop, Motion-End & 
     service.stop()
   })
 })
+
+describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login Gate)', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('encrypts secrets with FileKeyCryptoAdapter (AES-256-GCM) and verifies scrypt passwords & HMAC sessions', () => {
+    const cryptoAdapter = new FileKeyCryptoAdapter(tmpDir)
+    expect(cryptoAdapter.isEncryptionAvailable()).toBe(true)
+
+    const encrypted = cryptoAdapter.encryptString('super-secret-ring-token')
+    expect(encrypted.toString('utf-8')).not.toContain('super-secret-ring-token')
+    expect(cryptoAdapter.decryptString(encrypted)).toBe('super-secret-ring-token')
+
+    // Persisted keyfile reloads cleanly across restarts
+    const reloadedAdapter = new FileKeyCryptoAdapter(tmpDir)
+    expect(reloadedAdapter.decryptString(encrypted)).toBe('super-secret-ring-token')
+
+    const hash = hashPassword('my-nvr-pass')
+    expect(hash.startsWith('scrypt$')).toBe(true)
+    expect(verifyPassword('my-nvr-pass', hash)).toBe(true)
+    expect(verifyPassword('wrong-pass', hash)).toBe(false)
+
+    const signingKey = cryptoAdapter.getSessionSigningKey()
+    const token = createSessionToken(signingKey, 60_000)
+    expect(verifySessionToken(token, signingKey)).toBe(true)
+    expect(verifySessionToken(`${token}tampered`, signingKey)).toBe(false)
+  })
+
+  it('serves REST bootstrap, mounted relative /media URLs, and enforces the optional login gate end-to-end', async () => {
+    const recDir = path.join(tmpDir, 'recordings')
+    const webDir = path.join(tmpDir, 'web-dist')
+    fs.mkdirSync(webDir, { recursive: true })
+    fs.writeFileSync(path.join(webDir, 'index.html'), '<!doctype html><html><body>RingWatch Web</body></html>', 'utf-8')
+
+    // Disable continuous auto-start so the test doesn't spawn background demo FFmpeg loops
+    const preStore = new ConfigStore(tmpDir, recDir)
+    preStore.updateSettings({ continuousAutoStart: false })
+
+    const server = new RingWatchServer({
+      dataDir: tmpDir,
+      defaultRecordingsDir: recDir,
+      webDistDir: webDir,
+      demoAssetsDir: path.resolve(process.cwd(), 'public', 'demo'),
+      host: '127.0.0.1',
+      port: 0,
+    })
+
+    const { port } = await server.start()
+    const base = `http://127.0.0.1:${port}`
+
+    try {
+      // 1. Static web frontend serves index.html
+      const htmlRes = await fetch(`${base}/`)
+      expect(htmlRes.status).toBe(200)
+      expect(await htmlRes.text()).toContain('RingWatch Web')
+
+      // 2. Open mode by default (no password set) -> authEnabled: false, /api/bootstrap allowed
+      const authStatusRes = await fetch(`${base}/api/auth/status`)
+      expect(authStatusRes.status).toBe(200)
+      expect(await authStatusRes.json()).toEqual({
+        authEnabled: false,
+        authenticated: true,
+        managedByEnv: false,
+      })
+
+      const bootRes = await fetch(`${base}/api/bootstrap`)
+      expect(bootRes.status).toBe(200)
+      const boot = (await bootRes.json()) as {
+        connection: { mode: string }
+        settings: { mode: string }
+      }
+      expect(boot.connection.mode).toBe('demo')
+
+      // 3. Mounted StreamService generates same-origin relative /media/<token>/... URLs
+      fs.mkdirSync(recDir, { recursive: true })
+      const fakeMp4 = path.join(recDir, 'front_clip_test.mp4')
+      fs.writeFileSync(fakeMp4, Buffer.alloc(4096, 0x22))
+      const relUrl = server.streamService.getRecordingPlaybackUrl('front_clip_test.mp4')
+      expect(relUrl.startsWith('/media/')).toBe(true)
+
+      const mediaRes = await fetch(`${base}${relUrl}`, {
+        headers: { Range: 'bytes=0-1023' },
+      })
+      expect(mediaRes.status).toBe(206)
+      expect(mediaRes.headers.get('content-range')).toBe('bytes 0-1023/4096')
+
+      // 4. Enable optional login gate via /api/auth/password
+      const setPassRes = await fetch(`${base}/api/auth/password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newPassword: 'nvr-secret-2026' }),
+      })
+      expect(setPassRes.status).toBe(200)
+      expect(await setPassRes.json()).toEqual({ ok: true, authEnabled: true })
+
+      // 5. Unauthenticated requests are now blocked with 401
+      const unauthBoot = await fetch(`${base}/api/bootstrap`)
+      expect(unauthBoot.status).toBe(401)
+      const unauthMedia = await fetch(`${base}${relUrl}`)
+      expect(unauthMedia.status).toBe(401)
+
+      // 6. Wrong password rejected with 401
+      const badLogin = await fetch(`${base}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: 'wrong-password' }),
+      })
+      expect(badLogin.status).toBe(401)
+
+      // 7. Correct password sets HttpOnly session cookie that unlocks /api/bootstrap & /media
+      const goodLogin = await fetch(`${base}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: 'nvr-secret-2026' }),
+      })
+      expect(goodLogin.status).toBe(200)
+      const setCookie = goodLogin.headers.get('set-cookie') ?? ''
+      expect(setCookie).toContain('ringwatch_session=')
+      expect(setCookie).toContain('HttpOnly')
+      const cookieHeader = setCookie.split(';')[0]
+
+      const authedBoot = await fetch(`${base}/api/bootstrap`, {
+        headers: { Cookie: cookieHeader },
+      })
+      expect(authedBoot.status).toBe(200)
+
+      const authedMedia = await fetch(`${base}${relUrl}`, {
+        headers: { Cookie: cookieHeader },
+      })
+      expect(authedMedia.status).toBe(200)
+
+      // 8. Disabling password returns to open mode
+      const disableRes = await fetch(`${base}/api/auth/password`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookieHeader,
+        },
+        body: JSON.stringify({
+          currentPassword: 'nvr-secret-2026',
+          newPassword: '',
+        }),
+      })
+      expect(disableRes.status).toBe(200)
+      expect(await disableRes.json()).toEqual({ ok: true, authEnabled: false })
+      expect((await fetch(`${base}/api/bootstrap`)).status).toBe(200)
+    } finally {
+      await server.stop()
+    }
+  })
+})
+
 
 
 

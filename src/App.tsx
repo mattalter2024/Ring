@@ -17,6 +17,7 @@ import { RecordingsView } from '@/components/RecordingsView'
 import { SensorsView } from '@/components/SensorsView'
 import { PackageAiView } from '@/components/PackageAiView'
 import { SettingsView } from '@/components/SettingsView'
+import { LoginGate } from '@/components/LoginGate'
 import { playAlertChime } from '@/utils/audioChime'
 import { formatBytes } from '@/utils/format'
 
@@ -42,6 +43,10 @@ export function App() {
   const {
     api,
     loading,
+    authStatus,
+    login,
+    logout,
+    setAuthPassword,
     connection,
     setConnection,
     settings,
@@ -640,19 +645,46 @@ export function App() {
 
   const handleChooseFolder = async () => {
     if (!api) return
-    const dir = await api.chooseRecordingsFolder()
-    if (dir) {
-      setSettings((prev) => ({ ...prev, recordingsDir: dir }))
-      pushToast('Primary Storage Updated', `Recordings will save to ${dir}`, 'ok')
+    const entered = window.prompt(
+      'Enter full primary recordings folder path on the RingWatch NVR server:',
+      settings.recordingsDir,
+    )
+    if (!entered || !entered.trim()) return
+    try {
+      const updated = await api.updateSettings({ recordingsDir: entered.trim() })
+      setSettings(updated)
+      const res = await api.rescanLocalStorage()
+      setRecordings(res.recordings)
+      setStorageStats(res.stats)
+      pushToast('Primary Storage Updated', `Recordings will save to ${updated.recordingsDir}`, 'ok')
+    } catch (err) {
+      pushToast(
+        'Folder Update Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
     }
   }
 
   const handleChooseFailoverFolder = async () => {
     if (!api) return
-    const dir = await api.chooseFailoverFolder()
-    if (dir) {
-      setSettings((prev) => ({ ...prev, failoverRecordingsDir: dir }))
-      pushToast('Failover Storage Updated', `Failover storage set to ${dir}`, 'ok')
+    const entered = window.prompt(
+      'Enter full failover folder path on the RingWatch NVR server (leave blank to cancel):',
+      settings.failoverRecordingsDir || settings.recordingsDir,
+    )
+    if (!entered || !entered.trim()) return
+    try {
+      const updated = await api.updateSettings({ failoverRecordingsDir: entered.trim() })
+      setSettings(updated)
+      const stats = await api.getStorageStats()
+      setStorageStats(stats)
+      pushToast('Failover Storage Updated', `Failover storage set to ${updated.failoverRecordingsDir}`, 'ok')
+    } catch (err) {
+      pushToast(
+        'Failover Update Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
     }
   }
 
@@ -877,6 +909,10 @@ export function App() {
     (d) => d.packageDetected,
   ).length
 
+  if (!loading && authStatus.authEnabled && !authStatus.authenticated) {
+    return <LoginGate onLogin={login} />
+  }
+
   return (
     <div className="app-shell">
       <Sidebar
@@ -1039,6 +1075,7 @@ export function App() {
               connection={connection}
               settings={settings}
               cameras={cameras}
+              authStatus={authStatus}
               onSwitchMode={handleSwitchMode}
               onLoginCredentials={handleLoginCredentials}
               onConnectToken={handleConnectToken}
@@ -1047,6 +1084,8 @@ export function App() {
               onChooseRecordingsFolder={handleChooseFolder}
               onChooseFailoverFolder={handleChooseFailoverFolder}
               onTestAiConnection={handleTestAiConnection}
+              onUpdateAuthPassword={setAuthPassword}
+              onLogout={logout}
             />
           )}
         </main>
