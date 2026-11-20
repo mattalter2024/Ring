@@ -3,12 +3,13 @@ name: Build RingWatch Web & Backend
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test-and-package-windows:
@@ -127,9 +128,48 @@ jobs:
 
           Compress-Archive -Path "$stage/*" -DestinationPath "release/RingWatch-Windows-Server.zip" -Force
 
+          # Also package lightweight Cross-Platform (macOS / Linux / Node 20+) prebuilt bundle
+          $crossStage = "release/RingWatch-CrossPlatform"
+          if (Test-Path $crossStage) { Remove-Item -Recurse -Force $crossStage }
+          New-Item -ItemType Directory -Force -Path $crossStage | Out-Null
+          Copy-Item -Recurse dist "$crossStage/dist"
+          Copy-Item -Recurse dist-server "$crossStage/dist-server"
+          Copy-Item package.json, package-lock.json, README.md $crossStage
+          tar -czf "release/RingWatch-CrossPlatform.tar.gz" -C "release" "RingWatch-CrossPlatform"
+
       - name: Upload Windows Server Bundle
         uses: actions/upload-artifact@v4
         with:
           name: RingWatch-Windows-Server
           path: release/RingWatch-Windows-Server.zip
           if-no-files-found: error
+
+      - name: Publish GitHub Release (on v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $winZip = "release/RingWatch-Windows-Server-$tag.zip"
+          $crossTar = "release/RingWatch-CrossPlatform-$tag.tar.gz"
+          $sumsFile = "release/SHA256SUMS.txt"
+
+          Copy-Item "release/RingWatch-Windows-Server.zip" $winZip -Force
+          Copy-Item "release/RingWatch-CrossPlatform.tar.gz" $crossTar -Force
+
+          $winHash = (Get-FileHash $winZip -Algorithm SHA256).Hash.ToLower()
+          $crossHash = (Get-FileHash $crossTar -Algorithm SHA256).Hash.ToLower()
+          @(
+            "$winHash  RingWatch-Windows-Server-$tag.zip"
+            "$crossHash  RingWatch-CrossPlatform-$tag.tar.gz"
+          ) | Set-Content -Path $sumsFile -Encoding utf8
+
+          $title = "RingWatch $tag — 24/7 NVR, AI Package Detection, Passkeys & RBAC"
+          $notesFile = "docs/RELEASE_NOTES.md"
+
+          gh release create $tag $winZip $crossTar $sumsFile `
+            --title $title `
+            --notes-file $notesFile `
+            --latest
+
