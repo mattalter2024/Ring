@@ -960,7 +960,7 @@ export class RecordingService {
     const segmentPattern = path.join(dir, `${prefix}_%04d.mp4`)
 
     const listDir = path.join(os.tmpdir(), 'ringwatch-nvr')
-    fs.mkdirSync(listDir, { recursive: true })
+    fs.mkdirSync(listDir, { recursive: true, mode: 0o700 })
     const segmentListPath = path.join(listDir, `${prefix}.csv`)
 
     return {
@@ -1118,7 +1118,17 @@ export class RecordingService {
     const filePath = path.join(dir, fileName)
 
     const recordingUrl = await params.camera.getRecordingUrl(params.dingId)
-    const response = await fetch(recordingUrl)
+    let parsedUrl: URL
+    try {
+      parsedUrl = new URL(recordingUrl)
+    } catch {
+      throw new Error('Ring returned an invalid cloud recording URL')
+    }
+    if (parsedUrl.protocol !== 'https:') {
+      throw new Error('Refused to download cloud recording over an insecure non-HTTPS URL')
+    }
+
+    const response = await fetch(parsedUrl.toString())
     if (!response.ok) {
       throw new Error(`Ring cloud download failed (HTTP ${response.status})`)
     }
@@ -1366,7 +1376,15 @@ export class RecordingService {
 
   resolveFfmpegBinary(): string {
     const custom = this.configStore.getPublicSettings().ffmpegPath
-    if (custom) return custom
+    if (custom && !custom.includes('\0')) {
+      try {
+        if (fs.existsSync(custom) && fs.statSync(custom).isFile()) {
+          return custom
+        }
+      } catch {
+        // Ignore invalid custom path and fall back to bundled binary
+      }
+    }
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const bundled = require('ffmpeg-for-homebridge') as string | undefined

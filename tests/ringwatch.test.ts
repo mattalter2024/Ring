@@ -1275,6 +1275,141 @@ describe('Always-Live Stream Continuity & Improved AI Box Detection', () => {
   })
 })
 
+describe('Security Hardening', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('enforces per-session token auth, strict CORS, safe URI decoding, and HLS extension allowlist on StreamService', async () => {
+    const streamService = new StreamService(() => tmpDir)
+    const port = await streamService.startServer()
+
+    try {
+      const prepared = await streamService.prepareNvrHlsOutput('front-cam')
+      fs.writeFileSync(prepared.playlistPath, '#EXTM3U\nseg_00001.ts\n', 'utf-8')
+      fs.writeFileSync(path.join(prepared.dirPath, 'seg_00001.ts'), Buffer.alloc(2048, 0x47))
+      fs.writeFileSync(path.join(prepared.dirPath, 'secret.txt'), 'not-hls', 'utf-8')
+
+      // 1. Missing token -> 401
+      const unauthRes = await fetch(`http://127.0.0.1:${port}/hls/${prepared.safeId}/index.m3u8`)
+      expect(unauthRes.status).toBe(401)
+
+      // 2. Wrong token -> 401
+      const badTokenRes = await fetch(
+        `http://127.0.0.1:${port}/media/000000000000000000000000000000000000000000000000/hls/${prepared.safeId}/index.m3u8`,
+      )
+      expect(badTokenRes.status).toBe(401)
+
+      // 3. Malformed percent-encoding -> 400 (must not crash server)
+      const badUriRes = await fetch(`http://127.0.0.1:${port}/media/%E0%A4%A/hls/x`)
+      expect(badUriRes.status).toBe(400)
+
+      // 4. Valid authenticated playlist + relative segment work cleanly
+      const okPlaylist = await fetch(prepared.streamUrl, {
+        headers: { Origin: 'null' },
+      })
+      expect(okPlaylist.status).toBe(200)
+      expect(okPlaylist.headers.get('access-control-allow-origin')).toBe('null')
+      expect(okPlaylist.headers.get('x-content-type-options')).toBe('nosniff')
+
+      const relativeSegUrl = new URL('seg_00001.ts', prepared.streamUrl).toString()
+      const okSeg = await fetch(relativeSegUrl)
+      expect(okSeg.status).toBe(200)
+
+      // 5. Untrusted external web origin never gets CORS access
+      const evilOriginRes = await fetch(prepared.streamUrl, {
+        headers: { Origin: 'https://evil.example' },
+      })
+      expect(evilOriginRes.headers.get('access-control-allow-origin')).toBeNull()
+
+      // 6. Non-HLS file extension in HLS folder is blocked (403)
+      const nonHlsUrl = new URL('secret.txt', prepared.streamUrl).toString()
+      const blockedExtRes = await fetch(nonHlsUrl)
+      expect(blockedExtRes.status).toBe(403)
+
+      // 7. DNS rebinding Host header is rejected with 403
+      const http = await import('node:http')
+      const rebindStatus = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: new URL(prepared.streamUrl).pathname,
+            headers: { Host: `attacker.example:${port}` },
+          },
+          (res) => {
+            res.resume()
+            resolve(res.statusCode ?? 0)
+          },
+        )
+        req.on('error', reject)
+        req.end()
+      })
+      expect(rebindStatus).toBe(403)
+    } finally {
+      streamService.stopAll()
+    }
+  })
+
+  it('auto-migrates legacy plaintext secrets to encrypted storage on load when DPAPI is available', () => {
+    const configPath = path.join(tmpDir, 'ringwatch-config.json')
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        configVersion: 2,
+        mode: 'live',
+        secretsPlain: {
+          ringRefreshToken: 'plain_token_abc',
+          geminiApiKey: 'AIza-plain-key',
+        },
+      }),
+      'utf-8',
+    )
+
+    const mockDpapi: SecretCryptoAdapter = {
+      isEncryptionAvailable: () => true,
+      encryptString: (v) => Buffer.from(`dpapi:${v}`, 'utf-8'),
+      decryptString: (b) => b.toString('utf-8').replace(/^dpapi:/, ''),
+    }
+
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'), mockDpapi)
+    expect(store.getRingRefreshToken()).toBe('plain_token_abc')
+    expect(store.getGeminiApiKey()).toBe('AIza-plain-key')
+
+    const onDisk = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>
+    expect(onDisk.secretsPlain).toBeUndefined()
+    expect(onDisk.secretsEncrypted).toBeDefined()
+    expect(JSON.stringify(onDisk)).not.toContain('plain_token_abc')
+    expect(JSON.stringify(onDisk)).not.toContain('AIza-plain-key')
+  })
+
+  it('refuses to download Ring cloud recordings over non-HTTPS URLs', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    const streamService = new StreamService(() => store.getPublicSettings().recordingsDir)
+    const recordingService = new RecordingService(tmpDir, store, streamService)
+
+    await expect(
+      recordingService.downloadCloudRecording({
+        cameraId: 'cam-1',
+        cameraName: 'Front',
+        dingId: '12345',
+        durationSeconds: 30,
+        camera: {
+          recordToFile: async () => {},
+          getSnapshot: async () => Buffer.alloc(0),
+          getRecordingUrl: async () => 'http://127.0.0.1:8080/internal-secret',
+        },
+      }),
+    ).rejects.toThrow(/non-HTTPS/i)
+  })
+})
+
 
 
 

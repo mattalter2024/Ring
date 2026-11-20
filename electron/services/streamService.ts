@@ -2,6 +2,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import crypto from 'node:crypto'
 import type { LiveStreamSession } from '../../shared/types'
 
 interface ActiveRingStream {
@@ -34,10 +35,17 @@ export interface StreamableRingCamera {
   }>
 }
 
+const ALLOWED_DEV_ORIGINS = new Set([
+  'http://127.0.0.1:5173',
+  'http://localhost:5173',
+])
+
 export class StreamService {
   private server: http.Server | null = null
   private port = 0
   private sessionSeq = 0
+  private readonly authToken: string
+  private readonly authTokenBuf: Buffer
   private readonly hlsRoot: string
   private readonly activeStreams = new Map<string, ActiveRingStream>()
   private readonly nvrHlsFeeds = new Map<
@@ -57,8 +65,10 @@ export class StreamService {
   ) {
     this.getRecordingsDir = getRecordingsDir
     this.getAdditionalRecordingsDirs = getAdditionalRecordingsDirs
+    this.authToken = crypto.randomBytes(24).toString('hex')
+    this.authTokenBuf = Buffer.from(this.authToken, 'utf-8')
     this.hlsRoot = path.join(os.tmpdir(), 'ringwatch-hls')
-    fs.mkdirSync(this.hlsRoot, { recursive: true })
+    fs.mkdirSync(this.hlsRoot, { recursive: true, mode: 0o700 })
   }
 
   setRecordingPathResolver(resolver: (id: string) => string | undefined): void {
@@ -94,15 +104,19 @@ export class StreamService {
     })
   }
 
+  private buildAuthenticatedBaseUrl(): string {
+    return `http://127.0.0.1:${this.port}/media/${this.authToken}`
+  }
+
   getRecordingPlaybackUrl(fileName: string): string {
     if (!this.port) return ''
-    return `http://127.0.0.1:${this.port}/recordings/${encodeURIComponent(fileName)}`
+    return `${this.buildAuthenticatedBaseUrl()}/recordings/${encodeURIComponent(fileName)}`
   }
 
   getRecordingPlaybackUrlById(recordingId: string, fallbackFileName?: string): string {
     if (!this.port) return ''
     if (this.recordingPathResolver) {
-      return `http://127.0.0.1:${this.port}/recording-id/${encodeURIComponent(recordingId)}`
+      return `${this.buildAuthenticatedBaseUrl()}/recording-id/${encodeURIComponent(recordingId)}`
     }
     return this.getRecordingPlaybackUrl(fallbackFileName ?? recordingId)
   }
@@ -127,13 +141,45 @@ export class StreamService {
     })
   }
 
+  private isValidHostHeader(hostHeader: string | undefined): boolean {
+    if (!hostHeader) return true
+    const lower = hostHeader.trim().toLowerCase()
+    return (
+      lower === `127.0.0.1:${this.port}` ||
+      lower === `localhost:${this.port}` ||
+      lower === `[::1]:${this.port}`
+    )
+  }
+
+  private verifyAuthToken(candidate: string): boolean {
+    const candidateBuf = Buffer.from(candidate, 'utf-8')
+    if (candidateBuf.length !== this.authTokenBuf.length) {
+      return false
+    }
+    return crypto.timingSafeEqual(candidateBuf, this.authTokenBuf)
+  }
+
   private handleHttpRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): void {
-    res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Range')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('Vary', 'Origin')
+
+    // Reject DNS rebinding attempts using non-loopback Host headers
+    if (!this.isValidHostHeader(req.headers.host)) {
+      res.writeHead(403)
+      res.end('Forbidden')
+      return
+    }
+
+    // Restrict CORS to Electron's file:// renderer ("null") and local Vite dev server only
+    const origin = req.headers.origin
+    if (origin === 'null' || (origin && ALLOWED_DEV_ORIGINS.has(origin))) {
+      res.setHeader('Access-Control-Allow-Origin', origin)
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers', 'Range')
+    }
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204)
@@ -141,13 +187,61 @@ export class StreamService {
       return
     }
 
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405)
+      res.end('Method Not Allowed')
+      return
+    }
+
     const rawUrl = req.url ?? '/'
-    const cleanPath = decodeURIComponent(rawUrl.split('?')[0])
+    let decodedPath: string
+    try {
+      decodedPath = decodeURIComponent(rawUrl.split('?')[0])
+    } catch {
+      res.writeHead(400)
+      res.end('Bad Request')
+      return
+    }
+
+    if (decodedPath.includes('\0')) {
+      res.writeHead(400)
+      res.end('Bad Request')
+      return
+    }
+
+    // Require per-session secret token in path prefix: /media/<token>/<route>
+    if (!decodedPath.startsWith('/media/')) {
+      res.writeHead(401)
+      res.end('Unauthorized')
+      return
+    }
+    const afterMedia = decodedPath.slice('/media/'.length)
+    const slashIdx = afterMedia.indexOf('/')
+    if (slashIdx <= 0) {
+      res.writeHead(401)
+      res.end('Unauthorized')
+      return
+    }
+    const candidateToken = afterMedia.slice(0, slashIdx)
+    if (!this.verifyAuthToken(candidateToken)) {
+      res.writeHead(401)
+      res.end('Unauthorized')
+      return
+    }
+
+    const cleanPath = afterMedia.slice(slashIdx)
 
     if (cleanPath.startsWith('/hls/')) {
       const relative = cleanPath.slice('/hls/'.length)
-      const fullPath = path.resolve(this.hlsRoot, relative)
-      if (!fullPath.startsWith(path.resolve(this.hlsRoot))) {
+      const resolvedHlsRoot = path.resolve(this.hlsRoot)
+      const fullPath = path.resolve(resolvedHlsRoot, relative)
+      if (!this.isPathInsideRoots(fullPath, [resolvedHlsRoot])) {
+        res.writeHead(403)
+        res.end('Forbidden')
+        return
+      }
+      const ext = path.extname(fullPath).toLowerCase()
+      if (ext !== '.m3u8' && ext !== '.ts') {
         res.writeHead(403)
         res.end('Forbidden')
         return
@@ -158,13 +252,8 @@ export class StreamService {
         return
       }
       const stat = fs.statSync(fullPath)
-      const ext = path.extname(fullPath).toLowerCase()
       const contentType =
-        ext === '.m3u8'
-          ? 'application/vnd.apple.mpegurl'
-          : ext === '.ts'
-            ? 'video/mp2t'
-            : 'application/octet-stream'
+        ext === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp2t'
       res.writeHead(200, {
         'Content-Type': contentType,
         'Content-Length': stat.size,
@@ -194,6 +283,7 @@ export class StreamService {
       const targetPath = this.recordingPathResolver(recId)
       if (
         !targetPath ||
+        path.extname(targetPath).toLowerCase() !== '.mp4' ||
         !fs.existsSync(targetPath) ||
         !fs.statSync(targetPath).isFile()
       ) {
@@ -217,6 +307,7 @@ export class StreamService {
         const candidate = path.resolve(root, relPart)
         if (
           this.isPathInsideRoots(candidate, [root]) &&
+          path.extname(candidate).toLowerCase() === '.mp4' &&
           fs.existsSync(candidate) &&
           fs.statSync(candidate).isFile()
         ) {
@@ -427,7 +518,7 @@ export class StreamService {
       playlistPath,
       ffmpegPlaylistPath,
       ffmpegSegmentPattern,
-      streamUrl: `http://127.0.0.1:${this.port}/hls/${sessionKey}/index.m3u8`,
+      streamUrl: `${this.buildAuthenticatedBaseUrl()}/hls/${sessionKey}/index.m3u8`,
     }
   }
 
@@ -615,7 +706,7 @@ export class StreamService {
     const session: LiveStreamSession = {
       cameraId,
       mode: 'hls',
-      streamUrl: `http://127.0.0.1:${this.port}/hls/${sessionKey}/index.m3u8`,
+      streamUrl: `${this.buildAuthenticatedBaseUrl()}/hls/${sessionKey}/index.m3u8`,
       startedAt: new Date().toISOString(),
       audioEnabled: true,
     }

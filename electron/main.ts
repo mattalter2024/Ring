@@ -9,6 +9,7 @@ import {
   nativeTheme,
   powerSaveBlocker,
   safeStorage,
+  session,
   shell,
   systemPreferences,
 } from 'electron'
@@ -35,6 +36,24 @@ if (process.platform === 'win32') {
 }
 
 nativeTheme.themeSource = 'system'
+
+function assertSafeDrivePath(drivePath: unknown): string {
+  if (typeof drivePath !== 'string') {
+    throw new Error('Invalid drive path')
+  }
+  const trimmed = drivePath.trim()
+  if (!trimmed || trimmed.includes('\0')) {
+    throw new Error('Invalid drive path')
+  }
+  if (!path.isAbsolute(trimmed)) {
+    throw new Error('Drive path must be an absolute path')
+  }
+  const segments = trimmed.split(/[\\/]+/)
+  if (segments.includes('..')) {
+    throw new Error('Drive path cannot contain parent directory traversal')
+  }
+  return trimmed
+}
 
 function getSystemThemeInfo(): SystemThemeInfo {
   let accentColor: string | null = null
@@ -236,8 +255,22 @@ function createMainWindow(): void {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
     },
+  })
+
+  // Deny all new-window popups and block unexpected navigations outside the app bundle
+  const isDev = process.env.NODE_ENV === 'development'
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
+    const allowed = isDev
+      ? targetUrl.startsWith('http://127.0.0.1:5173/') || targetUrl === 'http://127.0.0.1:5173'
+      : targetUrl.startsWith('file://')
+    if (!allowed) {
+      event.preventDefault()
+    }
   })
 
   mainWindow.on('close', (event) => {
@@ -252,7 +285,6 @@ function createMainWindow(): void {
     mainWindow = null
   })
 
-  const isDev = process.env.NODE_ENV === 'development'
   if (isDev) {
     void mainWindow.loadURL('http://127.0.0.1:5173')
   } else {
@@ -289,9 +321,12 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('ringwatch:disconnect', () => ringService.disconnectRing())
 
-  ipcMain.handle('ringwatch:switch-mode', (_e, mode: AppMode) =>
-    ringService.switchMode(mode),
-  )
+  ipcMain.handle('ringwatch:switch-mode', (_e, mode: AppMode) => {
+    if (mode !== 'demo' && mode !== 'live') {
+      throw new Error('Invalid application mode')
+    }
+    return ringService.switchMode(mode)
+  })
 
   ipcMain.handle('ringwatch:refresh-devices', () => ringService.refreshDevices())
 
@@ -321,8 +356,12 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     'ringwatch:set-alarm-mode',
-    (_e, params: { locationId: string; mode: 'none' | 'some' | 'all' }) =>
-      ringService.setAlarmMode(params.locationId, params.mode),
+    (_e, params: { locationId: string; mode: 'none' | 'some' | 'all' }) => {
+      if (params.mode !== 'none' && params.mode !== 'some' && params.mode !== 'all') {
+        throw new Error('Invalid alarm mode')
+      }
+      return ringService.setAlarmMode(params.locationId, params.mode)
+    },
   )
 
   ipcMain.handle('ringwatch:get-nvr-status', () => ringService.getNvrStatus())
@@ -354,7 +393,16 @@ function registerIpcHandlers(): void {
         durationSeconds: number
         trigger?: LocalRecordingItem['trigger']
       },
-    ) => ringService.captureRecording(params),
+    ) => {
+      const clampedDuration = Math.max(
+        5,
+        Math.min(300, Math.round(Number(params.durationSeconds) || 30)),
+      )
+      return ringService.captureRecording({
+        ...params,
+        durationSeconds: clampedDuration,
+      })
+    },
   )
 
   ipcMain.handle('ringwatch:list-recordings', () =>
@@ -423,7 +471,8 @@ function registerIpcHandlers(): void {
   )
 
   ipcMain.handle('ringwatch:set-primary-drive', (_e, drivePath: string) => {
-    const targetDir = path.join(drivePath, 'RingWatch-NVR')
+    const safeDrive = assertSafeDrivePath(drivePath)
+    const targetDir = path.join(safeDrive, 'RingWatch-NVR')
     fs.mkdirSync(targetDir, { recursive: true })
     const settings = configStore.updateSettings({ recordingsDir: targetDir })
     const res = recordingService.rescanDirectory()
@@ -436,7 +485,8 @@ function registerIpcHandlers(): void {
   })
 
   ipcMain.handle('ringwatch:set-failover-drive', (_e, drivePath: string) => {
-    const targetDir = path.join(drivePath, 'RingWatch-Failover')
+    const safeDrive = assertSafeDrivePath(drivePath)
+    const targetDir = path.join(safeDrive, 'RingWatch-Failover')
     fs.mkdirSync(targetDir, { recursive: true })
     const settings = configStore.updateSettings({ failoverRecordingsDir: targetDir })
     const res = recordingService.rescanDirectory()
@@ -591,6 +641,13 @@ if (!singleInstanceLock) {
   })
 
   void app.whenReady().then(async () => {
+    // Deny all web-platform permission requests (camera/mic/geolocation/clipboard/etc.);
+    // RingWatch uses main-process Electron notifications and loopback playback only.
+    session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => {
+      callback(false)
+    })
+    session.defaultSession.setPermissionCheckHandler(() => false)
+
     const userDataDir = app.getPath('userData')
     const defaultRecordingsDir = path.join(app.getPath('videos'), 'RingWatch')
     fs.mkdirSync(defaultRecordingsDir, { recursive: true })

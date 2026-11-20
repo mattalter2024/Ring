@@ -189,6 +189,15 @@ export class ConfigStore {
       }
 
       this.secrets = this.readSecrets(parsed)
+      // If legacy plaintext secrets existed on disk and OS encryption is now available,
+      // immediately re-persist so secretsPlain is removed and replaced with encrypted values.
+      if (
+        parsed.secretsPlain &&
+        Object.keys(parsed.secretsPlain).length > 0 &&
+        this.cryptoAdapter?.isEncryptionAvailable()
+      ) {
+        migrated = true
+      }
       return { config: merged, migrated }
     } catch {
       return { config: defaults, migrated: false }
@@ -269,7 +278,10 @@ export class ConfigStore {
       payload.secretsPlain = { ...this.secrets }
     }
 
-    fs.writeFileSync(this.configPath, JSON.stringify(payload, null, 2), 'utf-8')
+    fs.writeFileSync(this.configPath, JSON.stringify(payload, null, 2), {
+      encoding: 'utf-8',
+      mode: 0o600,
+    })
   }
 
   getPublicSettings(): AppSettings {
