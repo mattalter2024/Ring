@@ -2339,6 +2339,244 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
   })
 })
 
+describe('Vault Actions, Demo Video Cleanup & Clear All Videos', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  })
+
+  it('auto-purges demo videos in Live Mode and skips demo files during rescanDirectory', () => {
+    const store = new ConfigStore(tmpDir)
+    const recDir = path.join(tmpDir, 'recordings')
+    fs.mkdirSync(recDir, { recursive: true })
+    store.updateSettings({ recordingsDir: recDir, mode: 'demo' })
+
+    const streamService = new StreamService(() => recDir)
+    const recService = new RecordingService(tmpDir, store, streamService)
+
+    const demoFile = path.join(recDir, 'front-porch-doorbell-pro_package_2026-01-01_10-00-00.mp4')
+    const realFile = path.join(recDir, 'garage-cam_motion_2026-01-01_10-05-00.mp4')
+    fs.writeFileSync(demoFile, Buffer.alloc(4096, 0x11))
+    fs.writeFileSync(realFile, Buffer.alloc(4096, 0x22))
+
+    // In Demo Mode, both are indexed
+    const demoScan = recService.rescanDirectory()
+    expect(demoScan.recordings.length).toBe(2)
+
+    // Switch to Live Mode -> listRecordings hides demo clips immediately
+    store.updateSettings({ mode: 'live' })
+    const liveListed = recService.listRecordings()
+    expect(liveListed.length).toBe(1)
+    expect(liveListed[0].fileName).toBe(path.basename(realFile))
+
+    // purgeDemoRecordings removes demo MP4 from disk and index while preserving real recordings
+    const purged = recService.purgeDemoRecordings()
+    expect(purged.deletedCount).toBe(1)
+    expect(fs.existsSync(demoFile)).toBe(false)
+    expect(fs.existsSync(realFile)).toBe(true)
+
+    // Even if a leftover demo MP4 reappears on disk in Live Mode, rescanDirectory skips it
+    const strayDemo = path.join(recDir, 'driveway-floodlight-cam_motion_2026-01-01_11-00-00.mp4')
+    fs.writeFileSync(strayDemo, Buffer.alloc(4096, 0x33))
+    const liveScan = recService.rescanDirectory()
+    expect(liveScan.recordings.length).toBe(1)
+    expect(liveScan.recordings[0].fileName).toBe(path.basename(realFile))
+  })
+
+  it('supports Clear All Videos (preserving or deleting starred clips), binary MP4 import, Evidence Bundle export, and folder path APIs with RBAC', async () => {
+    const recDir = path.join(tmpDir, 'recordings')
+    const webDir = path.join(tmpDir, 'web')
+    fs.mkdirSync(webDir, { recursive: true })
+    fs.writeFileSync(path.join(webDir, 'index.html'), '<html>ok</html>')
+
+    const preStore = new ConfigStore(tmpDir, recDir)
+    preStore.updateSettings({ continuousAutoStart: false })
+
+    const server = new RingWatchServer({
+      host: '127.0.0.1',
+      port: 0,
+      dataDir: tmpDir,
+      defaultRecordingsDir: recDir,
+      webDistDir: webDir,
+      demoAssetsDir: path.join(tmpDir, 'no-demo-assets'),
+    })
+
+    const { port } = await server.start()
+    const base = `http://127.0.0.1:${port}`
+
+    try {
+      // Create Admin + Viewer users to verify RBAC on vault endpoints
+      const createAdmin = await fetch(`${base}/api/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'admin',
+          displayName: 'Admin',
+          role: 'admin',
+          password: 'admin-password',
+        }),
+      })
+      expect(createAdmin.status).toBe(201)
+      await createAdmin.text()
+      const adminCookie = (createAdmin.headers.get('set-cookie') ?? '').split(';')[0]
+
+      const createViewer = await fetch(`${base}/api/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+        body: JSON.stringify({
+          username: 'viewer',
+          displayName: 'Viewer',
+          role: 'viewer',
+          password: 'viewer-password',
+        }),
+      })
+      expect(createViewer.status).toBe(201)
+      await createViewer.text()
+
+      const viewerLogin = await fetch(`${base}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'viewer', password: 'viewer-password' }),
+      })
+      expect(viewerLogin.status).toBe(200)
+      await viewerLogin.text()
+      const viewerCookie = (viewerLogin.headers.get('set-cookie') ?? '').split(';')[0]
+
+      // 1. Viewer cannot import or clear all videos (403)
+      const viewerImport = await fetch(`${base}/api/recordings/import`, {
+        method: 'POST',
+        headers: {
+          Cookie: viewerCookie,
+          'Content-Type': 'video/mp4',
+          'X-Filename': 'test.mp4',
+        },
+        body: Buffer.alloc(4096, 0x41),
+      })
+      expect(viewerImport.status).toBe(403)
+      await viewerImport.text()
+
+      const viewerClear = await fetch(`${base}/api/recordings`, {
+        method: 'DELETE',
+        headers: { Cookie: viewerCookie },
+      })
+      expect(viewerClear.status).toBe(403)
+      await viewerClear.text()
+
+      // 2. Admin imports two MP4 files via POST /api/recordings/import
+      const upload1 = await fetch(`${base}/api/recordings/import`, {
+        method: 'POST',
+        headers: {
+          Cookie: adminCookie,
+          'Content-Type': 'video/mp4',
+          'X-Filename': encodeURIComponent('porch clip 1.mp4'),
+        },
+        body: Buffer.alloc(4096, 0x55),
+      })
+      expect(upload1.status).toBe(201)
+      const clip1 = (await upload1.json()) as { id: string; filePath: string; fileName: string }
+      expect(fs.existsSync(clip1.filePath)).toBe(true)
+
+      const upload2 = await fetch(`${base}/api/recordings/import`, {
+        method: 'POST',
+        headers: {
+          Cookie: adminCookie,
+          'Content-Type': 'video/mp4',
+          'X-Filename': 'porch_clip_2.mp4',
+        },
+        body: Buffer.alloc(4096, 0x66),
+      })
+      expect(upload2.status).toBe(201)
+      const clip2 = (await upload2.json()) as { id: string; filePath: string }
+
+      // Star clip1
+      const starRes = await fetch(`${base}/api/recordings/${clip1.id}/star`, {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      })
+      expect(starRes.status).toBe(200)
+      await starRes.text()
+
+      // 3. Evidence Bundle export writes valid MP4 + SHA-256 .evidence.json manifest (no EISDIR!)
+      const evRes = await fetch(`${base}/api/recordings/${clip1.id}/evidence`, {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      })
+      expect(evRes.status).toBe(200)
+      const bundle = (await evRes.json()) as {
+        videoPath: string
+        manifestPath: string
+        sha256: string
+      }
+      expect(fs.existsSync(bundle.videoPath)).toBe(true)
+      expect(fs.existsSync(bundle.manifestPath)).toBe(true)
+      expect(bundle.sha256).toMatch(/^[0-9a-f]{64}$/)
+
+      // 4. Open Folder endpoints return exact path for clipboard/toast feedback
+      const rootFolderRes = await fetch(`${base}/api/recordings/open-folder`, {
+        method: 'POST',
+        headers: { Cookie: viewerCookie },
+      })
+      expect(rootFolderRes.status).toBe(200)
+      const rootFolderJson = (await rootFolderRes.json()) as { ok: boolean; path: string }
+      expect(rootFolderJson.ok).toBe(true)
+      expect(rootFolderJson.path).toBeTruthy()
+
+      const clipFolderRes = await fetch(`${base}/api/recordings/${clip1.id}/open-folder`, {
+        method: 'POST',
+        headers: { Cookie: viewerCookie },
+      })
+      expect(clipFolderRes.status).toBe(200)
+      const clipFolderJson = (await clipFolderRes.json()) as {
+        ok: boolean
+        path: string
+        dir: string
+      }
+      expect(clipFolderJson.ok).toBe(true)
+      expect(clipFolderJson.path).toBe(clip1.filePath)
+      expect(clipFolderJson.dir).toBe(path.dirname(clip1.filePath))
+
+      // 5. DELETE /api/recordings?includeStarred=0 keeps starred clip1 and deletes unstarred clip2
+      const clearUnstarred = await fetch(`${base}/api/recordings?includeStarred=0`, {
+        method: 'DELETE',
+        headers: { Cookie: adminCookie },
+      })
+      expect(clearUnstarred.status).toBe(200)
+      const clearUnstarredJson = (await clearUnstarred.json()) as {
+        deletedCount: number
+        remainingCount: number
+      }
+      expect(clearUnstarredJson.deletedCount).toBe(1)
+      expect(clearUnstarredJson.remainingCount).toBe(1)
+      expect(fs.existsSync(clip1.filePath)).toBe(true)
+      expect(fs.existsSync(clip2.filePath)).toBe(false)
+
+      // 6. DELETE /api/recordings (default includeStarred=1) wipes ALL videos including starred clips
+      const clearAll = await fetch(`${base}/api/recordings`, {
+        method: 'DELETE',
+        headers: { Cookie: adminCookie },
+      })
+      expect(clearAll.status).toBe(200)
+      const clearAllJson = (await clearAll.json()) as {
+        deletedCount: number
+        remainingCount: number
+        stats: { totalClips: number }
+      }
+      expect(clearAllJson.deletedCount).toBe(1)
+      expect(clearAllJson.remainingCount).toBe(0)
+      expect(clearAllJson.stats.totalClips).toBe(0)
+      expect(fs.existsSync(clip1.filePath)).toBe(false)
+    } finally {
+      await server.stop()
+    }
+  })
+})
+
+
 
 
 

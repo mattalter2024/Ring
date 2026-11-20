@@ -366,6 +366,15 @@ export const webRingWatchApi: RingWatchApi = {
       method: 'DELETE',
     })
   },
+  clearAllRecordings: (includeStarred = true) =>
+    apiJson<{
+      deletedCount: number
+      freedBytes: number
+      remainingCount: number
+      stats: StorageStats
+    }>(`/api/recordings?includeStarred=${includeStarred ? '1' : '0'}`, {
+      method: 'DELETE',
+    }),
   toggleRecordingStar: (recordingId: string) =>
     apiJson<LocalRecordingItem>(
       `/api/recordings/${encodeURIComponent(recordingId)}/star`,
@@ -387,7 +396,71 @@ export const webRingWatchApi: RingWatchApi = {
       `/api/recordings/${encodeURIComponent(recordingId)}/evidence`,
       { method: 'POST' },
     ),
-  importLocalVideos: async () => [],
+  importLocalVideos: async () => {
+    const files = await new Promise<File[]>((resolve) => {
+      const input = document.createElement('input')
+      input.type = 'file'
+      input.accept = 'video/mp4,.mp4'
+      input.multiple = true
+      input.style.position = 'fixed'
+      input.style.left = '-9999px'
+      document.body.appendChild(input)
+
+      let settled = false
+      const done = (selected: File[]) => {
+        if (settled) return
+        settled = true
+        window.removeEventListener('focus', onWindowFocus)
+        input.remove()
+        resolve(selected)
+      }
+      const onWindowFocus = () => {
+        setTimeout(() => {
+          if (!settled) {
+            done(input.files ? Array.from(input.files) : [])
+          }
+        }, 400)
+      }
+      input.addEventListener('change', () => {
+        done(input.files ? Array.from(input.files) : [])
+      })
+      input.addEventListener('cancel', () => done([]))
+      window.addEventListener('focus', onWindowFocus)
+      input.click()
+    })
+
+    if (files.length === 0) return []
+    const imported: LocalRecordingItem[] = []
+    for (const file of files) {
+      const res = await fetch('/api/recordings/import', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': file.type || 'video/mp4',
+          'X-Filename': encodeURIComponent(file.name),
+        },
+        body: file,
+      })
+      const text = await res.text()
+      let parsed: unknown = null
+      if (text) {
+        try {
+          parsed = JSON.parse(text)
+        } catch {
+          parsed = null
+        }
+      }
+      if (!res.ok) {
+        const msg =
+          parsed && typeof parsed === 'object' && 'error' in parsed
+            ? String((parsed as { error: unknown }).error)
+            : `HTTP ${res.status}`
+        throw new ApiError(res.status, msg)
+      }
+      imported.push(parsed as LocalRecordingItem)
+    }
+    return imported
+  },
   getStorageStats: () => apiJson<StorageStats>('/api/storage/stats'),
   listStorageDrives: () => apiJson<StorageDriveInfo[]>('/api/storage/drives'),
   setPrimaryStorageDrive: (drivePath: string) =>
@@ -415,15 +488,15 @@ export const webRingWatchApi: RingWatchApi = {
       '/api/storage/prune',
       { method: 'POST' },
     ),
-  openRecordingInFolder: async (recordingId: string) => {
-    await apiJson(
+  openRecordingInFolder: (recordingId: string) =>
+    apiJson<{ ok: boolean; path?: string; dir?: string }>(
       `/api/recordings/${encodeURIComponent(recordingId)}/open-folder`,
       { method: 'POST' },
-    )
-  },
-  openRecordingsRootFolder: async () => {
-    await apiJson('/api/recordings/open-folder', { method: 'POST' })
-  },
+    ),
+  openRecordingsRootFolder: () =>
+    apiJson<{ ok: boolean; path?: string }>('/api/recordings/open-folder', {
+      method: 'POST',
+    }),
   listCloudRecordings: (cameraId: string) =>
     apiJson<CloudRecordingItem[]>(
       `/api/cameras/${encodeURIComponent(cameraId)}/cloud-recordings`,

@@ -326,6 +326,118 @@ export function App() {
     }
   }
 
+  const copyTextQuietly = async (text: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text)
+        return true
+      }
+    } catch {
+      // Clipboard API may be unavailable on non-HTTPS LAN origins
+    }
+    return false
+  }
+
+  const handleOpenRootFolder = async () => {
+    if (!api) {
+      pushToast('Vault Folder', settings.recordingsDir, 'info')
+      return
+    }
+    try {
+      const res = await api.openRecordingsRootFolder()
+      const folderPath = res?.path || settings.recordingsDir
+      const copied = await copyTextQuietly(folderPath)
+      pushToast(
+        'Recordings Vault Folder',
+        copied
+          ? `Path copied to clipboard: ${folderPath}`
+          : `Server folder path: ${folderPath}`,
+        'info',
+      )
+    } catch (err) {
+      pushToast(
+        'Could Not Open Folder',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
+  }
+
+  const handleOpenRecordingInFolder = async (recordingId: string) => {
+    if (!api) return
+    try {
+      const res = await api.openRecordingInFolder(recordingId)
+      const targetPath = res?.path || res?.dir || settings.recordingsDir
+      const copied = await copyTextQuietly(targetPath)
+      pushToast(
+        'Recording Location',
+        copied
+          ? `File path copied to clipboard: ${targetPath}`
+          : `Server file path: ${targetPath}`,
+        'info',
+      )
+    } catch (err) {
+      pushToast(
+        'Could Not Locate File',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
+  }
+
+  const handleDeleteRecording = async (recordingId: string) => {
+    if (!api) {
+      setRecordings((prev) => prev.filter((r) => r.id !== recordingId))
+      return
+    }
+    try {
+      await api.deleteLocalRecording(recordingId)
+      setRecordings((prev) => prev.filter((r) => r.id !== recordingId))
+      pushToast('Recording Deleted', 'Removed video file from local vault.', 'info')
+    } catch (err) {
+      pushToast(
+        'Delete Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
+  }
+
+  const handleClearAllRecordings = async () => {
+    const count = recordings.length || storageStats.totalClips
+    const sizeLabel = formatBytes(storageStats.totalBytes)
+    const confirmed = window.confirm(
+      count > 0
+        ? `Delete all ${count} local video recording(s) (${sizeLabel}) from disk?\n\nThis includes starred/protected clips and cannot be undone.`
+        : 'Clear all video files and reset the local recordings index?',
+    )
+    if (!confirmed) return
+
+    if (!api) {
+      setRecordings([])
+      pushToast('All Videos Cleared', 'Removed all local preview clips.', 'ok')
+      return
+    }
+    try {
+      const res = await api.clearAllRecordings(true)
+      setRecordings([])
+      setStorageStats(res.stats)
+      pushToast(
+        'All Videos Cleared',
+        res.deletedCount > 0
+          ? `Deleted ${res.deletedCount} video(s), freeing ${formatBytes(res.freedBytes)}.`
+          : 'Vault is now empty.',
+        'ok',
+      )
+    } catch (err) {
+      pushToast(
+        'Clear All Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
+  }
+
   const handleToggleStar = async (recordingId: string) => {
     if (!api) {
       setRecordings((prev) =>
@@ -333,56 +445,106 @@ export function App() {
       )
       return
     }
-    const updated = await api.toggleRecordingStar(recordingId)
-    pushToast(
-      updated.starred ? 'Clip Protected' : 'Protection Removed',
-      updated.starred
-        ? `${updated.fileName} is locked and exempt from auto-pruning.`
-        : `${updated.fileName} can now be pruned by retention rules.`,
-      'info',
-    )
+    try {
+      const updated = await api.toggleRecordingStar(recordingId)
+      setRecordings((prev) =>
+        prev.map((r) => (r.id === recordingId ? updated : r)),
+      )
+      pushToast(
+        updated.starred ? 'Clip Protected' : 'Protection Removed',
+        updated.starred
+          ? `${updated.fileName} is locked and exempt from auto-pruning.`
+          : `${updated.fileName} can now be pruned by retention rules.`,
+        'info',
+      )
+    } catch (err) {
+      pushToast(
+        'Action Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
   }
 
   const handleExportRecording = async (recordingId: string) => {
     if (!api) return
-    const savedPath = await api.exportRecording(recordingId)
-    if (savedPath) {
-      pushToast('Video Exported', `Saved copy to ${savedPath}`, 'ok')
+    try {
+      const savedPath = await api.exportRecording(recordingId)
+      if (savedPath) {
+        pushToast('Video Download Started', 'Downloading MP4 recording to your browser.', 'ok')
+      }
+    } catch (err) {
+      pushToast(
+        'Export Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
     }
   }
 
   const handleImportVideos = async () => {
     if (!api) return
-    const imported = await api.importLocalVideos()
-    if (imported.length > 0) {
+    try {
+      const imported = await api.importLocalVideos()
+      if (imported.length > 0) {
+        const list = await api.listLocalRecordings()
+        setRecordings(list)
+        const stats = await api.getStorageStats()
+        setStorageStats(stats)
+        pushToast(
+          'Videos Imported',
+          `Imported ${imported.length} MP4 clip(s) into local vault.`,
+          'ok',
+        )
+      }
+    } catch (err) {
       pushToast(
-        'Videos Imported',
-        `Imported ${imported.length} MP4 clip(s) into local storage.`,
-        'ok',
+        'Import Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
       )
     }
   }
 
   const handleRescanStorage = async () => {
     if (!api) return
-    const res = await api.rescanLocalStorage()
-    pushToast(
-      'Disk Folder Rescanned',
-      `Indexed ${res.stats.totalClips} local MP4 clip(s) (${formatBytes(res.stats.totalBytes)}).`,
-      'ok',
-    )
+    try {
+      const res = await api.rescanLocalStorage()
+      setRecordings(res.recordings)
+      setStorageStats(res.stats)
+      pushToast(
+        'Disk Folder Rescanned',
+        `Indexed ${res.stats.totalClips} local MP4 clip(s) (${formatBytes(res.stats.totalBytes)}).`,
+        'ok',
+      )
+    } catch (err) {
+      pushToast(
+        'Rescan Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
   }
 
   const handlePruneStorage = async () => {
     if (!api) return
-    const res = await api.pruneLocalStorage()
-    pushToast(
-      'Storage Cleanup Complete',
-      res.prunedCount > 0
-        ? `Removed ${res.prunedCount} expired/over-quota clip(s), freeing ${formatBytes(res.freedBytes)}.`
-        : 'All local clips are within your quota and retention policy.',
-      'info',
-    )
+    try {
+      const res = await api.pruneLocalStorage()
+      setStorageStats(res.stats)
+      pushToast(
+        'Storage Cleanup Complete',
+        res.prunedCount > 0
+          ? `Removed ${res.prunedCount} expired/over-quota clip(s), freeing ${formatBytes(res.freedBytes)}.`
+          : 'All local clips are within your quota and retention policy.',
+        'info',
+      )
+    } catch (err) {
+      pushToast(
+        'Cleanup Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
   }
 
   const handleCaptureSnapshot = async (cameraId: string) => {
@@ -510,8 +672,16 @@ export function App() {
       }))
       return
     }
-    const updated = await api.updateSettings(patch)
-    setSettings(updated)
+    try {
+      const updated = await api.updateSettings(patch)
+      setSettings(updated)
+    } catch (err) {
+      pushToast(
+        'Settings Update Failed',
+        err instanceof Error ? err.message : String(err),
+        'err',
+      )
+    }
   }
 
   const handleSimulateDemoEvent = async (
@@ -1025,6 +1195,7 @@ export function App() {
               storageStats={storageStats}
               events={events}
               nvrBusy={nvrBusy}
+              canManageRecordings={can('recordings:manage')}
               onToggleAllRecording={handleToggleAllRecording}
               onToggleCameraContinuous={handleToggleCameraContinuous}
               onUpdateSettings={handleUpdateSettings}
@@ -1036,9 +1207,9 @@ export function App() {
               onChooseFailoverFolder={handleChooseFailoverFolder}
               onRescanStorage={handleRescanStorage}
               onPruneStorage={handlePruneStorage}
-              onOpenRootFolder={async () => {
-                if (api) await api.openRecordingsRootFolder()
-              }}
+              onClearAllRecordings={handleClearAllRecordings}
+              onOpenVault={() => setActiveTab('recordings')}
+              onOpenRootFolder={handleOpenRootFolder}
             />
           ) : activeTab === 'timeline' ? (
             <TimelineView
@@ -1049,14 +1220,14 @@ export function App() {
               nvrStatus={nvrStatus}
               nvrBusy={nvrBusy}
               defaultCaptureSeconds={settings.defaultCaptureSeconds}
+              canManageRecordings={can('recordings:manage')}
               onToggleAllRecording={handleToggleAllRecording}
               onSyncCloudEvents={handleSyncCloudEvents}
               onCaptureRecording={handleCaptureRecording}
               onToggleStar={handleToggleStar}
               onExportRecording={handleExportRecording}
-              onOpenInFolder={async (id) => {
-                if (api) await api.openRecordingInFolder(id)
-              }}
+              onOpenInFolder={handleOpenRecordingInFolder}
+              onClearAllRecordings={handleClearAllRecordings}
             />
           ) : activeTab === 'recordings' ? (
             <RecordingsView
@@ -1064,22 +1235,18 @@ export function App() {
               recordings={recordings}
               storageStats={storageStats}
               defaultCaptureSeconds={settings.defaultCaptureSeconds}
+              canManageRecordings={can('recordings:manage')}
               onCaptureRecording={handleCaptureRecording}
-              onDeleteRecording={async (id) => {
-                if (api) await api.deleteLocalRecording(id)
-              }}
+              onDeleteRecording={handleDeleteRecording}
+              onClearAllRecordings={handleClearAllRecordings}
               onToggleStar={handleToggleStar}
               onExportRecording={handleExportRecording}
               onExportEvidenceBundle={handleExportEvidenceBundle}
               onImportVideos={handleImportVideos}
               onRescanStorage={handleRescanStorage}
               onPruneStorage={handlePruneStorage}
-              onOpenInFolder={async (id) => {
-                if (api) await api.openRecordingInFolder(id)
-              }}
-              onOpenRootFolder={async () => {
-                if (api) await api.openRecordingsRootFolder()
-              }}
+              onOpenInFolder={handleOpenRecordingInFolder}
+              onOpenRootFolder={handleOpenRootFolder}
               onListCloudRecordings={handleListCloudRecordings}
               onDownloadCloudRecording={handleDownloadCloudRecording}
             />
@@ -1098,8 +1265,17 @@ export function App() {
               onUpdateSettings={handleUpdateSettings}
               onScanCamera={handleScanPackages}
               onClearDetections={async () => {
-                if (api) await api.clearPackageDetections()
-                setPackageDetections([])
+                try {
+                  if (api) await api.clearPackageDetections()
+                  setPackageDetections([])
+                  pushToast('History Cleared', 'Cleared AI package detection history.', 'info')
+                } catch (err) {
+                  pushToast(
+                    'Clear Failed',
+                    err instanceof Error ? err.message : String(err),
+                    'err',
+                  )
+                }
               }}
               onTestAlert={handleTestAlert}
               onGoToSettings={() => setActiveTab('settings')}

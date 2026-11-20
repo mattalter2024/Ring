@@ -1010,6 +1010,12 @@ export class RingService implements SnapshotSource {
         },
       ])
       .then((recs) => {
+        if (this.configStore.getPublicSettings().mode !== 'demo') {
+          this.recordingService.purgeDemoRecordings()
+          this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
+          this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
+          return
+        }
         this.callbacks.onRecordingsUpdated(recs)
         this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
       })
@@ -1020,6 +1026,25 @@ export class RingService implements SnapshotSource {
     }
 
     return this.getConnection()
+  }
+
+  private purgeDemoStateForLiveMode(): void {
+    const purged = this.recordingService.purgeDemoRecordings()
+    const beforeEvents = this.events.length
+    this.events = this.events.filter(
+      (ev) =>
+        !(ev.deviceId && ev.deviceId.startsWith('demo-')) &&
+        ev.title !== 'Demo Mode Active' &&
+        !ev.detail?.includes('Demo Mode'),
+    )
+    if (this.events.length !== beforeEvents) {
+      this.saveEventsToDisk()
+      this.callbacks.onEventsUpdated?.(this.getEvents())
+    }
+    if (purged.deletedCount > 0) {
+      this.callbacks.onRecordingsUpdated(this.recordingService.listRecordings())
+      this.callbacks.onStorageStatsUpdated(this.recordingService.getStorageStats())
+    }
   }
 
   async switchMode(mode: AppMode): Promise<ConnectionStatus> {
@@ -1041,6 +1066,7 @@ export class RingService implements SnapshotSource {
         error: 'Sign in with your Ring account or paste a Ring refresh token in Settings.',
       }
       this.configStore.updateSettings({ mode: 'live' })
+      this.purgeDemoStateForLiveMode()
       this.emitAllState()
       return this.getConnection()
     }
@@ -1115,7 +1141,7 @@ export class RingService implements SnapshotSource {
       throw new Error('Refresh token cannot be empty')
     }
 
-    // Clear any Demo Mode devices immediately so stale demo cards never persist in Live Mode
+    // Clear any Demo Mode devices, demo recordings, and demo events immediately
     this.locations = []
     this.cameras = []
     this.sensors = []
@@ -1136,6 +1162,7 @@ export class RingService implements SnapshotSource {
       this.ringApi = api
       this.configStore.setRingRefreshToken(trimmed)
       this.configStore.updateSettings({ mode: 'live' })
+      this.purgeDemoStateForLiveMode()
       this.callbacks.onSettingsUpdated?.(this.configStore.getPublicSettings())
 
       const tokenSub = api.onRefreshTokenUpdated.subscribe(({ newRefreshToken }) => {

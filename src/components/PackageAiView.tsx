@@ -369,7 +369,11 @@ export function PackageAiView({
               aria-label="Camera to scan for packages"
               className="select"
               style={{ width: 205, padding: '5px 8px', fontSize: 12.5 }}
-              value={selectedScanCameraId || cameras[0]?.id || ''}
+              value={
+                cameras.some((c) => c.id === selectedScanCameraId)
+                  ? selectedScanCameraId
+                  : (cameras[0]?.id ?? '')
+              }
               onChange={(e) => setSelectedScanCameraId(e.target.value)}
             >
               {cameras.map((c) => (
@@ -385,7 +389,9 @@ export function PackageAiView({
               className="btn btn-warn btn-sm"
               disabled={scanning || cameras.length === 0}
               onClick={async () => {
-                const target = selectedScanCameraId || cameras[0]?.id
+                const target = cameras.some((c) => c.id === selectedScanCameraId)
+                  ? selectedScanCameraId
+                  : cameras[0]?.id
                 if (!target) return
                 setScanning(true)
                 try {

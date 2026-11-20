@@ -580,8 +580,32 @@ export class RecordingService {
     }))
   }
 
+  isDemoFilename(fileName: string): boolean {
+    const lower = path.basename(fileName).toLowerCase()
+    return (
+      lower.startsWith('front-porch-doorbell-pro_') ||
+      lower.startsWith('driveway-floodlight-cam_') ||
+      lower.startsWith('back-patio-stick-up-cam_') ||
+      lower.includes('_demo_')
+    )
+  }
+
+  isDemoRecording(rec: Pick<LocalRecordingItem, 'cameraId' | 'fileName' | 'notes'>): boolean {
+    if (rec.cameraId.startsWith('demo-')) return true
+    if (rec.notes && rec.notes.toLowerCase().includes('demo sample')) return true
+    return this.isDemoFilename(rec.fileName)
+  }
+
+  private getActiveRecordingsForMode(): LocalRecordingItem[] {
+    const mode = this.configStore.getPublicSettings().mode
+    if (mode === 'live') {
+      return this.recordings.filter((r) => !this.isDemoRecording(r))
+    }
+    return this.recordings
+  }
+
   listRecordings(): LocalRecordingItem[] {
-    return this.withPlaybackUrls(this.recordings)
+    return this.withPlaybackUrls(this.getActiveRecordingsForMode())
   }
 
   getRecordingById(id: string): LocalRecordingItem | undefined {
@@ -590,7 +614,7 @@ export class RecordingService {
 
   getStorageStats(overrideFreeDiskBytes?: number): StorageStats {
     const settings = this.configStore.getPublicSettings()
-    const settingsKey = `${settings.recordingsDir}|${settings.failoverRecordingsDir}|${settings.maxStorageGb}|${settings.retentionDays}|${settings.lowDiskWarningGb}|${settings.minFreeDiskGb}`
+    const settingsKey = `${settings.mode}|${settings.recordingsDir}|${settings.failoverRecordingsDir}|${settings.maxStorageGb}|${settings.retentionDays}|${settings.lowDiskWarningGb}|${settings.minFreeDiskGb}`
     const nowMs = Date.now()
     if (
       overrideFreeDiskBytes === undefined &&
@@ -602,7 +626,7 @@ export class RecordingService {
     }
 
     const resolved = this.resolveActiveStorageDir()
-    const active = this.recordings
+    const active = this.getActiveRecordingsForMode()
 
     let totalBytes = 0
     let protectedBytes = 0
@@ -762,6 +786,123 @@ export class RecordingService {
     this.cleanupEmptySubdirs()
   }
 
+  clearAllRecordings(includeStarred = true): {
+    deletedCount: number
+    freedBytes: number
+    remainingCount: number
+    stats: StorageStats
+  } {
+    let deletedCount = 0
+    let freedBytes = 0
+    const keep: LocalRecordingItem[] = []
+
+    for (const rec of this.recordings) {
+      if (!includeStarred && rec.starred) {
+        keep.push(rec)
+        continue
+      }
+      if (rec.filePath && fs.existsSync(rec.filePath)) {
+        try {
+          fs.rmSync(rec.filePath, {
+            force: true,
+            maxRetries: 4,
+            retryDelay: 150,
+          })
+        } catch {
+          // Ignore transient lock
+        }
+      }
+      deletedCount++
+      freedBytes += rec.sizeBytes
+    }
+
+    // Also clear any unindexed leftover demo MP4 files if clearing everything
+    if (includeStarred) {
+      for (const root of this.getAllStorageRoots()) {
+        for (const fullPath of this.collectMp4FilesRecursive(root, 3)) {
+          if (this.isDemoFilename(fullPath)) {
+            try {
+              const stat = fs.statSync(fullPath)
+              fs.rmSync(fullPath, { force: true, maxRetries: 4, retryDelay: 150 })
+              freedBytes += stat.size
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+    }
+
+    this.recordings = keep
+    this.rebuildLookupMaps()
+    this.saveIndexDirty = true
+    this.flushIndexSync()
+    this.cleanupEmptySubdirs()
+
+    return {
+      deletedCount,
+      freedBytes,
+      remainingCount: this.recordings.length,
+      stats: this.getStorageStats(),
+    }
+  }
+
+  purgeDemoRecordings(): { deletedCount: number; freedBytes: number } {
+    let deletedCount = 0
+    let freedBytes = 0
+    const keep: LocalRecordingItem[] = []
+    const removedPaths = new Set<string>()
+
+    for (const rec of this.recordings) {
+      if (this.isDemoRecording(rec)) {
+        removedPaths.add(path.resolve(rec.filePath).toLowerCase())
+        if (rec.filePath && fs.existsSync(rec.filePath)) {
+          try {
+            fs.rmSync(rec.filePath, {
+              force: true,
+              maxRetries: 4,
+              retryDelay: 150,
+            })
+          } catch {
+            // ignore
+          }
+        }
+        deletedCount++
+        freedBytes += rec.sizeBytes
+      } else {
+        keep.push(rec)
+      }
+    }
+
+    // Also remove any unindexed demo MP4 files on disk so rescanDirectory() never re-imports them
+    for (const root of this.getAllStorageRoots()) {
+      for (const fullPath of this.collectMp4FilesRecursive(root, 3)) {
+        const key = path.resolve(fullPath).toLowerCase()
+        if (removedPaths.has(key)) continue
+        if (this.isDemoFilename(fullPath)) {
+          try {
+            const stat = fs.statSync(fullPath)
+            fs.rmSync(fullPath, { force: true, maxRetries: 4, retryDelay: 150 })
+            deletedCount++
+            freedBytes += stat.size
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    if (deletedCount > 0 || keep.length !== this.recordings.length) {
+      this.recordings = keep
+      this.rebuildLookupMaps()
+      this.saveIndexDirty = true
+      this.flushIndexSync()
+      this.cleanupEmptySubdirs()
+    }
+
+    return { deletedCount, freedBytes }
+  }
+
   exportRecording(id: string, destinationPath: string): string {
     const target = this.recordings.find((r) => r.id === id)
     if (!target || !fs.existsSync(target.filePath)) {
@@ -853,6 +994,57 @@ export class RecordingService {
     return imported
   }
 
+  registerUploadedMp4(
+    originalFileName: string,
+    tempFilePath: string,
+  ): LocalRecordingItem {
+    if (!fs.existsSync(tempFilePath)) {
+      throw new Error('Uploaded file not found')
+    }
+    const dir = this.resolveClipDirectory('imported', new Date())
+    const base = path.basename(originalFileName || 'imported.mp4')
+    const safeName = base.replace(/[^a-zA-Z0-9._-]/g, '_') || 'imported.mp4'
+    let fileName = safeName.toLowerCase().endsWith('.mp4')
+      ? safeName
+      : `${safeName}.mp4`
+    let destPath = path.join(dir, fileName)
+    if (fs.existsSync(destPath)) {
+      const ext = path.extname(fileName)
+      const stem = path.basename(fileName, ext)
+      fileName = `${stem}_${Date.now()}${ext}`
+      destPath = path.join(dir, fileName)
+    }
+    try {
+      fs.renameSync(tempFilePath, destPath)
+    } catch {
+      fs.copyFileSync(tempFilePath, destPath)
+      try {
+        fs.rmSync(tempFilePath, { force: true })
+      } catch {
+        // ignore cleanup
+      }
+    }
+    const stat = fs.statSync(destPath)
+    const id = crypto.randomUUID()
+    const item: LocalRecordingItem = {
+      id,
+      cameraId: 'imported-local',
+      cameraName: 'Imported Video',
+      filePath: destPath,
+      fileName,
+      createdAt: new Date().toISOString(),
+      durationSeconds: 30,
+      sizeBytes: stat.size,
+      trigger: 'imported',
+      starred: false,
+      playbackUrl: this.buildPlaybackUrl({ id, fileName }),
+    }
+    this.recordings.unshift(item)
+    this.saveIndex()
+    this.enforceRetentionAndQuota(undefined, undefined, item.id)
+    return item
+  }
+
   private collectMp4FilesRecursive(rootDir: string, maxDepth = 3): string[] {
     const results: string[] = []
     const walk = (dir: string, depth: number) => {
@@ -914,7 +1106,12 @@ export class RecordingService {
 
   rescanDirectory(): { recordings: LocalRecordingItem[]; stats: StorageStats } {
     this.ensureRecordingsDir()
-    this.recordings = this.recordings.filter((r) => fs.existsSync(r.filePath))
+    const isLiveMode = this.configStore.getPublicSettings().mode === 'live'
+    this.recordings = this.recordings.filter((r) => {
+      if (!fs.existsSync(r.filePath)) return false
+      if (isLiveMode && this.isDemoRecording(r)) return false
+      return true
+    })
     const indexedPaths = new Set(
       this.recordings.map((r) => path.resolve(r.filePath).toLowerCase()),
     )
@@ -925,6 +1122,7 @@ export class RecordingService {
       for (const fullPath of mp4Files) {
         const key = path.resolve(fullPath).toLowerCase()
         if (indexedPaths.has(key)) continue
+        if (key.includes(`${path.sep}evidence-exports${path.sep}`)) continue
 
         let stat: fs.Stats
         try {
@@ -935,6 +1133,7 @@ export class RecordingService {
         if (stat.size < 2048) continue
 
         const fileName = path.basename(fullPath)
+        if (isLiveMode && this.isDemoFilename(fileName)) continue
         const parts = fileName.split('_')
         const guessedCam = parts[0]?.replace(/-/g, ' ') || 'Local Camera'
         const titleCam = guessedCam.replace(/\b\w/g, (m) => m.toUpperCase())
@@ -1405,6 +1604,7 @@ export class RecordingService {
       sizeBytes: stat.size,
       trigger: params.trigger,
       starred: Boolean(params.starred),
+      notes: 'Demo sample clip',
       thumbnailDataUrl: params.thumbnailDataUrl,
       playbackUrl: this.buildPlaybackUrl({ id, fileName }),
     }

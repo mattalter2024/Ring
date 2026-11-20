@@ -510,6 +510,12 @@ export interface RingWatchApi {
   }) => Promise<LocalRecordingItem>
   listLocalRecordings: () => Promise<LocalRecordingItem[]>
   deleteLocalRecording: (recordingId: string) => Promise<void>
+  clearAllRecordings: (includeStarred?: boolean) => Promise<{
+    deletedCount: number
+    freedBytes: number
+    remainingCount: number
+    stats: StorageStats
+  }>
   toggleRecordingStar: (recordingId: string) => Promise<LocalRecordingItem>
   exportRecording: (recordingId: string) => Promise<string | null>
   exportEvidenceBundle: (recordingId: string) => Promise<{
@@ -541,8 +547,10 @@ export interface RingWatchApi {
     freedBytes: number
     stats: StorageStats
   }>
-  openRecordingInFolder: (recordingId: string) => Promise<void>
-  openRecordingsRootFolder: () => Promise<void>
+  openRecordingInFolder: (
+    recordingId: string,
+  ) => Promise<{ ok?: boolean; path?: string; dir?: string } | void>
+  openRecordingsRootFolder: () => Promise<{ ok?: boolean; path?: string } | void>
   listCloudRecordings: (cameraId: string) => Promise<CloudRecordingItem[]>
   downloadCloudRecording: (cameraId: string, dingId: string) => Promise<LocalRecordingItem>
 

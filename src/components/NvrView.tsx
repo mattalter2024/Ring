@@ -5,6 +5,7 @@ import {
   Bell,
   CheckCircle2,
   Circle,
+  Film,
   FolderOpen,
   HardDrive,
   Moon,
@@ -14,6 +15,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Square,
+  Trash2,
   Usb,
 } from 'lucide-react'
 import type {
@@ -34,6 +36,7 @@ interface NvrViewProps {
   storageStats: StorageStats
   events: SecurityEvent[]
   nvrBusy: boolean
+  canManageRecordings?: boolean
   onToggleAllRecording: () => Promise<void>
   onToggleCameraContinuous: (cameraId: string, enable: boolean) => Promise<void>
   onUpdateSettings: (patch: AppSettingsPatch) => Promise<void>
@@ -45,6 +48,8 @@ interface NvrViewProps {
   onChooseFailoverFolder: () => Promise<void>
   onRescanStorage: () => Promise<void>
   onPruneStorage: () => Promise<void>
+  onClearAllRecordings: () => Promise<void>
+  onOpenVault: () => void
   onOpenRootFolder: () => Promise<void>
 }
 
@@ -55,6 +60,7 @@ export function NvrView({
   storageStats,
   events,
   nvrBusy,
+  canManageRecordings = true,
   onToggleAllRecording,
   onToggleCameraContinuous,
   onUpdateSettings,
@@ -66,6 +72,8 @@ export function NvrView({
   onChooseFailoverFolder,
   onRescanStorage,
   onPruneStorage,
+  onClearAllRecordings,
+  onOpenVault,
   onOpenRootFolder,
 }: NvrViewProps) {
   const [drives, setDrives] = useState<StorageDriveInfo[]>([])
@@ -245,13 +253,45 @@ export function NvrView({
               )}
             </button>
             <button
+              id="btn-nvr-open-vault"
+              type="button"
+              className="btn"
+              onClick={() => onOpenVault()}
+              title="Open the Recordings Vault in the web app"
+            >
+              <Film size={14} />
+              Open Vault
+            </button>
+            <button
               type="button"
               className="btn"
               onClick={() => void onOpenRootFolder()}
+              title="Copy server recordings folder path & open on host"
             >
               <FolderOpen size={14} />
-              Open Vault
+              Folder Path
             </button>
+            {canManageRecordings && (
+              <button
+                id="btn-nvr-clear-all-videos"
+                type="button"
+                className="btn btn-danger"
+                disabled={actionBusy || storageStats.totalClips === 0}
+                title="Permanently delete all local video recordings from disk"
+                onClick={async () => {
+                  setActionBusy(true)
+                  try {
+                    await onClearAllRecordings()
+                    await refreshDrives()
+                  } finally {
+                    setActionBusy(false)
+                  }
+                }}
+              >
+                <Trash2 size={14} />
+                Clear All Videos
+              </button>
+            )}
           </div>
         </div>
 

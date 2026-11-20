@@ -27,8 +27,10 @@ interface RecordingsViewProps {
   recordings: LocalRecordingItem[]
   storageStats: StorageStats
   defaultCaptureSeconds: number
+  canManageRecordings?: boolean
   onCaptureRecording: (cameraId: string, durationSeconds: number) => Promise<void>
   onDeleteRecording: (recordingId: string) => Promise<void>
+  onClearAllRecordings: () => Promise<void>
   onToggleStar: (recordingId: string) => Promise<void>
   onExportRecording: (recordingId: string) => Promise<void>
   onExportEvidenceBundle?: (recordingId: string) => Promise<void>
@@ -46,12 +48,15 @@ export function RecordingsView({
   recordings,
   storageStats,
   defaultCaptureSeconds,
+  canManageRecordings = true,
   onCaptureRecording,
   onDeleteRecording,
+  onClearAllRecordings,
   onToggleStar,
   onExportRecording,
   onExportEvidenceBundle,
   onImportVideos,
+  onRescanStorage,
   onOpenInFolder,
   onOpenRootFolder,
   onListCloudRecordings,
@@ -70,19 +75,26 @@ export function RecordingsView({
   const [loadingCloud, setLoadingCloud] = useState(false)
   const [downloadingId, setDownloadingId] = useState<string | null>(null)
   const [capturing, setCapturing] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const [rescanning, setRescanning] = useState(false)
+  const [clearingAll, setClearingAll] = useState(false)
 
   useEffect(() => {
     setVisibleLimit(60)
   }, [filterCameraId, starredOnly])
 
   useEffect(() => {
-    if (!cloudCameraId && cameras[0]?.id) {
+    if ((!cloudCameraId || !cameras.some((c) => c.id === cloudCameraId)) && cameras[0]?.id) {
       setCloudCameraId(cameras[0].id)
     }
   }, [cameras, cloudCameraId])
 
   useEffect(() => {
-    if (recordings.length > 0 && !recordings.some((r) => r.id === selectedLocalId)) {
+    if (recordings.length === 0) {
+      if (selectedLocalId !== null) setSelectedLocalId(null)
+      return
+    }
+    if (!recordings.some((r) => r.id === selectedLocalId)) {
       setSelectedLocalId(recordings[0].id)
     }
   }, [recordings, selectedLocalId])
@@ -163,23 +175,71 @@ export function RecordingsView({
           </div>
 
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+            {canManageRecordings && (
+              <button
+                id="btn-import-videos"
+                type="button"
+                className="btn btn-sm"
+                disabled={importing}
+                onClick={async () => {
+                  setImporting(true)
+                  try {
+                    await onImportVideos()
+                  } finally {
+                    setImporting(false)
+                  }
+                }}
+              >
+                <Upload size={13} />
+                {importing ? 'Importing…' : 'Import MP4'}
+              </button>
+            )}
             <button
-              id="btn-import-videos"
               type="button"
               className="btn btn-sm"
-              onClick={() => void onImportVideos()}
+              disabled={rescanning}
+              title="Rescan recordings folder on the server"
+              onClick={async () => {
+                setRescanning(true)
+                try {
+                  await onRescanStorage()
+                } finally {
+                  setRescanning(false)
+                }
+              }}
             >
-              <Upload size={13} />
-              Import MP4
+              <RefreshCw size={13} className={rescanning ? 'spin' : ''} />
+              {rescanning ? 'Scanning…' : 'Rescan'}
             </button>
             <button
               type="button"
               className="btn btn-sm"
+              title="Copy server recordings folder path & open on host"
               onClick={() => void onOpenRootFolder()}
             >
               <FolderOpen size={13} />
               Open Folder
             </button>
+            {canManageRecordings && (
+              <button
+                id="btn-clear-all-videos"
+                type="button"
+                className="btn btn-danger btn-sm"
+                disabled={clearingAll || recordings.length === 0}
+                title="Permanently delete all local video recordings from disk"
+                onClick={async () => {
+                  setClearingAll(true)
+                  try {
+                    await onClearAllRecordings()
+                  } finally {
+                    setClearingAll(false)
+                  }
+                }}
+              >
+                <Trash2 size={13} />
+                {clearingAll ? 'Clearing…' : 'Clear All Videos'}
+              </button>
+            )}
           </div>
         </div>
       </section>
@@ -357,18 +417,20 @@ export function RecordingsView({
                       style={{ display: 'flex', gap: 5 }}
                       onClick={(e) => e.stopPropagation()}
                     >
-                      <button
-                        type="button"
-                        className={`btn btn-icon ${rec.starred ? 'btn-warn' : ''}`}
-                        title={
-                          rec.starred
-                            ? 'Unprotect clip'
-                            : 'Star/Protect clip from auto-pruning'
-                        }
-                        onClick={() => void onToggleStar(rec.id)}
-                      >
-                        <Star size={13} fill={rec.starred ? 'currentColor' : 'none'} />
-                      </button>
+                      {canManageRecordings && (
+                        <button
+                          type="button"
+                          className={`btn btn-icon ${rec.starred ? 'btn-warn' : ''}`}
+                          title={
+                            rec.starred
+                              ? 'Unprotect clip'
+                              : 'Star/Protect clip from auto-pruning'
+                          }
+                          onClick={() => void onToggleStar(rec.id)}
+                        >
+                          <Star size={13} fill={rec.starred ? 'currentColor' : 'none'} />
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="btn btn-icon"
@@ -385,14 +447,16 @@ export function RecordingsView({
                       >
                         <FolderOpen size={13} />
                       </button>
-                      <button
-                        type="button"
-                        className="btn btn-icon btn-danger"
-                        title="Delete recording"
-                        onClick={() => void onDeleteRecording(rec.id)}
-                      >
-                        <Trash2 size={13} />
-                      </button>
+                      {canManageRecordings && (
+                        <button
+                          type="button"
+                          className="btn btn-icon btn-danger"
+                          title="Delete recording"
+                          onClick={() => void onDeleteRecording(rec.id)}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
                     </div>
                   </div>
                   )
@@ -424,7 +488,7 @@ export function RecordingsView({
                     <Download size={13} />
                     Export
                   </button>
-                  {onExportEvidenceBundle && (
+                  {canManageRecordings && onExportEvidenceBundle && (
                     <button
                       type="button"
                       className="btn btn-sm"
@@ -459,7 +523,7 @@ export function RecordingsView({
                       />
                     ) : (
                       <div className="empty-state">
-                        <span>Playback available inside Electron desktop app</span>
+                        <span>Playback stream unavailable for this recording.</span>
                       </div>
                     )}
                   </div>

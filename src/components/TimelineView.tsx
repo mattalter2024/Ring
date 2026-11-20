@@ -18,6 +18,7 @@ import {
   SkipBack,
   SkipForward,
   Star,
+  Trash2,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
@@ -54,12 +55,14 @@ interface TimelineViewProps {
   nvrStatus: NvrStatus
   nvrBusy: boolean
   defaultCaptureSeconds: number
+  canManageRecordings?: boolean
   onToggleAllRecording: () => Promise<void>
   onSyncCloudEvents: () => Promise<void>
   onCaptureRecording: (cameraId: string, durationSeconds: number) => Promise<void>
   onToggleStar: (recordingId: string) => Promise<void>
   onExportRecording: (recordingId: string) => Promise<void>
   onOpenInFolder: (recordingId: string) => Promise<void>
+  onClearAllRecordings?: () => Promise<void>
 }
 
 const ZOOM_LEVELS: TimelineZoomHours[] = [24, 12, 6, 1, 0.5, 0.25]
@@ -78,11 +81,13 @@ export function TimelineView({
   packageDetections,
   nvrStatus,
   defaultCaptureSeconds,
+  canManageRecordings = true,
   onSyncCloudEvents,
   onCaptureRecording,
   onToggleStar,
   onExportRecording,
   onOpenInFolder,
+  onClearAllRecordings,
 }: TimelineViewProps) {
   const platformLabels = useMemo(() => getPlatformLabels(), [])
   const initialAnchorMs = useMemo(
@@ -119,6 +124,7 @@ export function TimelineView({
   const [clipCurrentSec, setClipCurrentSec] = useState<number>(0)
   const [capturing, setCapturing] = useState(false)
   const [syncingEvents, setSyncingEvents] = useState(false)
+  const [clearingAll, setClearingAll] = useState(false)
   const [nowMs, setNowMs] = useState<number>(() => Date.now())
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -215,11 +221,42 @@ export function TimelineView({
 
   // Keep selectedCameraId valid as cameras/recordings load
   useEffect(() => {
-    if (cameraTracks.length === 0) return
+    if (cameraTracks.length === 0) {
+      if (selectedCameraId) setSelectedCameraId('')
+      return
+    }
     if (!selectedCameraId || !cameraTracks.some((c) => c.id === selectedCameraId)) {
       setSelectedCameraId(cameraTracks[0].id)
     }
   }, [cameraTracks, selectedCameraId])
+
+  // Keep activeClipId and date anchor fresh when old demo clips are purged or all videos are cleared
+  useEffect(() => {
+    if (recordings.length === 0) {
+      if (activeClipId !== null) setActiveClipId(null)
+      setIsPlaying(false)
+      const now = Date.now()
+      const today = toLocalDateKey(new Date(now))
+      if (dateKey !== today) {
+        setDateKey(today)
+        setPlayheadMs(now)
+        setViewportCenterMs(now)
+      }
+      return
+    }
+    if (activeClipId && !recordings.some((r) => r.id === activeClipId)) {
+      const newest = recordings[0]
+      const newestMs = new Date(newest.createdAt).getTime()
+      const newestDate = toLocalDateKey(new Date(newestMs))
+      setActiveClipId(newest.id)
+      setIsPlaying(false)
+      if (dayRecordings.length === 0 && newestDate !== dateKey) {
+        setDateKey(newestDate)
+        setPlayheadMs(newestMs)
+        setViewportCenterMs(newestMs)
+      }
+    }
+  }, [recordings, activeClipId, dateKey, dayRecordings.length])
 
   const activeCameraTrack = useMemo(
     () => cameraTracks.find((c) => c.id === selectedCameraId) ?? cameraTracks[0] ?? null,
@@ -1340,6 +1377,27 @@ export function TimelineView({
               >
                 <RefreshCw size={13} className={syncingEvents ? 'spin' : ''} />
               </button>
+              {canManageRecordings && onClearAllRecordings && (
+                <button
+                  id="btn-timeline-clear-all"
+                  type="button"
+                  className="btn btn-danger btn-sm"
+                  style={{ padding: '4px 8px', fontSize: 11.5 }}
+                  title="Permanently delete all local video recordings from disk"
+                  disabled={clearingAll || recordings.length === 0}
+                  onClick={async () => {
+                    setClearingAll(true)
+                    try {
+                      await onClearAllRecordings()
+                    } finally {
+                      setClearingAll(false)
+                    }
+                  }}
+                >
+                  <Trash2 size={12} />
+                  {clearingAll ? 'Clearing…' : 'Clear All'}
+                </button>
+              )}
             </div>
           </div>
           <div className="panel-body form-stack">

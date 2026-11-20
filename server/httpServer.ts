@@ -1,6 +1,7 @@
 import http from 'node:http'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import type {
@@ -41,6 +42,7 @@ import {
 const SESSION_COOKIE_NAME = 'ringwatch_session'
 const SESSION_MAX_AGE_SEC = 7 * 24 * 60 * 60
 const MAX_JSON_BODY_BYTES = 1024 * 1024 // 1 MB
+const MAX_UPLOAD_MP4_BYTES = 500 * 1024 * 1024 // 500 MB
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -1173,6 +1175,78 @@ export class RingWatchServer {
       this.sendJson(res, 200, this.recordingService.listRecordings())
       return
     }
+    if (method === 'DELETE' && pathname === '/api/recordings') {
+      if (!this.requirePerm(res, session, 'recordings:manage')) return
+      const searchParams = new URL(req.url ?? '/', 'http://localhost').searchParams
+      const includeStarred = searchParams.get('includeStarred') !== '0'
+      const result = this.recordingService.clearAllRecordings(includeStarred)
+      this.broadcast('recordings-updated', this.recordingService.listRecordings(), 'recordings:view')
+      this.broadcast('storage-stats-updated', result.stats, 'recordings:view')
+      this.sendJson(res, 200, result)
+      return
+    }
+    if (method === 'POST' && pathname === '/api/recordings/import') {
+      if (!this.requirePerm(res, session, 'recordings:manage')) return
+      const rawNameHeader = req.headers['x-filename']
+      let rawName = Array.isArray(rawNameHeader) ? rawNameHeader[0] : (rawNameHeader ?? 'imported.mp4')
+      try {
+        rawName = decodeURIComponent(rawName)
+      } catch {
+        // Keep raw header if not percent-encoded
+      }
+      const tempPath = path.join(os.tmpdir(), `ringwatch-upload-${crypto.randomUUID()}.mp4`)
+      let totalBytes = 0
+      let aborted = false
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const out = fs.createWriteStream(tempPath)
+          const fail = (err: Error) => {
+            if (aborted) return
+            aborted = true
+            out.destroy()
+            reject(err)
+          }
+          req.on('data', (chunk: Buffer) => {
+            totalBytes += chunk.length
+            if (totalBytes > MAX_UPLOAD_MP4_BYTES) {
+              fail(new Error('Uploaded MP4 exceeds 500 MB limit'))
+              req.resume()
+              return
+            }
+            if (!aborted) {
+              out.write(chunk)
+            }
+          })
+          req.on('end', () => {
+            if (!aborted) out.end()
+          })
+          req.on('error', (err) => fail(err))
+          out.on('error', (err) => fail(err))
+          out.on('finish', () => {
+            if (!aborted) resolve()
+          })
+        })
+        if (totalBytes === 0) {
+          fs.rmSync(tempPath, { force: true })
+          this.sendJson(res, 400, { error: 'Uploaded file is empty.' })
+          return
+        }
+        const item = this.recordingService.registerUploadedMp4(rawName, tempPath)
+        this.broadcast('recordings-updated', this.recordingService.listRecordings(), 'recordings:view')
+        this.broadcast('storage-stats-updated', this.recordingService.getStorageStats(), 'recordings:view')
+        this.sendJson(res, 201, item)
+      } catch (err) {
+        try {
+          fs.rmSync(tempPath, { force: true })
+        } catch {
+          // ignore
+        }
+        const msg = err instanceof Error ? err.message : 'Failed to import video'
+        const status = msg.includes('500 MB') ? 413 : 400
+        this.sendJson(res, status, { error: msg })
+      }
+      return
+    }
     if (method === 'POST' && pathname === '/api/recordings/capture') {
       if (!this.requirePerm(res, session, 'recordings:manage')) return
       const body = await readJsonBody(req)
@@ -1250,17 +1324,22 @@ export class RingWatchServer {
           'evidence-exports',
         )
         fs.mkdirSync(evidenceDir, { recursive: true })
-        const bundle = this.recordingService.exportEvidenceBundle(recId, evidenceDir)
+        const safeFileName = path.basename(item.fileName).replace(/[^a-zA-Z0-9._-]/g, '_')
+        const destMp4Path = path.join(evidenceDir, safeFileName)
+        const bundle = this.recordingService.exportEvidenceBundle(recId, destMp4Path)
         this.sendJson(res, 200, bundle)
         return
       }
       if (method === 'POST' && sub === 'open-folder') {
         if (!this.requirePerm(res, session, 'recordings:view')) return
         const item = this.recordingService.getRecordingById(recId)
-        if (item && fs.existsSync(item.filePath)) {
-          this.openHostFolder(path.dirname(item.filePath), item.filePath)
+        if (!item || !fs.existsSync(item.filePath)) {
+          this.sendJson(res, 404, { error: 'Recording not found on disk' })
+          return
         }
-        this.sendJson(res, 200, { ok: true })
+        const dir = path.dirname(item.filePath)
+        this.openHostFolder(dir, item.filePath)
+        this.sendJson(res, 200, { ok: true, path: item.filePath, dir })
         return
       }
     }
