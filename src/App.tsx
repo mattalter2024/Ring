@@ -295,8 +295,8 @@ export function App() {
   ) => {
     if (!api) {
       pushToast(
-        'Desktop App Required',
-        'MP4 file capture runs in the Electron Windows desktop process.',
+        'Backend Unavailable',
+        'MP4 capture requires a connected RingWatch NVR backend server.',
         'warn',
       )
       return
@@ -601,7 +601,7 @@ export function App() {
     if (!api) {
       return {
         status: 'error',
-        error: 'Ring sign-in runs inside the Electron Windows app.',
+        error: 'Ring sign-in requires a connected RingWatch backend server.',
       }
     }
     const res = await api.loginWithCredentials(params)
@@ -757,8 +757,8 @@ export function App() {
   const handleExportEvidenceBundle = async (recordingId: string) => {
     if (!api) {
       pushToast(
-        'Desktop App Required',
-        'SHA-256 Evidence Bundle export runs inside the Electron Windows app.',
+        'Backend Unavailable',
+        'SHA-256 Evidence Bundle export requires a connected RingWatch backend server.',
         'warn',
       )
       return
@@ -785,7 +785,7 @@ export function App() {
     if (!api) {
       return {
         ok: false,
-        message: 'Run inside Electron Windows app to test live Vision API.',
+        message: 'Connect to the RingWatch backend server to test live Vision API.',
       }
     }
     return api.testAiConnection()
@@ -807,8 +807,8 @@ export function App() {
   const handleToggleAllRecording = async () => {
     if (!api) {
       pushToast(
-        'Desktop App Required',
-        'Continuous all-camera MP4 recording runs in the Electron Windows desktop process.',
+        'Backend Unavailable',
+        'Continuous all-camera MP4 recording requires a connected RingWatch backend server.',
         'warn',
       )
       return
@@ -854,8 +854,8 @@ export function App() {
   ) => {
     if (!api) {
       pushToast(
-        'Desktop App Required',
-        'Continuous MP4 recording runs in the Electron Windows desktop process.',
+        'Backend Unavailable',
+        'Continuous MP4 recording requires a connected RingWatch backend server.',
         'warn',
       )
       return

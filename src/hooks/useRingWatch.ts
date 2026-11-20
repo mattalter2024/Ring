@@ -17,6 +17,7 @@ import type {
 import { webRingWatchApi } from '@/api/webClient'
 import { playAlertChime } from '@/utils/audioChime'
 import { applySystemTheme } from '@/utils/theme'
+import { applyClientPlatformAttribute } from '@/utils/platform'
 
 export interface UiToast {
   id: string
@@ -165,8 +166,9 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     setStreamsByCamera(streamMap)
   }, [])
 
-  // Follow browser OS dark/light theme automatically
+  // Follow browser OS dark/light theme and native Windows/macOS platform styles automatically
   useEffect(() => {
+    applyClientPlatformAttribute()
     const mq =
       typeof window !== 'undefined' && typeof window.matchMedia === 'function'
         ? window.matchMedia('(prefers-color-scheme: dark)')

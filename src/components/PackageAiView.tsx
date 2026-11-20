@@ -331,9 +331,9 @@ export function PackageAiView({
 
               <div className="toggle-row" style={{ padding: '4px 0' }}>
                 <div>
-                  <div className="toggle-label-main">Windows Desktop Toast</div>
+                  <div className="toggle-label-main">Desktop Browser Alerts</div>
                   <div className="toggle-label-sub">
-                    Show native Windows notification on package detection
+                    Show native Windows or macOS browser notification on package detection
                   </div>
                 </div>
                 <button

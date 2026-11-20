@@ -126,8 +126,38 @@ export const LiveVideoPlayer = memo(function LiveVideoPlayer({
           }
         })
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = session.streamUrl
-        void video.play().then(() => setBuffering(false)).catch(() => {})
+        // Native HLS playback for macOS Safari / iOS Safari
+        const bustUrl =
+          reattachFailures > 0
+            ? `${session.streamUrl}${session.streamUrl.includes('?') ? '&' : '?'}r=${Date.now()}`
+            : session.streamUrl
+        const onCanPlay = () => {
+          if (disposed) return
+          reattachFailures = 0
+          setStreamError(null)
+          setBuffering(false)
+          void video.play().catch(() => {})
+        }
+        const onNativeError = () => {
+          if (disposed) return
+          reattachFailures += 1
+          setStreamError('Reconnecting live stream…')
+          if (reattachFailures >= 2) {
+            onStalledRef.current?.(camera.id)
+          }
+          if (!retryTimer) {
+            retryTimer = setTimeout(() => {
+              retryTimer = null
+              attachHls()
+            }, 2000)
+          }
+        }
+        video.onloadedmetadata = onCanPlay
+        video.onplaying = onCanPlay
+        video.onerror = onNativeError
+        video.src = bustUrl
+        video.load()
+        void video.play().catch(() => {})
       }
     }
 
@@ -185,8 +215,15 @@ export const LiveVideoPlayer = memo(function LiveVideoPlayer({
       clearInterval(watchdog)
       document.removeEventListener('visibilitychange', onVisibilityChange)
       if (retryTimer) clearTimeout(retryTimer)
+      video.onloadedmetadata = null
+      video.onplaying = null
+      video.onerror = null
       if (hls) {
         hls.destroy()
+      } else {
+        video.pause()
+        video.removeAttribute('src')
+        video.load()
       }
     }
   }, [camera.id, session?.streamUrl, session?.mode, session?.startedAt])

@@ -2102,6 +2102,33 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
       await server.stop()
     }
   })
+
+  it('detects Windows and macOS clients accurately and adapts native frontend labels', async () => {
+    const { detectClientPlatform, getPlatformLabels } = await import(
+      '../src/utils/platform'
+    )
+
+    const macPlatform = detectClientPlatform({
+      platform: 'MacIntel',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15',
+    })
+    expect(macPlatform).toBe('mac')
+    const macLabels = getPlatformLabels(macPlatform)
+    expect(macLabels.isMac).toBe(true)
+    expect(macLabels.fileManagerName).toBe('Finder')
+    expect(macLabels.shortcutModifier).toBe('⌘')
+    expect(macLabels.timelineControlsHint).toContain('Pinch')
+
+    const winPlatform = detectClientPlatform({
+      platform: 'Win32',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    })
+    expect(winPlatform).toBe('windows')
+    const winLabels = getPlatformLabels(winPlatform)
+    expect(winLabels.isMac).toBe(false)
+    expect(winLabels.fileManagerName).toBe('Explorer')
+    expect(winLabels.shortcutModifier).toBe('Ctrl')
+  })
 })
 
 

@@ -20,6 +20,7 @@ import type {
   StorageStats,
 } from '@shared/types'
 import { formatBytes, formatDuration, formatRelativeTime } from '@/utils/format'
+import { getPlatformLabels } from '@/utils/platform'
 
 interface RecordingsViewProps {
   cameras: RingCameraInfo[]
@@ -56,6 +57,7 @@ export function RecordingsView({
   onListCloudRecordings,
   onDownloadCloudRecording,
 }: RecordingsViewProps) {
+  const platformLabels = useMemo(() => getPlatformLabels(), [])
   const [tab, setTab] = useState<'local' | 'cloud'>('local')
   const [selectedLocalId, setSelectedLocalId] = useState<string | null>(
     recordings[0]?.id ?? null,
@@ -378,7 +380,7 @@ export function RecordingsView({
                       <button
                         type="button"
                         className="btn btn-icon"
-                        title="Show in Windows Explorer"
+                        title={platformLabels.showInFileManager}
                         onClick={() => void onOpenInFolder(rec.id)}
                       >
                         <FolderOpen size={13} />
@@ -439,7 +441,7 @@ export function RecordingsView({
                     onClick={() => void onOpenInFolder(selectedLocal.id)}
                   >
                     <FolderOpen size={13} />
-                    Explorer
+                    {platformLabels.fileManagerName}
                   </button>
                 </div>
               )}

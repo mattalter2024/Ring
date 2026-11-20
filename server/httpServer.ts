@@ -34,6 +34,7 @@ const MIME_TYPES: Record<string, string> = {
   '.mjs': 'application/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -1025,12 +1026,21 @@ export class RingWatchServer {
   }
 
   private openHostFolderIfWindows(dirPath: string, selectFile?: string): void {
-    if (process.platform !== 'win32') return
     try {
-      if (selectFile) {
-        execFile('explorer.exe', [`/select,${selectFile}`])
-      } else {
-        execFile('explorer.exe', [dirPath])
+      if (process.platform === 'win32') {
+        if (selectFile) {
+          execFile('explorer.exe', [`/select,${selectFile}`])
+        } else {
+          execFile('explorer.exe', [dirPath])
+        }
+      } else if (process.platform === 'darwin') {
+        if (selectFile) {
+          execFile('open', ['-R', selectFile])
+        } else {
+          execFile('open', [dirPath])
+        }
+      } else if (process.platform === 'linux') {
+        execFile('xdg-open', [dirPath])
       }
     } catch {
       // Ignore if running headless / as service

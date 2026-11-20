@@ -180,7 +180,7 @@ export function SettingsView({
               >
                 {connection.error
                   ? connection.error
-                  : 'Credentials are stored locally using Windows encryption.'}
+                  : 'Credentials are encrypted locally on your RingWatch backend server.'}
               </div>
             </div>
             {settings.hasRingToken && (

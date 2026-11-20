@@ -44,6 +44,7 @@ import {
   type TimelineZoomHours,
 } from '@/utils/timeline'
 import { formatBytes, formatDuration, formatTimestamp } from '@/utils/format'
+import { getPlatformLabels } from '@/utils/platform'
 
 interface TimelineViewProps {
   cameras: RingCameraInfo[]
@@ -83,6 +84,7 @@ export function TimelineView({
   onExportRecording,
   onOpenInFolder,
 }: TimelineViewProps) {
+  const platformLabels = useMemo(() => getPlatformLabels(), [])
   const initialAnchorMs = useMemo(
     () => (recordings[0] ? new Date(recordings[0].createdAt).getTime() : Date.now()),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -759,10 +761,13 @@ export function TimelineView({
     })
   }
 
-  // Non-passive mouse-wheel listener for cursor-anchored zoom & horizontal pan
+  // Non-passive mouse-wheel & macOS trackpad listener for cursor-anchored zoom & smooth horizontal pan
   useEffect(() => {
     const el = tracksContainerRef.current
     if (!el) return
+    let zoomAccum = 0
+    let lastZoomAt = 0
+
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
       const rect = el.getBoundingClientRect()
@@ -776,18 +781,31 @@ export function TimelineView({
         viewportCenterMs: vc,
       } = windowRef.current
 
-      // Horizontal scroll / Shift+Wheel pans smoothly left/right
-      if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+      // Horizontal two-finger swipe (macOS trackpad) or Shift+Wheel (Windows) pans smoothly
+      if (!e.ctrlKey && (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY))) {
         const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
         const deltaMs = (delta / Math.max(200, rect.width)) * (we - ws) * 1.15
         setViewportCenterMs(panWindowCenter(ds, de, vc, zh, deltaMs))
         return
       }
 
-      // Vertical wheel zooms in/out anchored at the cursor timestamp
+      // Vertical wheel or macOS trackpad pinch (ctrlKey) zooms anchored at cursor timestamp.
+      // Accumulate small trackpad ticks so MacBook trackpads don't overshoot zoom levels.
+      const now = performance.now()
+      if (now - lastZoomAt > 180) {
+        zoomAccum = 0
+      }
+      lastZoomAt = now
+      zoomAccum += e.deltaY
+      const threshold = e.ctrlKey ? 14 : 45
+      if (Math.abs(zoomAccum) < threshold) return
+
+      const direction = zoomAccum < 0 ? 1 : -1
+      zoomAccum = 0
+
       const idx = ZOOM_LEVELS.indexOf(zh)
       const nextIdx =
-        e.deltaY < 0
+        direction > 0
           ? Math.min(ZOOM_LEVELS.length - 1, idx + 1)
           : Math.max(0, idx - 1)
       if (nextIdx === idx) return
@@ -1286,7 +1304,7 @@ export function TimelineView({
                   <button
                     type="button"
                     className="btn btn-icon"
-                    title="Show in Windows Explorer"
+                    title={platformLabels.showInFileManager}
                     onClick={() => void onOpenInFolder(activeClip.id)}
                   >
                     <FolderOpen size={14} />
@@ -1637,7 +1655,7 @@ export function TimelineView({
             Recording Now
           </span>
           <span style={{ marginLeft: 'auto', color: 'var(--text-muted)' }}>
-            Drag anywhere to scrub · Scroll wheel to zoom · Shift+Scroll to pan
+            {platformLabels.timelineControlsHint}
           </span>
         </div>
 

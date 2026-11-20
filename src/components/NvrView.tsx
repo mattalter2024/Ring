@@ -622,7 +622,7 @@ export function NvrView({
                     Keep PC Awake While Recording
                   </div>
                   <div className="toggle-label-sub">
-                    Prevent Windows sleep so overnight recording never pauses
+                    Prevent host sleep so overnight recording never pauses
                   </div>
                 </div>
                 <button
@@ -752,7 +752,7 @@ export function NvrView({
                         Low Disk &amp; Health Alerts
                       </div>
                       <div className="toggle-label-sub">
-                        Windows alerts for low disk space, failover, or camera drops
+                        Desktop alerts for low disk space, failover, or camera drops
                       </div>
                     </div>
                     <button

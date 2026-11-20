@@ -1,0 +1,18 @@
+{
+  "name": "RingWatch — 24/7 NVR & AI Security Hub",
+  "short_name": "RingWatch",
+  "description": "Cross-platform web console (Windows & macOS) for Ring cameras, live video streaming, 24/7 local NVR recordings, sensors, and AI package detection.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0b0e13",
+  "theme_color": "#0b0e13",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

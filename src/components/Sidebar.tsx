@@ -119,7 +119,7 @@ export function Sidebar({
         </div>
         <div className="brand-text">
           <h2>RingWatch</h2>
-          <span>Windows Security Hub</span>
+          <span>NVR &amp; AI Security Hub</span>
         </div>
       </div>
 
