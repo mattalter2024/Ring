@@ -163,6 +163,8 @@ export class RingService implements SnapshotSource {
   private visualMotionChecking = false
   private readonly lastVisualSegmentByCamera = new Map<string, string>()
   private readonly lastVisualLumaByCamera = new Map<string, Buffer>()
+  private readonly cleanVisualBaselineByCamera = new Map<string, Buffer>()
+  private readonly visualMotionPendingByCamera = new Set<string>()
   private readonly lastVisualTriggerAtByCamera = new Map<string, number>()
   private snapshotCache = new Map<string, { dataUrl: string; capturedAt: string }>()
 
@@ -539,17 +541,38 @@ export class RingService implements SnapshotSource {
           const cvProps = (rawEv.cv_properties ?? {}) as Record<string, unknown>
           const cvType = String(cvProps.detection_type ?? '').toLowerCase()
           const personDetected = Boolean(cvProps.person_detected)
+          const isExplicitPersonOrPackage =
+            kindLower.includes('package') ||
+            kindLower.includes('person') ||
+            cvType.includes('package') ||
+            cvType.includes('human') ||
+            cvType.includes('person') ||
+            personDetected
+          const isExplicitNonDeliveryNoise =
+            cvType !== '' &&
+            !isExplicitPersonOrPackage &&
+            (cvType.includes('other') ||
+              cvType.includes('vehicle') ||
+              cvType.includes('car') ||
+              cvType.includes('animal'))
+
+          // Cost-saver #6: When Ring's own free CV tags an event as non-person/non-package noise
+          // (e.g. passing car, tree, animal), skip calling Cloud Vision API ($0).
+          if (
+            kindLower !== 'ding' &&
+            aiCfg.personOrPackageEventsOnly &&
+            isExplicitNonDeliveryNoise
+          ) {
+            this.aiPackageService.recordLocalSkip('local-gate')
+            continue
+          }
+
           const trigger: 'motion' | 'doorbell' | null =
             kindLower === 'ding'
               ? 'doorbell'
               : kindLower.includes('motion') ||
-                  kindLower.includes('package') ||
-                  kindLower.includes('person') ||
                   kindLower.includes('loiter') ||
-                  cvType.includes('package') ||
-                  cvType.includes('human') ||
-                  cvType.includes('person') ||
-                  personDetected
+                  isExplicitPersonOrPackage
                 ? 'motion'
                 : null
 
@@ -583,10 +606,10 @@ export class RingService implements SnapshotSource {
 
   /**
    * Local visual scene-change detector on active 24/7 NVR / Live View HLS streams.
-   * Ring cameras commonly suppress cloud motion push events while a continuous Live View
-   * WebRTC session is open. Comparing tiny 64x36 grayscale keyframes locally costs $0 in
-   * Cloud Vision API calls when the porch is idle, and immediately triggers AI package
-   * scanning whenever a courier, person, or box changes the scene.
+   * Comparing tiny 64x36 grayscale keyframes locally costs $0 in Cloud Vision API calls.
+   * When requirePersistentChange is enabled (default), transient motion (passing cars, shadows,
+   * wind) is held for 1 settled cycle and compared against the pre-motion baseline so Cloud AI
+   * is only called when a new object actually remains in the scene.
    */
   private async pollVisualMotionForAi(): Promise<void> {
     if (this.visualMotionChecking) return
@@ -598,6 +621,7 @@ export class RingService implements SnapshotSource {
     this.visualMotionChecking = true
     try {
       const nowMs = Date.now()
+      const minGapMs = Math.max(45_000, aiCfg.minScanIntervalSeconds * 1000)
       for (const camId of this.liveCamerasById.keys()) {
         if (
           aiCfg.monitoredCameraIds.length > 0 &&
@@ -617,6 +641,7 @@ export class RingService implements SnapshotSource {
         const prevGrid = this.lastVisualLumaByCamera.get(camId)
         if (!prevGrid) {
           this.lastVisualLumaByCamera.set(camId, currGrid)
+          this.cleanVisualBaselineByCamera.set(camId, currGrid)
           continue
         }
 
@@ -626,10 +651,42 @@ export class RingService implements SnapshotSource {
           this.lastVisualLumaByCamera.set(camId, currGrid)
         }
 
-        if (!diff.significant) continue
+        if (aiCfg.requirePersistentChange) {
+          const hadPending = this.visualMotionPendingByCamera.has(camId)
+          if (diff.significant) {
+            // Scene is currently changing — wait for next settled segment to verify persistence
+            this.visualMotionPendingByCamera.add(camId)
+            continue
+          }
+
+          if (!hadPending) {
+            // Calm scene — smoothly track ambient lighting changes in the clean baseline
+            if (diff.currMean >= 4) {
+              this.cleanVisualBaselineByCamera.set(camId, currGrid)
+            }
+            continue
+          }
+
+          // Motion just settled: compare settled frame against pre-motion baseline ($0)
+          this.visualMotionPendingByCamera.delete(camId)
+          const baselineGrid = this.cleanVisualBaselineByCamera.get(camId)
+          if (baselineGrid) {
+            const persistentDiff = computeLumaSceneChange(baselineGrid, currGrid)
+            if (diff.currMean >= 4) {
+              this.cleanVisualBaselineByCamera.set(camId, currGrid)
+            }
+            if (!persistentDiff.significant) {
+              // Scene returned to empty baseline (car drove by, wind, shadow) -> skip Cloud AI!
+              this.aiPackageService.recordLocalSkip('local-gate')
+              continue
+            }
+          }
+        } else {
+          if (!diff.significant) continue
+        }
 
         const lastTriggeredAt = this.lastVisualTriggerAtByCamera.get(camId) ?? 0
-        if (nowMs - lastTriggeredAt < 45_000) continue
+        if (nowMs - lastTriggeredAt < minGapMs) continue
         this.lastVisualTriggerAtByCamera.set(camId, nowMs)
 
         const nowIso = new Date().toISOString()
@@ -746,6 +803,8 @@ export class RingService implements SnapshotSource {
     this.boundSensorZids.clear()
     this.lastVisualSegmentByCamera.clear()
     this.lastVisualLumaByCamera.clear()
+    this.cleanVisualBaselineByCamera.clear()
+    this.visualMotionPendingByCamera.clear()
     this.lastVisualTriggerAtByCamera.clear()
     this.callbacks.onNvrStatusUpdated?.(this.getNvrStatus())
   }
@@ -1531,17 +1590,43 @@ export class RingService implements SnapshotSource {
       this.subscriptions.push(
         cam.onNewNotification.subscribe((notification) => {
           const category = String(notification?.android_config?.category ?? '').toLowerCase()
-          const dingId = notification?.data?.event?.ding?.id
+          const dingObj = notification?.data?.event?.ding as
+            | (Record<string, unknown> & { id?: string | number })
+            | undefined
+          const dingId = dingObj?.id
           if (dingId) {
             this.seenRingEventIds.add(`${camId}:${dingId}`)
           }
           if (category.includes('ding') && !category.includes('motion')) {
             return // Already handled by onDoorbellPressed
           }
+
+          const aiCfg = this.configStore.getPublicSettings().packageAi
+          const detectionType = String(dingObj?.detection_type ?? '').toLowerCase()
+          const isExplicitPersonOrPackage =
+            category.includes('package') ||
+            category.includes('person') ||
+            category.includes('human') ||
+            detectionType.includes('package') ||
+            detectionType.includes('person') ||
+            detectionType.includes('human')
+          const isExplicitNonDeliveryNoise =
+            !isExplicitPersonOrPackage &&
+            (detectionType.includes('other') ||
+              detectionType.includes('vehicle') ||
+              detectionType.includes('car') ||
+              detectionType.includes('animal') ||
+              category.includes('vehicle') ||
+              category.includes('animal'))
+
+          if (aiCfg.personOrPackageEventsOnly && isExplicitNonDeliveryNoise) {
+            this.aiPackageService.recordLocalSkip('local-gate')
+            return
+          }
+
           if (
             category.includes('motion') ||
-            category.includes('package') ||
-            category.includes('person')
+            isExplicitPersonOrPackage
           ) {
             void this.aiPackageService.handleAutoTrigger(camId, 'motion')
           }
@@ -1688,6 +1773,15 @@ export class RingService implements SnapshotSource {
       const rawBuf = Buffer.from(jpegBase64, 'base64')
       const cropped = await this.recordingService.createDeliveryZoneCrop(rawBuf)
       return cropped ? cropped.toString('base64') : null
+    } catch {
+      return null
+    }
+  }
+
+  async extractLumaGridFromJpegBase64(jpegBase64: string): Promise<Buffer | null> {
+    try {
+      const rawBuf = Buffer.from(jpegBase64, 'base64')
+      return await this.recordingService.extractLumaGridFromJpegBuffer(rawBuf)
     } catch {
       return null
     }

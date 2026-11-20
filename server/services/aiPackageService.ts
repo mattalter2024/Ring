@@ -3,10 +3,12 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import type {
   AiProvider,
+  AiUsageStats,
   PackageDetectionRecord,
   SecurityEvent,
 } from '../../shared/types'
 import { normalizeGeminiModel, type ConfigStore } from './configStore'
+import { computeLumaSceneChange } from './recordingService'
 import type { NotificationService } from './notificationService'
 
 export interface ParsedPackageVisionResult {
@@ -16,6 +18,7 @@ export interface ParsedPackageVisionResult {
   carrierHint: string | null
   placement: string | null
   personPresent: boolean
+  uncertain?: boolean
   summary: string
 }
 
@@ -23,42 +26,23 @@ interface VisionImageBundle {
   currentBase64: string
   baselineBase64?: string | null
   zoomCropBase64?: string | null
+  resolution: 'low' | 'high'
 }
 
-const SYSTEM_PROMPT = `You are a high-recall home-security delivery & package vision analyzer for wide-angle Ring cameras.
-Your #1 job is to NEVER miss a real delivery while ignoring permanent fixtures.
+const COMPACT_TRIAGE_PROMPT = `Home-security delivery detector for a Ring camera frame.
+Check ground, porch, steps, mat, walkway, and driveway for ANY delivered cardboard box, shipping parcel, padded/poly mailer, food/grocery delivery bag, or person carrying/dropping a package.
+Ignore permanent fixtures (welcome mats, plants, furniture, hoses, bins, parked cars).
+Set "uncertain": true ONLY if there is a small, shadowed, or ambiguous new object on the ground that needs a high-resolution zoomed check.
+Reply ONLY with valid JSON:
+{"packageDetected":boolean,"confidence":0.0-1.0,"packageCount":integer,"carrierHint":string|null,"placement":string|null,"personPresent":boolean,"uncertain":boolean,"summary":"1 concise sentence"}`
 
-Carefully inspect EVERY ground, porch, step, welcome mat, walkway, driveway, garage apron, yard edge, railing corner, bench, and planter area across ALL provided images (including shaded areas, bright glare, corners, and distant ground).
-
-When an EARLIER BASELINE ("BEFORE") image is provided alongside the CURRENT ("AFTER") image:
-- FIRST compare BEFORE vs AFTER to spot ANY newly appeared object resting on the ground, porch, steps, mat, walkway, or driveway, or anyone delivering an item.
-- A newly appeared cardboard box, white/poly mailer, padded envelope, or delivery bag that was NOT in the baseline is almost certainly a delivery—report "packageDetected": true!
-
-When a ZOOMED DELIVERY ZONE image is provided:
-- Use its extra pixel detail to spot small, flat, angled, or shadowed boxes, envelopes, and bags that look tiny in the wide-angle frame.
-
-Count ALL of these as "packageDetected": true:
-- Plain brown/kraft cardboard shipping boxes of ANY size (even unbranded, small, angled, shadowed, or partially behind a railing/pillar/planter)
-- Branded or white/colored shipping boxes (Amazon, UPS, FedEx, USPS, DHL, Target, Walmart, Chewy, etc.)
-- Padded bubble mailers, Amazon blue-and-white envelopes, kraft envelopes, and plastic poly mailer bags lying flat or propped up
-- Paper or plastic grocery/food/retail delivery bags (DoorDash, Uber Eats, Instacart, Grubhub, etc.) left near an entrance
-- Large/oversized boxes, stacked parcels, or multiple boxes (count each distinct item)
-- ACTIVE DELIVERIES IN PROGRESS: a courier/delivery driver or person carrying, holding, or setting down a shipping box, mailer, or delivery bag
-
-Do NOT count permanent fixtures already present in the baseline (welcome mats, potted plants, patio furniture, bricks/pavers, hoses, trash bins, siding, parked cars).
-
-Respond ONLY with a single valid JSON object matching this exact schema (complete "sceneScan" and "newObjectsFromBaseline" FIRST before deciding "packageDetected"):
-{
-  "sceneScan": string, // brief inventory of objects on the porch, steps, mat, walkway, driveway, or yard
-  "newObjectsFromBaseline": string, // what NEW objects or people appeared compared to baseline, or "No baseline provided"
-  "packageDetected": boolean,
-  "confidence": number, // 0.0 to 1.0
-  "packageCount": integer, // 0 if none, >= 1 if packageDetected is true
-  "carrierHint": string | null, // e.g. "Amazon", "UPS", "FedEx", "USPS", "DHL", "Food/Grocery", or null if plain/unclear
-  "placement": string | null, // concise location in frame, e.g. "Left of front steps on walkway"
-  "personPresent": boolean,
-  "summary": string // concise 1-sentence description for a Windows desktop notification
-}`
+const SYSTEM_PROMPT = `High-recall home-security delivery & package vision analyzer for wide-angle Ring cameras.
+Inspect EVERY porch, step, mat, walkway, driveway, railing corner, and shaded ground area across ALL provided images.
+- If an EARLIER BASELINE (BEFORE) image is provided, compare BEFORE vs AFTER to spot ANY newly appeared box, mailer, or delivery bag while ignoring permanent fixtures already present (mats, plants, furniture, bins, cars).
+- If a ZOOMED DELIVERY ZONE image is provided, use its detail for small, flat, angled, or shadowed parcels.
+Count as "packageDetected": true: plain/branded cardboard shipping boxes, padded/poly mailers, kraft envelopes, food/grocery delivery bags, or a courier carrying/setting down a parcel.
+Reply ONLY with a single valid JSON object:
+{"sceneScan":string,"newObjectsFromBaseline":string,"packageDetected":boolean,"confidence":0.0-1.0,"packageCount":integer,"carrierHint":string|null,"placement":string|null,"personPresent":boolean,"summary":"1 concise sentence"}`
 
 function parseLooseBoolean(value: unknown): boolean {
   if (typeof value === 'boolean') return value
@@ -117,6 +101,7 @@ export function parseVisionResponse(rawText: string): ParsedPackageVisionResult 
       : null
 
   const personPresent = parseLooseBoolean(parsed.personPresent)
+  const uncertain = parseLooseBoolean(parsed.uncertain)
 
   const summary =
     typeof parsed.summary === 'string' && parsed.summary.trim()
@@ -132,6 +117,7 @@ export function parseVisionResponse(rawText: string): ParsedPackageVisionResult 
     carrierHint,
     placement,
     personPresent,
+    uncertain,
     summary,
   }
 }
@@ -141,26 +127,40 @@ export interface SnapshotSource {
   listCameraIds(): string[]
   captureSnapshotBase64(cameraId: string): Promise<{ base64: string; dataUrl: string }>
   cropDeliveryZoneBase64?(jpegBase64: string): Promise<string | null>
+  extractLumaGridFromJpegBase64?(jpegBase64: string): Promise<Buffer | null>
+}
+
+function getLocalDateKey(now = new Date()): string {
+  const y = now.getFullYear()
+  const m = String(now.getMonth() + 1).padStart(2, '0')
+  const d = String(now.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
 }
 
 export class AiPackageService {
   private readonly historyPath: string
+  private readonly usagePath: string
   private readonly configStore: ConfigStore
   private readonly notifications: NotificationService
   private readonly onDetection: (record: PackageDetectionRecord) => void
   private readonly onSecurityEvent: (event: SecurityEvent) => void
+  private readonly onUsageUpdated?: (stats: AiUsageStats) => void
   private readonly retryDelayMs: number
   private readonly motionFollowUpDelaysMs: number[]
   private readonly motionEndDelayMs: number
   private history: PackageDetectionRecord[] = []
+  private usage: Omit<AiUsageStats, 'dailyScanLimit'>
   private readonly lastNotifiedAtByCamera = new Map<string, number>()
   private readonly lastNotifiedCountByCamera = new Map<string, number>()
   private readonly lastDetectedAtByCamera = new Map<string, number>()
   private readonly lastDetectedSeqByCamera = new Map<string, number>()
+  private readonly lastScanCompletedAtByCamera = new Map<string, number>()
+  private readonly lastScanSawPersonByCamera = new Map<string, boolean>()
+  private readonly packagePresentByCamera = new Map<string, boolean>()
   private detectionSeq = 0
   private readonly cleanBaselineByCamera = new Map<
     string,
-    { base64: string; capturedAtMs: number }
+    { base64: string; lumaGrid?: Buffer | null; capturedAtMs: number }
   >()
   private readonly inFlightCameras = new Set<string>()
   private readonly inFlightStartedAtByCamera = new Map<string, number>()
@@ -178,35 +178,109 @@ export class AiPackageService {
     notifications: NotificationService
     onDetection: (record: PackageDetectionRecord) => void
     onSecurityEvent: (event: SecurityEvent) => void
+    onUsageUpdated?: (stats: AiUsageStats) => void
     retryDelayMs?: number
     motionFollowUpDelayMs?: number
     motionFollowUpDelaysMs?: number[]
     motionEndDelayMs?: number
   }) {
     this.historyPath = path.join(params.userDataDir, 'package-detections.json')
+    this.usagePath = path.join(params.userDataDir, 'ai-usage-stats.json')
     this.configStore = params.configStore
     this.notifications = params.notifications
     this.onDetection = params.onDetection
     this.onSecurityEvent = params.onSecurityEvent
+    this.onUsageUpdated = params.onUsageUpdated
     this.retryDelayMs = params.retryDelayMs ?? 800
     if (params.motionFollowUpDelaysMs) {
       this.motionFollowUpDelaysMs = params.motionFollowUpDelaysMs.filter((ms) => ms > 0)
     } else if (params.motionFollowUpDelayMs !== undefined) {
       this.motionFollowUpDelaysMs =
-        params.motionFollowUpDelayMs > 0
-          ? [params.motionFollowUpDelayMs, params.motionFollowUpDelayMs * 2]
-          : []
+        params.motionFollowUpDelayMs > 0 ? [params.motionFollowUpDelayMs] : []
     } else {
-      // Multi-stage verification: mid-delivery (12s) + post-drop departure (28s)
-      this.motionFollowUpDelaysMs = [12_000, 28_000]
+      // Single settled follow-up check (15s) — only scheduled when a person is actively in frame,
+      // on a doorbell ring, or after a transient snapshot/API hiccup.
+      this.motionFollowUpDelaysMs = [15_000]
     }
     this.motionEndDelayMs = params.motionEndDelayMs ?? 2500
     this.history = this.loadHistory()
+    this.usage = this.loadUsage()
   }
 
   attachSnapshotSource(source: SnapshotSource): void {
     this.snapshotSource = source
     this.syncScheduler()
+  }
+
+  private createEmptyUsage(dateKey = getLocalDateKey()): Omit<AiUsageStats, 'dailyScanLimit'> {
+    return {
+      dateKey,
+      scansToday: 0,
+      imagesSentToday: 0,
+      skippedByLocalGateToday: 0,
+      skippedByThrottleToday: 0,
+      skippedByAlreadyPresentToday: 0,
+      skippedByQuietHoursToday: 0,
+      skippedByDailyLimitToday: 0,
+    }
+  }
+
+  private loadUsage(): Omit<AiUsageStats, 'dailyScanLimit'> {
+    const today = getLocalDateKey()
+    if (!fs.existsSync(this.usagePath)) return this.createEmptyUsage(today)
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.usagePath, 'utf-8')) as Partial<AiUsageStats>
+      if (parsed.dateKey !== today) return this.createEmptyUsage(today)
+      return {
+        dateKey: today,
+        scansToday: Number(parsed.scansToday) || 0,
+        imagesSentToday: Number(parsed.imagesSentToday) || 0,
+        skippedByLocalGateToday: Number(parsed.skippedByLocalGateToday) || 0,
+        skippedByThrottleToday: Number(parsed.skippedByThrottleToday) || 0,
+        skippedByAlreadyPresentToday: Number(parsed.skippedByAlreadyPresentToday) || 0,
+        skippedByQuietHoursToday: Number(parsed.skippedByQuietHoursToday) || 0,
+        skippedByDailyLimitToday: Number(parsed.skippedByDailyLimitToday) || 0,
+      }
+    } catch {
+      return this.createEmptyUsage(today)
+    }
+  }
+
+  private ensureCurrentDayUsage(): void {
+    const today = getLocalDateKey()
+    if (this.usage.dateKey !== today) {
+      this.usage = this.createEmptyUsage(today)
+    }
+  }
+
+  private saveUsage(): void {
+    try {
+      fs.writeFileSync(this.usagePath, JSON.stringify(this.usage, null, 2), 'utf-8')
+    } catch {
+      // Ignore transient disk write failures
+    }
+    this.onUsageUpdated?.(this.getUsageStats())
+  }
+
+  getUsageStats(): AiUsageStats {
+    this.ensureCurrentDayUsage()
+    const limit = this.configStore.getPublicSettings().packageAi.dailyScanLimit
+    return {
+      ...this.usage,
+      dailyScanLimit: limit,
+    }
+  }
+
+  recordLocalSkip(
+    reason: 'local-gate' | 'throttle' | 'already-present' | 'quiet-hours' | 'daily-limit' = 'local-gate',
+  ): void {
+    this.ensureCurrentDayUsage()
+    if (reason === 'local-gate') this.usage.skippedByLocalGateToday++
+    else if (reason === 'throttle') this.usage.skippedByThrottleToday++
+    else if (reason === 'already-present') this.usage.skippedByAlreadyPresentToday++
+    else if (reason === 'quiet-hours') this.usage.skippedByQuietHoursToday++
+    else if (reason === 'daily-limit') this.usage.skippedByDailyLimitToday++
+    this.saveUsage()
   }
 
   private loadHistory(): PackageDetectionRecord[] {
@@ -241,6 +315,9 @@ export class AiPackageService {
     this.lastNotifiedCountByCamera.clear()
     this.lastDetectedAtByCamera.clear()
     this.lastDetectedSeqByCamera.clear()
+    this.lastScanCompletedAtByCamera.clear()
+    this.lastScanSawPersonByCamera.clear()
+    this.packagePresentByCamera.clear()
     this.saveHistory()
   }
 
@@ -263,6 +340,7 @@ export class AiPackageService {
           ? allIds.filter((id) => settings.monitoredCameraIds.includes(id))
           : allIds
       for (const camId of targets) {
+        if (this.checkAutoScanGate(camId, 'interval') !== 'ok') continue
         void this.scanCamera(camId, 'interval')
       }
     }, ms)
@@ -299,6 +377,71 @@ export class AiPackageService {
       lower.includes('http 401') ||
       lower.includes('http 403')
     )
+  }
+
+  isWithinActiveHours(now = new Date()): boolean {
+    const ai = this.configStore.getPublicSettings().packageAi
+    if (!ai.activeHoursEnabled) return true
+    const hour = now.getHours()
+    const start = ai.activeHoursStart
+    const end = ai.activeHoursEnd
+    if (start === end) return true
+    if (start < end) {
+      return hour >= start && hour < end
+    }
+    // Overnight wrap-around window (e.g. 22 -> 6)
+    return hour >= start || hour < end
+  }
+
+  private checkAutoScanGate(
+    cameraId: string,
+    trigger: 'motion' | 'doorbell' | 'interval',
+    options?: { isFollowUp?: boolean; now?: Date },
+  ): 'ok' | 'quiet-hours' | 'daily-limit' | 'already-present' | 'throttle' {
+    const ai = this.configStore.getPublicSettings().packageAi
+    const now = options?.now ?? new Date()
+    const nowMs = now.getTime()
+    this.ensureCurrentDayUsage()
+
+    // 1. Active delivery hours (doorbell presses always bypass quiet hours)
+    if ((trigger === 'motion' || trigger === 'interval') && !this.isWithinActiveHours(now)) {
+      this.recordLocalSkip('quiet-hours')
+      return 'quiet-hours'
+    }
+
+    // 2. Daily auto-scan safety cap (manual scans never hit this gate)
+    if (ai.dailyScanLimit > 0 && this.usage.scansToday >= ai.dailyScanLimit) {
+      this.recordLocalSkip('daily-limit')
+      return 'daily-limit'
+    }
+
+    // 3. Pause repeated motion scans while a package is already confirmed sitting on this camera
+    if (
+      ai.pauseWhilePackagePresent &&
+      trigger === 'motion' &&
+      this.packagePresentByCamera.get(cameraId)
+    ) {
+      const lastDetectedAt = this.lastDetectedAtByCamera.get(cameraId) ?? 0
+      const pauseWindowMs = Math.max(
+        ai.cooldownMinutes * 60_000,
+        ai.minScanIntervalSeconds * 1000,
+      )
+      if (pauseWindowMs > 0 && nowMs - lastDetectedAt < pauseWindowMs) {
+        this.recordLocalSkip('already-present')
+        return 'already-present'
+      }
+    }
+
+    // 4. Per-camera minimum scan interval throttle (bypassed by doorbell and active follow-ups)
+    if (!options?.isFollowUp && trigger === 'motion' && ai.minScanIntervalSeconds > 0) {
+      const lastScanAt = this.lastScanCompletedAtByCamera.get(cameraId) ?? 0
+      if (lastScanAt > 0 && nowMs - lastScanAt < ai.minScanIntervalSeconds * 1000) {
+        this.recordLocalSkip('throttle')
+        return 'throttle'
+      }
+    }
+
+    return 'ok'
   }
 
   shouldTriggerForCamera(
@@ -353,6 +496,7 @@ export class AiPackageService {
         if (!this.shouldTriggerForCamera(cameraId, trigger)) return
         const lastHitSeq = this.lastDetectedSeqByCamera.get(cameraId) ?? 0
         if (lastHitSeq > burstStartSeq) return
+        if (this.checkAutoScanGate(cameraId, trigger, { isFollowUp: true }) !== 'ok') return
         if (this.inFlightCameras.has(cameraId)) {
           this.pendingAutoTriggerByCamera.set(cameraId, trigger)
           return
@@ -373,6 +517,7 @@ export class AiPackageService {
               if (!this.shouldTriggerForCamera(cameraId, trigger)) return
               const hitSeq = this.lastDetectedSeqByCamera.get(cameraId) ?? 0
               if (hitSeq > burstStartSeq) return
+              if (this.checkAutoScanGate(cameraId, trigger, { isFollowUp: true }) !== 'ok') return
               void this.scanCamera(cameraId, trigger)
             })
           }
@@ -383,7 +528,8 @@ export class AiPackageService {
 
   /**
    * Called when Ring reports that a camera's motion period has ended (driver left the porch).
-   * Schedules a single unobstructed verification scan if no package was spotted during the burst.
+   * Schedules an unobstructed verification scan only when a courier was seen during the motion
+   * burst or when the scan interval throttle has elapsed, avoiding redundant API calls on empty motion.
    */
   handleMotionEnded(cameraId: string): void {
     if (!this.snapshotSource) return
@@ -391,12 +537,26 @@ export class AiPackageService {
     const lastHit = this.lastDetectedAtByCamera.get(cameraId) ?? 0
     if (Date.now() - lastHit < 90_000) return
 
+    const ai = this.configStore.getPublicSettings().packageAi
+    const sawPerson = this.lastScanSawPersonByCamera.get(cameraId) === true
+    const lastScanAt = this.lastScanCompletedAtByCamera.get(cameraId) ?? 0
+    const throttleMs = ai.minScanIntervalSeconds * 1000
+    if (!sawPerson && throttleMs > 0 && lastScanAt > 0 && Date.now() - lastScanAt < throttleMs) {
+      this.recordLocalSkip('throttle')
+      return
+    }
+
     const scheduledSeq = this.detectionSeq
     this.scheduleTimer(cameraId, this.motionEndDelayMs, () => {
       if (!this.snapshotSource) return
       if (!this.shouldTriggerForCamera(cameraId, 'motion')) return
       const hitSeq = this.lastDetectedSeqByCamera.get(cameraId) ?? 0
       if (hitSeq > scheduledSeq) return
+      if (
+        this.checkAutoScanGate(cameraId, 'motion', { isFollowUp: sawPerson }) !== 'ok'
+      ) {
+        return
+      }
       if (this.inFlightCameras.has(cameraId)) {
         this.pendingAutoTriggerByCamera.set(cameraId, 'motion')
         return
@@ -422,15 +582,55 @@ export class AiPackageService {
       }
       return null
     }
+
+    if (this.checkAutoScanGate(cameraId, trigger) !== 'ok') {
+      return null
+    }
+
     const burstStartSeq = this.detectionSeq
     const record = await this.scanCamera(cameraId, trigger)
-    // Motion often fires while the delivery driver is still approaching the porch—or the
-    // initial scan can hit a transient API/snapshot hiccup. Keep follow-up verification active
-    // unless a package was already found or the error is a permanent API-key configuration error.
-    if (!record.packageDetected && !this.isPermanentConfigError(record.rawError)) {
+    // Cost-saver #2: Only schedule a follow-up check if a courier/person was actually in frame,
+    // someone rang the doorbell, or a transient API/snapshot error occurred. Empty motion
+    // (passing cars, trees, shadows) completes in 1 single scan instead of 3-5 scans.
+    const locallySkipped = record.imagesSubmitted === 0 && !record.rawError
+    const needsFollowUp =
+      !locallySkipped &&
+      !record.packageDetected &&
+      !this.isPermanentConfigError(record.rawError) &&
+      (record.personPresent || Boolean(record.rawError) || trigger === 'doorbell')
+    if (needsFollowUp) {
       this.scheduleMotionFollowUps(cameraId, trigger, burstStartSeq)
     }
     return record
+  }
+
+  private async runVisionProviderCall(
+    provider: AiProvider,
+    apiKey: string,
+    aiCfg: { openaiModel: string; geminiModel: string; customPromptHint: string },
+    bundle: VisionImageBundle,
+    cameraName: string,
+  ): Promise<{ parsed: ParsedPackageVisionResult; modelUsed: string; imagesSent: number }> {
+    const imagesSent =
+      1 + (bundle.baselineBase64 ? 1 : 0) + (bundle.zoomCropBase64 ? 1 : 0)
+    if (provider === 'openai') {
+      const parsed = await this.analyzeWithOpenAI(
+        apiKey,
+        aiCfg.openaiModel,
+        bundle,
+        aiCfg.customPromptHint,
+        cameraName,
+      )
+      return { parsed, modelUsed: aiCfg.openaiModel, imagesSent }
+    }
+    const geminiRes = await this.analyzeWithGemini(
+      apiKey,
+      aiCfg.geminiModel,
+      bundle,
+      aiCfg.customPromptHint,
+      cameraName,
+    )
+    return { parsed: geminiRes.parsed, modelUsed: geminiRes.modelUsed, imagesSent }
   }
 
   async scanCamera(
@@ -456,28 +656,75 @@ export class AiPackageService {
       const { base64, dataUrl } =
         await this.snapshotSource.captureSnapshotBase64(cameraId)
 
-      // Prepare multi-image context: previous clean empty-porch baseline + zoomed ground delivery crop
       const cachedBaseline = this.cleanBaselineByCamera.get(cameraId)
-      const baselineBase64 =
-        cachedBaseline &&
-        cachedBaseline.base64 !== base64 &&
-        Date.now() - cachedBaseline.capturedAtMs < 24 * 60 * 60 * 1000
-          ? cachedBaseline.base64
-          : null
+      const baselineFresh = Boolean(
+        cachedBaseline && Date.now() - cachedBaseline.capturedAtMs < 24 * 60 * 60 * 1000,
+      )
 
-      let zoomCropBase64: string | null = null
-      if (typeof this.snapshotSource.cropDeliveryZoneBase64 === 'function') {
+      // Extract tiny 64x36 grayscale grid ($0 local CPU) for persistent-change gating
+      let currLumaGrid: Buffer | null = null
+      if (typeof this.snapshotSource.extractLumaGridFromJpegBase64 === 'function') {
         try {
-          zoomCropBase64 = await this.snapshotSource.cropDeliveryZoneBase64(base64)
+          currLumaGrid = await this.snapshotSource.extractLumaGridFromJpegBase64(base64)
         } catch {
-          zoomCropBase64 = null
+          currLumaGrid = null
         }
       }
 
-      const imageBundle: VisionImageBundle = {
-        currentBase64: base64,
-        baselineBase64,
-        zoomCropBase64,
+      // Cost-saver #1: Local Persistent-Baseline Gate ($0)
+      // On motion triggers, if we have a confirmed clean empty-porch baseline and the current
+      // frame still matches it (car drove by, shadow flickered, person walked past leaving nothing),
+      // skip Cloud Vision completely and save 100% of API spend for this event.
+      if (
+        trigger === 'motion' &&
+        aiCfg.requirePersistentChange &&
+        baselineFresh &&
+        cachedBaseline?.lumaGrid &&
+        currLumaGrid
+      ) {
+        const diff = computeLumaSceneChange(cachedBaseline.lumaGrid, currLumaGrid)
+        if (!diff.significant) {
+          this.recordLocalSkip('local-gate')
+          this.lastScanSawPersonByCamera.set(cameraId, false)
+          this.cancelFollowUps(cameraId)
+          return {
+            id: crypto.randomUUID(),
+            cameraId,
+            cameraName: meta.name,
+            timestamp: new Date().toISOString(),
+            provider: aiCfg.provider,
+            model:
+              aiCfg.provider === 'openai'
+                ? aiCfg.openaiModel
+                : normalizeGeminiModel(aiCfg.geminiModel),
+            trigger,
+            packageDetected: false,
+            confidence: 0.99,
+            packageCount: 0,
+            carrierHint: null,
+            placement: null,
+            personPresent: false,
+            summary: 'Skipped cloud AI ($0 local baseline match — scene unchanged).',
+            snapshotDataUrl: dataUrl,
+            notified: false,
+            latencyMs: Date.now() - started,
+            imagesSubmitted: 0,
+          }
+        }
+      }
+
+      const baselineBase64 =
+        baselineFresh && cachedBaseline && cachedBaseline.base64 !== base64
+          ? cachedBaseline.base64
+          : null
+
+      const getZoomCrop = async (): Promise<string | null> => {
+        if (typeof this.snapshotSource?.cropDeliveryZoneBase64 !== 'function') return null
+        try {
+          return await this.snapshotSource.cropDeliveryZoneBase64(base64)
+        } catch {
+          return null
+        }
       }
 
       const provider = aiCfg.provider
@@ -486,55 +733,118 @@ export class AiPackageService {
           ? this.configStore.getOpenaiApiKey()
           : this.configStore.getGeminiApiKey()
 
+      const qualityMode = aiCfg.scanQualityMode ?? 'balanced'
       let parsed: ParsedPackageVisionResult
       let usedProvider: AiProvider | 'demo-vision' = provider
       let usedModel =
         provider === 'openai'
           ? aiCfg.openaiModel
           : normalizeGeminiModel(aiCfg.geminiModel)
+      let imagesSubmitted = 0
 
       if (apiKey) {
-        if (provider === 'openai') {
-          parsed = await this.analyzeWithOpenAI(
+        if (qualityMode === 'economy') {
+          // Cost-saver #3 (Economy): Always 1 low-res frame, zero escalations
+          const res = await this.runVisionProviderCall(
+            provider,
             apiKey,
-            aiCfg.openaiModel,
-            imageBundle,
-            aiCfg.customPromptHint,
+            aiCfg,
+            { currentBase64: base64, resolution: 'low' },
             meta.name,
           )
+          parsed = res.parsed
+          usedModel = res.modelUsed
+          imagesSubmitted = res.imagesSent
+        } else if (qualityMode === 'balanced') {
+          // Cost-saver #3 (Balanced — Recommended):
+          // Stage 1: Cheap single low-res triage frame (~85 tokens on OpenAI / low-res on Gemini).
+          // Stage 2: Escalate to high-res + zoomed delivery crop ONLY if Stage 1 is uncertain
+          // or reports a borderline package (< 0.85 confidence).
+          const stage1 = await this.runVisionProviderCall(
+            provider,
+            apiKey,
+            aiCfg,
+            { currentBase64: base64, resolution: 'low' },
+            meta.name,
+          )
+          parsed = stage1.parsed
+          usedModel = stage1.modelUsed
+          imagesSubmitted = stage1.imagesSent
+
+          const needsHighResVerify =
+            Boolean(stage1.parsed.uncertain) ||
+            (stage1.parsed.packageDetected && stage1.parsed.confidence < 0.85)
+          if (needsHighResVerify) {
+            const zoomCropBase64 = await getZoomCrop()
+            const stage2 = await this.runVisionProviderCall(
+              provider,
+              apiKey,
+              aiCfg,
+              {
+                currentBase64: base64,
+                baselineBase64,
+                zoomCropBase64,
+                resolution: 'high',
+              },
+              meta.name,
+            )
+            parsed = stage2.parsed
+            usedModel = stage2.modelUsed
+            imagesSubmitted += stage2.imagesSent
+          }
         } else {
-          const geminiRes = await this.analyzeWithGemini(
+          // High Accuracy mode: full BEFORE baseline + AFTER current + zoomed delivery crop at high res
+          const zoomCropBase64 = await getZoomCrop()
+          const res = await this.runVisionProviderCall(
+            provider,
             apiKey,
-            aiCfg.geminiModel,
-            imageBundle,
-            aiCfg.customPromptHint,
+            aiCfg,
+            {
+              currentBase64: base64,
+              baselineBase64,
+              zoomCropBase64,
+              resolution: 'high',
+            },
             meta.name,
           )
-          parsed = geminiRes.parsed
-          usedModel = geminiRes.modelUsed
+          parsed = res.parsed
+          usedModel = res.modelUsed
+          imagesSubmitted = res.imagesSent
         }
+
+        this.ensureCurrentDayUsage()
+        this.usage.scansToday += 1
+        this.usage.imagesSentToday += imagesSubmitted
+        this.saveUsage()
       } else if (settings.mode === 'demo') {
         usedProvider = 'demo-vision'
         usedModel = 'demo-simulator'
         parsed = this.simulateDemoVision(cameraId, meta.name)
+        imagesSubmitted = 0
       } else {
         throw new Error(
           `No ${provider === 'openai' ? 'OpenAI' : 'Gemini'} API key configured. Add your API key in Settings -> Cloud Vision AI.`,
         )
       }
 
-      // Update clean empty-porch baseline whenever the scene is confirmed clear
+      const completedAt = Date.now()
+      this.lastScanCompletedAtByCamera.set(cameraId, completedAt)
+      this.lastScanSawPersonByCamera.set(cameraId, parsed.personPresent)
+      this.packagePresentByCamera.set(cameraId, parsed.packageDetected)
+
+      // Update clean empty-porch baseline (including 64x36 luma grid) whenever scene is confirmed clear
       if (!parsed.packageDetected) {
         this.lastNotifiedCountByCamera.set(cameraId, 0)
         if (!parsed.personPresent) {
           this.cleanBaselineByCamera.set(cameraId, {
             base64,
-            capturedAtMs: Date.now(),
+            lumaGrid: currLumaGrid,
+            capturedAtMs: completedAt,
           })
         }
       } else {
         detectedInThisScan = true
-        this.lastDetectedAtByCamera.set(cameraId, Date.now())
+        this.lastDetectedAtByCamera.set(cameraId, completedAt)
         this.lastDetectedSeqByCamera.set(cameraId, ++this.detectionSeq)
         this.cancelFollowUps(cameraId)
       }
@@ -572,6 +882,7 @@ export class AiPackageService {
         snapshotDataUrl: dataUrl,
         notified: shouldNotify,
         latencyMs,
+        imagesSubmitted,
       }
 
       this.history.unshift(record)
@@ -747,68 +1058,82 @@ export class AiPackageService {
     customHint: string,
     cameraName?: string,
   ): Promise<ParsedPackageVisionResult> {
+    const isLowRes = images.resolution === 'low'
+    const detailLevel: 'low' | 'high' = isLowRes ? 'low' : 'high'
     const camContext = cameraName ? `Camera: "${cameraName}". ` : ''
-    const hintContext = customHint.trim()
-      ? ` Additional context: ${customHint.trim()}`
-      : ''
+    const hintContext = customHint.trim() ? ` Context: ${customHint.trim()}` : ''
 
     const userContent: Array<
       | { type: 'text'; text: string }
-      | { type: 'image_url'; image_url: { url: string; detail: 'high' } }
+      | { type: 'image_url'; image_url: { url: string; detail: 'low' | 'high' } }
     > = []
 
-    if (images.baselineBase64) {
+    if (isLowRes) {
       userContent.push({
         type: 'text',
-        text: `${camContext}Compare the EARLIER BASELINE (empty scene) image against the CURRENT frame${images.zoomCropBase64 ? ' and the ZOOMED DELIVERY ZONE crop' : ''} to detect any newly delivered boxes, parcels, mailers, delivery bags, or an active delivery in progress.${hintContext}\n\nImage 1 — EARLIER BASELINE (BEFORE):`,
+        text: `${camContext}Inspect for delivered boxes/parcels/bags or an active courier.${hintContext}`,
       })
       userContent.push({
         type: 'image_url',
         image_url: {
-          url: `data:image/jpeg;base64,${images.baselineBase64}`,
-          detail: 'high',
+          url: `data:image/jpeg;base64,${images.currentBase64}`,
+          detail: 'low',
         },
-      })
-      userContent.push({
-        type: 'text',
-        text: 'Image 2 — CURRENT FULL FRAME (AFTER):',
       })
     } else {
-      userContent.push({
-        type: 'text',
-        text: `${camContext}Carefully inspect this full-resolution Ring camera frame${images.zoomCropBase64 ? ' and its ZOOMED DELIVERY ZONE crop' : ''} for any delivered boxes, cardboard parcels, mailers, delivery bags, or an active delivery in progress.${hintContext}\n\nCURRENT FULL FRAME:`,
-      })
-    }
+      if (images.baselineBase64) {
+        userContent.push({
+          type: 'text',
+          text: `${camContext}Compare BEFORE baseline vs AFTER current${images.zoomCropBase64 ? ' + ZOOMED DELIVERY ZONE' : ''} for newly delivered packages.${hintContext}\n\nImage 1 — BEFORE:`,
+        })
+        userContent.push({
+          type: 'image_url',
+          image_url: {
+            url: `data:image/jpeg;base64,${images.baselineBase64}`,
+            detail: detailLevel,
+          },
+        })
+        userContent.push({
+          type: 'text',
+          text: 'Image 2 — AFTER:',
+        })
+      } else {
+        userContent.push({
+          type: 'text',
+          text: `${camContext}Inspect this Ring frame${images.zoomCropBase64 ? ' + ZOOMED DELIVERY ZONE' : ''} for delivered boxes, mailers, bags, or a courier.${hintContext}`,
+        })
+      }
 
-    userContent.push({
-      type: 'image_url',
-      image_url: {
-        url: `data:image/jpeg;base64,${images.currentBase64}`,
-        detail: 'high',
-      },
-    })
-
-    if (images.zoomCropBase64) {
-      userContent.push({
-        type: 'text',
-        text: 'ZOOMED DELIVERY ZONE (lower porch, steps, doormat, walkway, driveway):',
-      })
       userContent.push({
         type: 'image_url',
         image_url: {
-          url: `data:image/jpeg;base64,${images.zoomCropBase64}`,
-          detail: 'high',
+          url: `data:image/jpeg;base64,${images.currentBase64}`,
+          detail: detailLevel,
         },
       })
+
+      if (images.zoomCropBase64) {
+        userContent.push({
+          type: 'text',
+          text: 'ZOOMED DELIVERY ZONE:',
+        })
+        userContent.push({
+          type: 'image_url',
+          image_url: {
+            url: `data:image/jpeg;base64,${images.zoomCropBase64}`,
+            detail: detailLevel,
+          },
+        })
+      }
     }
 
     const body = JSON.stringify({
       model,
       temperature: 0.1,
-      max_tokens: 500,
+      max_tokens: 220,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'system', content: isLowRes ? COMPACT_TRIAGE_PROMPT : SYSTEM_PROMPT },
         { role: 'user', content: userContent },
       ],
     })
@@ -919,6 +1244,7 @@ export class AiPackageService {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(candidateModel)}:generateContent`
       let currentPayload: Record<string, unknown> = payload
       let strippedMediaResolution = false
+      let strippedThinkingConfig = false
 
       for (let attempt = 0; attempt < 2; attempt++) {
         const response = await fetch(url, {
@@ -951,23 +1277,39 @@ export class AiPackageService {
         const errText = await response.text()
         lastError = `Gemini HTTP ${response.status} (${candidateModel}): ${errText.slice(0, 220)}`
 
-        // If a specific Gemini model rejects mediaResolution in generationConfig (HTTP 400),
-        // strip mediaResolution and immediately retry on the same model.
+        // Gracefully strip optional generationConfig fields (thinkingConfig / mediaResolution)
+        // if a specific Gemini model rejects them with HTTP 400.
         if (
           response.status === 400 &&
-          !strippedMediaResolution &&
           typeof currentPayload.generationConfig === 'object' &&
-          currentPayload.generationConfig !== null &&
-          'mediaResolution' in (currentPayload.generationConfig as Record<string, unknown>)
+          currentPayload.generationConfig !== null
         ) {
-          const { mediaResolution: _drop, ...restGen } = currentPayload.generationConfig as Record<
-            string,
-            unknown
-          >
-          currentPayload = { ...currentPayload, generationConfig: restGen }
-          strippedMediaResolution = true
-          attempt = -1
-          continue
+          const genCfg = currentPayload.generationConfig as Record<string, unknown>
+          const errLower = errText.toLowerCase()
+          const hasThinking = !strippedThinkingConfig && 'thinkingConfig' in genCfg
+          const hasMediaRes = !strippedMediaResolution && 'mediaResolution' in genCfg
+
+          if (hasThinking && (errLower.includes('thinking') || !hasMediaRes)) {
+            const { thinkingConfig: _drop, ...restGen } = genCfg
+            currentPayload = { ...currentPayload, generationConfig: restGen }
+            strippedThinkingConfig = true
+            attempt = -1
+            continue
+          }
+          if (hasMediaRes && (errLower.includes('mediaresolution') || errLower.includes('media_resolution') || !hasThinking)) {
+            const { mediaResolution: _drop, ...restGen } = genCfg
+            currentPayload = { ...currentPayload, generationConfig: restGen }
+            strippedMediaResolution = true
+            attempt = -1
+            continue
+          }
+          if (hasThinking) {
+            const { thinkingConfig: _drop, ...restGen } = genCfg
+            currentPayload = { ...currentPayload, generationConfig: restGen }
+            strippedThinkingConfig = true
+            attempt = -1
+            continue
+          }
         }
 
         if (response.status === 404) {
@@ -1005,26 +1347,27 @@ export class AiPackageService {
     customHint: string,
     cameraName?: string,
   ): Promise<{ parsed: ParsedPackageVisionResult; modelUsed: string }> {
-    const camLine = cameraName ? `\nCamera vantage point: "${cameraName}".` : ''
-    const hintLine = customHint.trim() ? `\nAdditional context: ${customHint.trim()}` : ''
-    const userPrompt = `${SYSTEM_PROMPT}${camLine}${hintLine}`
+    const isLowRes = images.resolution === 'low'
+    const camLine = cameraName ? `\nCamera: "${cameraName}".` : ''
+    const hintLine = customHint.trim() ? `\nContext: ${customHint.trim()}` : ''
+    const userPrompt = `${isLowRes ? COMPACT_TRIAGE_PROMPT : SYSTEM_PROMPT}${camLine}${hintLine}`
 
     const parts: Array<
       | { text: string }
       | { inline_data: { mime_type: string; data: string } }
     > = [{ text: userPrompt }]
 
-    if (images.baselineBase64) {
-      parts.push({ text: 'Image 1 — EARLIER CLEAN BASELINE (BEFORE):' })
+    if (!isLowRes && images.baselineBase64) {
+      parts.push({ text: 'Image 1 — BEFORE:' })
       parts.push({
         inline_data: {
           mime_type: 'image/jpeg',
           data: images.baselineBase64,
         },
       })
-      parts.push({ text: 'Image 2 — CURRENT FULL FRAME (AFTER):' })
-    } else {
-      parts.push({ text: 'CURRENT FULL FRAME:' })
+      parts.push({ text: 'Image 2 — AFTER:' })
+    } else if (!isLowRes) {
+      parts.push({ text: 'CURRENT FRAME:' })
     }
 
     parts.push({
@@ -1034,10 +1377,8 @@ export class AiPackageService {
       },
     })
 
-    if (images.zoomCropBase64) {
-      parts.push({
-        text: 'ZOOMED DELIVERY ZONE (lower porch, steps, doormat, walkway, driveway):',
-      })
+    if (!isLowRes && images.zoomCropBase64) {
+      parts.push({ text: 'ZOOMED DELIVERY ZONE:' })
       parts.push({
         inline_data: {
           mime_type: 'image/jpeg',
@@ -1053,7 +1394,9 @@ export class AiPackageService {
         contents: [{ parts }],
         generationConfig: {
           responseMimeType: 'application/json',
-          mediaResolution: 'MEDIA_RESOLUTION_HIGH',
+          maxOutputTokens: 220,
+          mediaResolution: isLowRes ? 'MEDIA_RESOLUTION_LOW' : 'MEDIA_RESOLUTION_HIGH',
+          thinkingConfig: { thinkingBudget: 0 },
         },
       },
     )

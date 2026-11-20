@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
+  AiUsageStats,
   AlertSoundPayload,
   AppSettings,
   AuthStatus,
@@ -75,7 +76,28 @@ const DEFAULT_SETTINGS: AppSettings = {
     alertSound: 'crisp-chime',
     alertVolume: 0.85,
     customPromptHint: '',
+    scanQualityMode: 'balanced',
+    requirePersistentChange: true,
+    personOrPackageEventsOnly: true,
+    minScanIntervalSeconds: 90,
+    pauseWhilePackagePresent: true,
+    dailyScanLimit: 60,
+    activeHoursEnabled: false,
+    activeHoursStart: 6,
+    activeHoursEnd: 22,
   },
+}
+
+const DEFAULT_AI_USAGE: AiUsageStats = {
+  dateKey: new Date().toISOString().slice(0, 10),
+  scansToday: 0,
+  imagesSentToday: 0,
+  skippedByLocalGateToday: 0,
+  skippedByThrottleToday: 0,
+  skippedByAlreadyPresentToday: 0,
+  skippedByQuietHoursToday: 0,
+  skippedByDailyLimitToday: 0,
+  dailyScanLimit: 60,
 }
 
 const DEFAULT_STORAGE_STATS: StorageStats = {
@@ -140,6 +162,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
   const [events, setEvents] = useState<SecurityEvent[]>([])
   const [recordings, setRecordings] = useState<LocalRecordingItem[]>([])
   const [packageDetections, setPackageDetections] = useState<PackageDetectionRecord[]>([])
+  const [aiUsageStats, setAiUsageStats] = useState<AiUsageStats>(DEFAULT_AI_USAGE)
   const [streamsByCamera, setStreamsByCamera] = useState<Record<string, LiveStreamSession>>({})
   const [toasts, setToasts] = useState<UiToast[]>([])
 
@@ -172,6 +195,9 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     setEvents(boot.events)
     setRecordings(boot.recordings)
     setPackageDetections(boot.packageDetections)
+    if (boot.aiUsageStats) {
+      setAiUsageStats(boot.aiUsageStats)
+    }
     const streamMap: Record<string, LiveStreamSession> = {}
     for (const s of boot.activeStreams) streamMap[s.cameraId] = s
     setStreamsByCamera(streamMap)
@@ -246,6 +272,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
       webRingWatchApi.onPackageDetection((rec) =>
         setPackageDetections((prev) => [rec, ...prev].slice(0, 150)),
       ),
+      webRingWatchApi.onAiUsageUpdated((stats) => setAiUsageStats(stats)),
       webRingWatchApi.onPlayAlertSound((payload: AlertSoundPayload) => {
         if (payload.profile !== 'none') {
           playAlertChime(payload.profile, payload.volume)
@@ -462,6 +489,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     setRecordings,
     packageDetections,
     setPackageDetections,
+    aiUsageStats,
     streamsByCamera,
     setStreamsByCamera,
     toasts,

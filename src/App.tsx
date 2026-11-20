@@ -73,6 +73,7 @@ export function App() {
     setRecordings,
     packageDetections,
     setPackageDetections,
+    aiUsageStats,
     streamsByCamera,
     setStreamsByCamera,
     toasts,
@@ -1265,6 +1266,7 @@ export function App() {
               cameras={cameras}
               settings={settings}
               detections={packageDetections}
+              usageStats={aiUsageStats}
               onUpdateSettings={handleUpdateSettings}
               onScanCamera={handleScanPackages}
               onClearDetections={async () => {

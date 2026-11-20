@@ -339,6 +339,7 @@ export function SettingsView({
                       })
                     }
                   >
+                    <option value="gpt-4.1-nano">gpt-4.1-nano (Ultra low cost)</option>
                     <option value="gpt-4o-mini">gpt-4o-mini (Fast &amp; low cost)</option>
                     <option value="gpt-4.1-mini">gpt-4.1-mini (Balanced)</option>
                     <option value="gpt-4o">gpt-4o (Maximum accuracy)</option>

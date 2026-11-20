@@ -89,6 +89,15 @@ const DEFAULT_PACKAGE_AI: Omit<PackageAiConfig, 'hasOpenaiKey' | 'hasGeminiKey'>
   alertSound: 'crisp-chime',
   alertVolume: 0.85,
   customPromptHint: '',
+  scanQualityMode: 'balanced',
+  requirePersistentChange: true,
+  personOrPackageEventsOnly: true,
+  minScanIntervalSeconds: 90,
+  pauseWhilePackagePresent: true,
+  dailyScanLimit: 60,
+  activeHoursEnabled: false,
+  activeHoursStart: 6,
+  activeHoursEnd: 22,
 }
 
 export class ConfigStore {
@@ -437,6 +446,49 @@ export class ConfigStore {
       }
       if (ai.customPromptHint !== undefined) {
         this.data.packageAi.customPromptHint = ai.customPromptHint
+      }
+      if (
+        ai.scanQualityMode === 'economy' ||
+        ai.scanQualityMode === 'balanced' ||
+        ai.scanQualityMode === 'high'
+      ) {
+        this.data.packageAi.scanQualityMode = ai.scanQualityMode
+      }
+      if (ai.requirePersistentChange !== undefined) {
+        this.data.packageAi.requirePersistentChange = ai.requirePersistentChange
+      }
+      if (ai.personOrPackageEventsOnly !== undefined) {
+        this.data.packageAi.personOrPackageEventsOnly = ai.personOrPackageEventsOnly
+      }
+      if (ai.minScanIntervalSeconds !== undefined) {
+        this.data.packageAi.minScanIntervalSeconds = Math.max(
+          0,
+          Math.min(3600, Math.round(ai.minScanIntervalSeconds)),
+        )
+      }
+      if (ai.pauseWhilePackagePresent !== undefined) {
+        this.data.packageAi.pauseWhilePackagePresent = ai.pauseWhilePackagePresent
+      }
+      if (ai.dailyScanLimit !== undefined) {
+        this.data.packageAi.dailyScanLimit = Math.max(
+          0,
+          Math.min(1000, Math.round(ai.dailyScanLimit)),
+        )
+      }
+      if (ai.activeHoursEnabled !== undefined) {
+        this.data.packageAi.activeHoursEnabled = ai.activeHoursEnabled
+      }
+      if (ai.activeHoursStart !== undefined) {
+        this.data.packageAi.activeHoursStart = Math.max(
+          0,
+          Math.min(23, Math.round(ai.activeHoursStart)),
+        )
+      }
+      if (ai.activeHoursEnd !== undefined) {
+        this.data.packageAi.activeHoursEnd = Math.max(
+          0,
+          Math.min(23, Math.round(ai.activeHoursEnd)),
+        )
       }
       if (ai.openaiApiKey !== undefined) {
         const trimmed = ai.openaiApiKey.trim()

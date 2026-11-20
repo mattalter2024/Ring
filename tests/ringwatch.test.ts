@@ -136,6 +136,8 @@ describe('AiPackageService automation & Vision providers', () => {
         minConfidence: 0.7,
         cooldownMinutes: 10,
         monitoredCameraIds: ['cam-front'],
+        minScanIntervalSeconds: 0,
+        pauseWhilePackagePresent: false,
       },
     })
 
@@ -1228,9 +1230,15 @@ describe('Always-Live Stream Continuity & Improved AI Box Detection', () => {
     expect(store.getPublicSettings().packageAi.geminiModel).toBe('gemini-3.5-flash-lite')
     expect(calledModels.filter((u) => u.includes('gemini-3.5-flash-lite'))).toHaveLength(2)
 
-    // 2. OpenAI uses detail: 'high' and two-stage motion follow-up catches box placed seconds later
+    // 2. OpenAI High Accuracy mode uses detail: 'high' and follow-up catches box placed seconds later
     store.updateSettings({
-      packageAi: { provider: 'openai', openaiModel: 'gpt-4o-mini' },
+      packageAi: {
+        provider: 'openai',
+        openaiModel: 'gpt-4o-mini',
+        scanQualityMode: 'high',
+        minScanIntervalSeconds: 0,
+        pauseWhilePackagePresent: false,
+      },
     })
 
     let openAiCalls = 0
@@ -1445,6 +1453,9 @@ describe('Enhanced Delivery Detection (Baseline Diff, Ground Crop, Motion-End & 
         geminiModel: 'gemini-3-flash-preview',
         geminiApiKey: 'AIza-test-delivery',
         cooldownMinutes: 10,
+        scanQualityMode: 'high',
+        minScanIntervalSeconds: 0,
+        pauseWhilePackagePresent: false,
       },
     })
 
@@ -1736,6 +1747,8 @@ describe('Enhanced Delivery Detection (Baseline Diff, Ground Crop, Motion-End & 
         triggerOnMotion: true,
         triggerOnDoorbell: true,
         cooldownMinutes: 5,
+        minScanIntervalSeconds: 0,
+        pauseWhilePackagePresent: false,
       },
     })
 
@@ -2614,6 +2627,532 @@ describe('Vault Actions, Demo Video Cleanup & Clear All Videos', () => {
       expect(clearAllJson.remainingCount).toBe(0)
       expect(clearAllJson.stats.totalClips).toBe(0)
       expect(fs.existsSync(clip1.filePath)).toBe(false)
+    } finally {
+      await server.stop()
+    }
+  })
+})
+
+describe('AI Spend Reduction (Cost-Saver Pipeline #1–#6)', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('skips Cloud Vision at $0 when post-motion snapshot matches clean baseline luma grid (#1) and triggers when a box appears', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    store.updateSettings({
+      mode: 'live',
+      packageAi: {
+        enabled: true,
+        provider: 'openai',
+        openaiModel: 'gpt-4.1-nano',
+        openaiApiKey: 'sk-test-cost-saver',
+        requirePersistentChange: true,
+        minScanIntervalSeconds: 0,
+        pauseWhilePackagePresent: false,
+      },
+    })
+
+    const service = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: { notifyPackageAlert: vi.fn() } as unknown as NotificationService,
+      onDetection: vi.fn(),
+      onSecurityEvent: vi.fn(),
+      retryDelayMs: 0,
+      motionFollowUpDelaysMs: [40],
+      motionEndDelayMs: 40,
+    })
+
+    // Create 64x36 luma grids: baseline empty porch, unchanged frame, and frame with a cardboard box patch
+    const emptyGrid = Buffer.alloc(64 * 36, 90)
+    const unchangedGrid = Buffer.alloc(64 * 36, 92) // slight ambient brightness drift only
+    const boxGrid = Buffer.from(emptyGrid)
+    // Paint a localized 14x10 bright parcel on the lower porch
+    for (let y = 20; y < 30; y++) {
+      for (let x = 24; x < 38; x++) {
+        boxGrid[y * 64 + x] = 215
+      }
+    }
+
+    const gridsByB64 = new Map<string, Buffer>([
+      [Buffer.from('frame-baseline').toString('base64'), emptyGrid],
+      [Buffer.from('frame-unchanged').toString('base64'), unchangedGrid],
+      [Buffer.from('frame-with-box').toString('base64'), boxGrid],
+    ])
+    const frameOrder = Array.from(gridsByB64.keys())
+    let idx = 0
+
+    service.attachSnapshotSource({
+      getCameraMeta: (id) => ({ id, name: 'Front Porch' }),
+      listCameraIds: () => ['cam-front'],
+      captureSnapshotBase64: async () => {
+        const base64 = frameOrder[Math.min(idx++, frameOrder.length - 1)]
+        return { base64, dataUrl: `data:image/jpeg;base64,${base64}` }
+      },
+      extractLumaGridFromJpegBase64: async (b64) => gridsByB64.get(b64) ?? null,
+    })
+
+    let fetchCalls = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async () => {
+        fetchCalls++
+        const isBoxFrame = fetchCalls >= 2
+        return {
+          ok: true,
+          json: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    packageDetected: isBoxFrame,
+                    confidence: 0.94,
+                    packageCount: isBoxFrame ? 1 : 0,
+                    carrierHint: isBoxFrame ? 'Amazon' : null,
+                    placement: isBoxFrame ? 'Doormat' : null,
+                    personPresent: false,
+                    uncertain: false,
+                    summary: isBoxFrame ? 'Amazon box on doormat.' : 'Empty porch.',
+                  }),
+                },
+              },
+            ],
+          }),
+        }
+      }),
+    )
+
+    // 1. First scan establishes clean baseline (calls Vision once)
+    const first = await service.handleAutoTrigger('cam-front', 'motion')
+    expect(first?.packageDetected).toBe(false)
+    expect(first?.imagesSubmitted).toBe(1)
+    expect(fetchCalls).toBe(1)
+
+    // Cost-saver #2: Since personPresent=false and packageDetected=false, ZERO blind follow-ups run!
+    await new Promise((r) => setTimeout(r, 100))
+    expect(fetchCalls).toBe(1)
+
+    // 2. Second motion event where scene matches empty baseline -> skipped locally at $0!
+    const skipped = await service.handleAutoTrigger('cam-front', 'motion')
+    expect(skipped?.imagesSubmitted).toBe(0)
+    expect(skipped?.packageDetected).toBe(false)
+    expect(fetchCalls).toBe(1) // ZERO new Cloud Vision API calls!
+    expect(service.getUsageStats().skippedByLocalGateToday).toBe(1)
+
+    // 3. Third motion event where a localized box actually remains -> passes local gate and calls Vision!
+    const delivered = await service.handleAutoTrigger('cam-front', 'motion')
+    expect(delivered?.packageDetected).toBe(true)
+    expect(fetchCalls).toBe(2)
+    expect(service.getUsageStats().scansToday).toBe(2)
+
+    service.stop()
+  })
+
+  it('uses 1 low-res triage image in Balanced mode, escalates only when uncertain, and never escalates in Economy mode (#3)', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    store.updateSettings({
+      mode: 'live',
+      packageAi: {
+        enabled: true,
+        provider: 'openai',
+        openaiModel: 'gpt-4o-mini',
+        openaiApiKey: 'sk-test-balanced',
+        scanQualityMode: 'balanced',
+        minScanIntervalSeconds: 0,
+        pauseWhilePackagePresent: false,
+      },
+    })
+
+    const service = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: { notifyPackageAlert: vi.fn() } as unknown as NotificationService,
+      onDetection: vi.fn(),
+      onSecurityEvent: vi.fn(),
+      retryDelayMs: 0,
+      motionFollowUpDelaysMs: [],
+    })
+
+    let snapSeq = 0
+    service.attachSnapshotSource({
+      getCameraMeta: (id) => ({ id, name: 'Porch' }),
+      listCameraIds: () => ['cam-1'],
+      captureSnapshotBase64: async () => {
+        const b64 = Buffer.from(`snap-${++snapSeq}`).toString('base64')
+        return { base64: b64, dataUrl: `data:image/jpeg;base64,${b64}` }
+      },
+      cropDeliveryZoneBase64: async () => Buffer.from('zoom-crop').toString('base64'),
+    })
+
+    const observedCalls: Array<{
+      detailLevels: string[]
+      imageCount: number
+      maxTokens: number
+    }> = []
+    let callNum = 0
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+        callNum++
+        const body = JSON.parse(String(init?.body ?? '{}')) as {
+          max_tokens?: number
+          messages: Array<{ content: unknown }>
+        }
+        const parts = body.messages[1].content as Array<{
+          type: string
+          image_url?: { detail?: string }
+        }>
+        const imgParts = parts.filter((p) => p.type === 'image_url')
+        observedCalls.push({
+          detailLevels: imgParts.map((p) => p.image_url?.detail ?? ''),
+          imageCount: imgParts.length,
+          maxTokens: body.max_tokens ?? 0,
+        })
+
+        // Call 1 (clear triage): returns clear, uncertain=false -> NO escalation
+        // Call 2 (uncertain triage): returns uncertain=true -> triggers Stage 2 high-res verify (Call 3)
+        // Call 3 (Stage 2 high-res verify): confirms package
+        // Call 4 (Economy mode): returns uncertain=true -> MUST NOT escalate
+        const payload =
+          callNum === 1
+            ? {
+                packageDetected: false,
+                confidence: 0.96,
+                packageCount: 0,
+                carrierHint: null,
+                placement: null,
+                personPresent: false,
+                uncertain: false,
+                summary: 'Porch empty.',
+              }
+            : callNum === 2 || callNum === 4
+              ? {
+                  packageDetected: false,
+                  confidence: 0.55,
+                  packageCount: 0,
+                  carrierHint: null,
+                  placement: null,
+                  personPresent: false,
+                  uncertain: true,
+                  summary: 'Small shadowed object near steps.',
+                }
+              : {
+                  packageDetected: true,
+                  confidence: 0.92,
+                  packageCount: 1,
+                  carrierHint: 'USPS',
+                  placement: 'Top step',
+                  personPresent: false,
+                  uncertain: false,
+                  summary: 'Confirmed small padded USPS mailer on top step.',
+                }
+
+        return {
+          ok: true,
+          json: async () => ({
+            choices: [{ message: { content: JSON.stringify(payload) } }],
+          }),
+        }
+      }),
+    )
+
+    // 1. Balanced clear scan: 1 low-res image only, max_tokens=220
+    const clearRec = await service.scanCamera('cam-1', 'motion')
+    expect(clearRec.packageDetected).toBe(false)
+    expect(clearRec.imagesSubmitted).toBe(1)
+    expect(observedCalls).toHaveLength(1)
+    expect(observedCalls[0]).toEqual({
+      detailLevels: ['low'],
+      imageCount: 1,
+      maxTokens: 220,
+    })
+
+    // 2. Balanced uncertain scan: Stage 1 (1 low-res) escalates to Stage 2 (3 high-res: baseline + current + crop)
+    const verifiedRec = await service.scanCamera('cam-1', 'motion')
+    expect(verifiedRec.packageDetected).toBe(true)
+    expect(verifiedRec.carrierHint).toBe('USPS')
+    expect(verifiedRec.imagesSubmitted).toBe(4)
+    expect(observedCalls).toHaveLength(3)
+    expect(observedCalls[1]).toEqual({ detailLevels: ['low'], imageCount: 1, maxTokens: 220 })
+    expect(observedCalls[2]).toEqual({
+      detailLevels: ['high', 'high', 'high'],
+      imageCount: 3,
+      maxTokens: 220,
+    })
+
+    // 3. Economy mode: even when uncertain=true, stays at 1 low-res image and NEVER escalates
+    store.updateSettings({ packageAi: { scanQualityMode: 'economy' } })
+    const econRec = await service.scanCamera('cam-1', 'motion')
+    expect(econRec.imagesSubmitted).toBe(1)
+    expect(observedCalls).toHaveLength(4)
+    expect(observedCalls[3]).toEqual({ detailLevels: ['low'], imageCount: 1, maxTokens: 220 })
+
+    service.stop()
+  })
+
+  it('enforces minScanIntervalSeconds, pauseWhilePackagePresent, dailyScanLimit, and activeHoursEnabled (#4)', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    store.updateSettings({
+      mode: 'live',
+      packageAi: {
+        enabled: true,
+        provider: 'openai',
+        openaiApiKey: 'sk-test-caps',
+        minScanIntervalSeconds: 90,
+        pauseWhilePackagePresent: true,
+        dailyScanLimit: 2,
+        cooldownMinutes: 10,
+        activeHoursEnabled: false,
+      },
+    })
+
+    const service = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: { notifyPackageAlert: vi.fn() } as unknown as NotificationService,
+      onDetection: vi.fn(),
+      onSecurityEvent: vi.fn(),
+      retryDelayMs: 0,
+      motionFollowUpDelaysMs: [],
+    })
+
+    service.attachSnapshotSource({
+      getCameraMeta: (id) => ({ id, name: 'Porch' }),
+      listCameraIds: () => ['cam-front'],
+      captureSnapshotBase64: async () => ({
+        base64: Buffer.from('frame').toString('base64'),
+        dataUrl: 'data:image/jpeg;base64,ZnJhbWU=',
+      }),
+    })
+
+    let calls = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async () => {
+        calls++
+        return {
+          ok: true,
+          json: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    packageDetected: calls === 2,
+                    confidence: 0.93,
+                    packageCount: calls === 2 ? 1 : 0,
+                    carrierHint: null,
+                    placement: null,
+                    personPresent: false,
+                    uncertain: false,
+                    summary: calls === 2 ? 'Box on porch.' : 'Empty porch.',
+                  }),
+                },
+              },
+            ],
+          }),
+        }
+      }),
+    )
+
+    // 1. First motion scan succeeds (scansToday = 1)
+    expect(await service.handleAutoTrigger('cam-front', 'motion')).not.toBeNull()
+    expect(calls).toBe(1)
+
+    // 2. Immediate repeat motion is throttled by minScanIntervalSeconds=90
+    expect(await service.handleAutoTrigger('cam-front', 'motion')).toBeNull()
+    expect(service.getUsageStats().skippedByThrottleToday).toBe(1)
+    expect(calls).toBe(1)
+
+    // 3. Doorbell ring bypasses motion throttle and detects a package (scansToday = 2, hitting dailyScanLimit=2)
+    const doorbellRec = await service.handleAutoTrigger('cam-front', 'doorbell')
+    expect(doorbellRec?.packageDetected).toBe(true)
+    expect(calls).toBe(2)
+
+    // 4. Further auto triggers hit dailyScanLimit=2 and are blocked
+    expect(await service.handleAutoTrigger('cam-front', 'doorbell')).toBeNull()
+    expect(service.getUsageStats().skippedByDailyLimitToday).toBe(1)
+    expect(calls).toBe(2)
+
+    // 5. Pause-while-present blocks repeat motion when daily limit is raised
+    store.updateSettings({ packageAi: { dailyScanLimit: 60 } })
+    expect(await service.handleAutoTrigger('cam-front', 'motion')).toBeNull()
+    expect(service.getUsageStats().skippedByAlreadyPresentToday).toBe(1)
+    expect(calls).toBe(2)
+
+    // 6. Manual scan ALWAYS bypasses daily cap and pause-while-present
+    store.updateSettings({ packageAi: { dailyScanLimit: 2 } })
+    const manualRec = await service.scanCamera('cam-front', 'manual')
+    expect(manualRec.rawError).toBeUndefined()
+    expect(calls).toBe(3)
+
+    // 7. Active delivery hours window (normal + overnight wrap-around)
+    store.updateSettings({
+      packageAi: { activeHoursEnabled: true, activeHoursStart: 6, activeHoursEnd: 22 },
+    })
+    expect(service.isWithinActiveHours(new Date('2026-11-20T03:30:00'))).toBe(false)
+    expect(service.isWithinActiveHours(new Date('2026-11-20T14:00:00'))).toBe(true)
+    expect(service.isWithinActiveHours(new Date('2026-11-20T22:00:00'))).toBe(false)
+
+    store.updateSettings({
+      packageAi: { activeHoursEnabled: true, activeHoursStart: 22, activeHoursEnd: 6 },
+    })
+    expect(service.isWithinActiveHours(new Date('2026-11-20T23:15:00'))).toBe(true)
+    expect(service.isWithinActiveHours(new Date('2026-11-20T02:00:00'))).toBe(true)
+    expect(service.isWithinActiveHours(new Date('2026-11-20T12:00:00'))).toBe(false)
+
+    service.stop()
+  })
+
+  it('sends Gemini MEDIA_RESOLUTION_LOW + thinkingBudget=0 in Balanced mode and strips thinkingConfig on HTTP 400 (#5)', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    store.updateSettings({
+      mode: 'live',
+      packageAi: {
+        enabled: true,
+        provider: 'gemini',
+        geminiModel: 'gemini-3-flash-preview',
+        geminiApiKey: 'AIza-test-thinking',
+        scanQualityMode: 'balanced',
+      },
+    })
+
+    const service = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: { notifyPackageAlert: vi.fn() } as unknown as NotificationService,
+      onDetection: vi.fn(),
+      onSecurityEvent: vi.fn(),
+      retryDelayMs: 0,
+      motionFollowUpDelaysMs: [],
+    })
+
+    service.attachSnapshotSource({
+      getCameraMeta: (id) => ({ id, name: 'Porch' }),
+      listCameraIds: () => ['cam-1'],
+      captureSnapshotBase64: async () => ({
+        base64: Buffer.from('img').toString('base64'),
+        dataUrl: 'data:image/jpeg;base64,aW1n',
+      }),
+    })
+
+    let attempt = 0
+    let sawThinkingZero = false
+    let sawLowRes = false
+    let retriedWithoutThinking = false
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+        attempt++
+        const body = JSON.parse(String(init?.body ?? '{}')) as {
+          generationConfig?: {
+            mediaResolution?: string
+            maxOutputTokens?: number
+            thinkingConfig?: { thinkingBudget?: number }
+          }
+        }
+        expect(body.generationConfig?.maxOutputTokens).toBe(220)
+        if (attempt === 1) {
+          sawLowRes = body.generationConfig?.mediaResolution === 'MEDIA_RESOLUTION_LOW'
+          sawThinkingZero = body.generationConfig?.thinkingConfig?.thinkingBudget === 0
+          return {
+            ok: false,
+            status: 400,
+            text: async () => 'Invalid JSON payload: unknown field "thinkingConfig"',
+          }
+        }
+        retriedWithoutThinking = body.generationConfig?.thinkingConfig === undefined
+        return {
+          ok: true,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        packageDetected: false,
+                        confidence: 0.95,
+                        packageCount: 0,
+                        carrierHint: null,
+                        placement: null,
+                        personPresent: false,
+                        uncertain: false,
+                        summary: 'No package present.',
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        }
+      }),
+    )
+
+    const rec = await service.scanCamera('cam-1', 'manual')
+    expect(rec.rawError).toBeUndefined()
+    expect(sawLowRes).toBe(true)
+    expect(sawThinkingZero).toBe(true)
+    expect(retriedWithoutThinking).toBe(true)
+    expect(attempt).toBe(2)
+
+    service.stop()
+  })
+
+  it('serves live AiUsageStats on GET /api/ai/usage and GET /api/bootstrap (#4 & #6)', async () => {
+    const recDir = path.join(tmpDir, 'videos')
+    const webDir = path.join(tmpDir, 'web')
+    fs.mkdirSync(webDir, { recursive: true })
+    fs.writeFileSync(path.join(webDir, 'index.html'), '<html>ok</html>')
+
+    const preStore = new ConfigStore(tmpDir, recDir)
+    preStore.updateSettings({ continuousAutoStart: false })
+
+    const server = new RingWatchServer({
+      dataDir: tmpDir,
+      defaultRecordingsDir: recDir,
+      demoAssetsDir: path.resolve(process.cwd(), 'public', 'demo'),
+      webDistDir: webDir,
+      host: '127.0.0.1',
+      port: 0,
+    })
+
+    const { port } = await server.start()
+    const base = `http://127.0.0.1:${port}`
+    try {
+      server.aiPackageService.recordLocalSkip('local-gate')
+      server.aiPackageService.recordLocalSkip('throttle')
+
+      const usageRes = await fetch(`${base}/api/ai/usage`)
+      expect(usageRes.status).toBe(200)
+      const usage = (await usageRes.json()) as {
+        scansToday: number
+        skippedByLocalGateToday: number
+        skippedByThrottleToday: number
+        dailyScanLimit: number
+      }
+      expect(usage.skippedByLocalGateToday).toBe(1)
+      expect(usage.skippedByThrottleToday).toBe(1)
+      expect(usage.dailyScanLimit).toBe(60)
+
+      const bootRes = await fetch(`${base}/api/bootstrap`)
+      expect(bootRes.status).toBe(200)
+      const boot = (await bootRes.json()) as {
+        aiUsageStats?: { skippedByLocalGateToday: number; dailyScanLimit: number }
+      }
+      expect(boot.aiUsageStats?.skippedByLocalGateToday).toBe(1)
+      expect(boot.aiUsageStats?.dailyScanLimit).toBe(60)
     } finally {
       await server.stop()
     }

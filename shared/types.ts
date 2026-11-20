@@ -236,6 +236,29 @@ export interface PackageAiConfig {
   alertSound: AlertSoundProfile
   alertVolume: number
   customPromptHint: string
+  scanQualityMode: AiScanQualityMode
+  requirePersistentChange: boolean
+  personOrPackageEventsOnly: boolean
+  minScanIntervalSeconds: number
+  pauseWhilePackagePresent: boolean
+  dailyScanLimit: number
+  activeHoursEnabled: boolean
+  activeHoursStart: number
+  activeHoursEnd: number
+}
+
+export type AiScanQualityMode = 'economy' | 'balanced' | 'high'
+
+export interface AiUsageStats {
+  dateKey: string
+  scansToday: number
+  imagesSentToday: number
+  skippedByLocalGateToday: number
+  skippedByThrottleToday: number
+  skippedByAlreadyPresentToday: number
+  skippedByQuietHoursToday: number
+  skippedByDailyLimitToday: number
+  dailyScanLimit: number
 }
 
 export interface PackageAiConfigPatch {
@@ -255,6 +278,15 @@ export interface PackageAiConfigPatch {
   alertSound?: AlertSoundProfile
   alertVolume?: number
   customPromptHint?: string
+  scanQualityMode?: AiScanQualityMode
+  requirePersistentChange?: boolean
+  personOrPackageEventsOnly?: boolean
+  minScanIntervalSeconds?: number
+  pauseWhilePackagePresent?: boolean
+  dailyScanLimit?: number
+  activeHoursEnabled?: boolean
+  activeHoursStart?: number
+  activeHoursEnd?: number
 }
 
 export interface PackageDetectionRecord {
@@ -275,6 +307,7 @@ export interface PackageDetectionRecord {
   snapshotDataUrl?: string
   notified: boolean
   latencyMs: number
+  imagesSubmitted?: number
   rawError?: string
 }
 
@@ -407,6 +440,7 @@ export interface RingWatchBootstrap {
   events: SecurityEvent[]
   recordings: LocalRecordingItem[]
   packageDetections: PackageDetectionRecord[]
+  aiUsageStats?: AiUsageStats
   activeStreams: LiveStreamSession[]
   authStatus?: AuthStatus
   systemTheme?: SystemThemeInfo
@@ -562,6 +596,7 @@ export interface RingWatchApi {
     trigger?: PackageDetectionRecord['trigger'],
   ) => Promise<PackageDetectionRecord>
   listPackageDetections: () => Promise<PackageDetectionRecord[]>
+  getAiUsageStats: () => Promise<AiUsageStats>
   clearPackageDetections: () => Promise<void>
   testAiConnection: () => Promise<{ ok: boolean; message: string; latencyMs?: number }>
   testPackageAlert: () => Promise<void>
@@ -585,6 +620,7 @@ export interface RingWatchApi {
   onRecordingsUpdated: (cb: (recordings: LocalRecordingItem[]) => void) => () => void
   onStorageStatsUpdated: (cb: (stats: StorageStats) => void) => () => void
   onPackageDetection: (cb: (record: PackageDetectionRecord) => void) => () => void
+  onAiUsageUpdated: (cb: (stats: AiUsageStats) => void) => () => void
   onPlayAlertSound: (cb: (payload: AlertSoundPayload) => void) => () => void
   onFocusCamera: (cb: (cameraId: string) => void) => () => void
   onStreamsUpdated: (cb: (streams: LiveStreamSession[]) => void) => () => void

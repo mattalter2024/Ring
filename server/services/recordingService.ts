@@ -1969,6 +1969,98 @@ export class RecordingService {
     ])
   }
 
+  /**
+   * Extract a 64x36 grayscale luma grid directly from an in-memory JPEG snapshot buffer.
+   * Used by AiPackageService's zero-cost persistent-change gate to skip Cloud Vision API
+   * calls when a post-motion snapshot still matches the confirmed empty-porch baseline.
+   */
+  async extractLumaGridFromJpegBuffer(jpegBuffer: Buffer): Promise<Buffer | null> {
+    if (!jpegBuffer || jpegBuffer.length < 256) return null
+    if (jpegBuffer[0] !== 0xff || jpegBuffer[1] !== 0xd8) return null
+
+    const ffmpegBin = this.resolveFfmpegBinary()
+    return new Promise((resolve) => {
+      let settled = false
+      const chunks: Buffer[] = []
+      let totalBytes = 0
+
+      let child: ReturnType<typeof spawn>
+      try {
+        child = spawn(
+          ffmpegBin,
+          [
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-f',
+            'image2pipe',
+            '-vcodec',
+            'mjpeg',
+            '-i',
+            'pipe:0',
+            '-frames:v',
+            '1',
+            '-vf',
+            `scale=${MOTION_GRID_WIDTH}:${MOTION_GRID_HEIGHT},format=gray`,
+            '-f',
+            'rawvideo',
+            'pipe:1',
+          ],
+          { windowsHide: true },
+        )
+      } catch {
+        resolve(null)
+        return
+      }
+
+      const finish = (buf: Buffer | null) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(buf)
+      }
+
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          // ignore
+        }
+        finish(null)
+      }, 3000)
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        totalBytes += chunk.length
+        if (totalBytes <= MOTION_GRID_PIXELS * 4) {
+          chunks.push(chunk)
+        }
+      })
+
+      child.on('error', () => finish(null))
+      child.on('close', (code) => {
+        if (code !== 0 || chunks.length === 0) {
+          finish(null)
+          return
+        }
+        const out = Buffer.concat(chunks)
+        if (out.length >= MOTION_GRID_PIXELS) {
+          finish(out.subarray(0, MOTION_GRID_PIXELS))
+        } else {
+          finish(null)
+        }
+      })
+
+      child.stdin?.on('error', () => {
+        // Ignore EPIPE
+      })
+      try {
+        child.stdin?.end(jpegBuffer)
+      } catch {
+        finish(null)
+      }
+    })
+  }
+
   resolveFfmpegBinary(): string {
     const custom = this.configStore.getPublicSettings().ffmpegPath
     if (custom && !custom.includes('\0')) {

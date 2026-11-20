@@ -2,6 +2,7 @@ import { useState } from 'react'
 import {
   Bell,
   CheckCircle2,
+  Gauge,
   PackageCheck,
   PackageSearch,
   Sparkles,
@@ -9,6 +10,8 @@ import {
   Volume2,
 } from 'lucide-react'
 import type {
+  AiScanQualityMode,
+  AiUsageStats,
   AlertSoundProfile,
   AppSettings,
   AppSettingsPatch,
@@ -22,6 +25,7 @@ interface PackageAiViewProps {
   cameras: RingCameraInfo[]
   settings: AppSettings
   detections: PackageDetectionRecord[]
+  usageStats?: AiUsageStats
   onUpdateSettings: (patch: AppSettingsPatch) => Promise<void>
   onScanCamera: (cameraId: string) => Promise<void>
   onClearDetections: () => Promise<void>
@@ -37,10 +41,17 @@ const SOUND_OPTIONS: Array<{ value: AlertSoundProfile; label: string }> = [
   { value: 'none', label: 'Silent (Toast Only)' },
 ]
 
+const HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => {
+  const suffix = h < 12 ? 'AM' : 'PM'
+  const hour12 = h % 12 === 0 ? 12 : h % 12
+  return { value: h, label: `${hour12}:00 ${suffix}` }
+})
+
 export function PackageAiView({
   cameras,
   settings,
   detections,
+  usageStats,
   onUpdateSettings,
   onScanCamera,
   onClearDetections,
@@ -55,6 +66,14 @@ export function PackageAiView({
 
   const hasActiveKey =
     ai.provider === 'openai' ? ai.hasOpenaiKey : ai.hasGeminiKey
+
+  const totalSkippedToday = usageStats
+    ? usageStats.skippedByLocalGateToday +
+      usageStats.skippedByThrottleToday +
+      usageStats.skippedByAlreadyPresentToday +
+      usageStats.skippedByQuietHoursToday +
+      usageStats.skippedByDailyLimitToday
+    : 0
 
   const toggleMonitoredCamera = (cameraId: string) => {
     const current = ai.monitoredCameraIds
@@ -75,6 +94,68 @@ export function PackageAiView({
         </div>
 
         <div className="panel-body form-stack">
+          {usageStats && (
+            <div
+              style={{
+                padding: '10px 12px',
+                borderRadius: 9,
+                background: 'var(--bg-subtle)',
+                border: '1px solid var(--border-subtle)',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 8,
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  fontSize: 12,
+                  fontWeight: 600,
+                  color: 'var(--text-primary)',
+                }}
+              >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <Gauge size={14} />
+                  AI Usage &amp; Savings Today
+                </span>
+                <span className="chip ok" style={{ fontSize: 11 }}>
+                  {totalSkippedToday} calls saved ($0)
+                </span>
+              </div>
+              <div
+                className="mono"
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                  gap: 8,
+                  fontSize: 11.5,
+                }}
+              >
+                <div>
+                  <div style={{ color: 'var(--text-muted)', fontSize: 10.5 }}>Scans Today</div>
+                  <div style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+                    {usageStats.scansToday}
+                    {usageStats.dailyScanLimit > 0 ? ` / ${usageStats.dailyScanLimit}` : ' (no cap)'}
+                  </div>
+                </div>
+                <div>
+                  <div style={{ color: 'var(--text-muted)', fontSize: 10.5 }}>Images Sent</div>
+                  <div style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+                    {usageStats.imagesSentToday}
+                  </div>
+                </div>
+                <div>
+                  <div style={{ color: 'var(--text-muted)', fontSize: 10.5 }}>Local Skips</div>
+                  <div style={{ color: '#4ade80', fontWeight: 600 }}>
+                    {usageStats.skippedByLocalGateToday} baseline · {usageStats.skippedByThrottleToday + usageStats.skippedByAlreadyPresentToday} throttled
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           <div className="toggle-row">
             <div>
               <div className="toggle-label-main">Enable AI Package Automation</div>
@@ -145,6 +226,112 @@ export function PackageAiView({
                 )
               })}
             </div>
+            {ai.monitoredCameraIds.length === 0 && cameras.length > 1 && (
+              <div
+                style={{
+                  fontSize: 11.5,
+                  color: 'var(--text-secondary)',
+                  marginTop: 4,
+                }}
+              >
+                Cost tip: Select only delivery-zone cameras (e.g. Front Porch) to avoid scanning driveway/backyard motion.
+              </div>
+            )}
+          </div>
+
+          <div className="field">
+            <label htmlFor="ai-quality-mode">Vision Cost &amp; Quality Mode</label>
+            <select
+              id="ai-quality-mode"
+              className="select"
+              value={ai.scanQualityMode ?? 'balanced'}
+              onChange={(e) =>
+                void onUpdateSettings({
+                  packageAi: {
+                    scanQualityMode: e.target.value as AiScanQualityMode,
+                  },
+                })
+              }
+            >
+              <option value="economy">
+                Economy — 1 low-res image per scan (Lowest API cost)
+              </option>
+              <option value="balanced">
+                Balanced — 1 low-res triage + high-res verify only if uncertain (Recommended)
+              </option>
+              <option value="high">
+                High Accuracy — 3 high-res images (Before + After + Zoom crop)
+              </option>
+            </select>
+          </div>
+
+          <div className="toggle-row">
+            <div>
+              <div className="toggle-label-main">Persistent-Change Baseline Filter ($0)</div>
+              <div className="toggle-label-sub">
+                Skip Cloud AI when motion settles back to the empty porch (cars, wind, shadows)
+              </div>
+            </div>
+            <button
+              id="toggle-ai-persistent-change"
+              type="button"
+              role="switch"
+              aria-checked={ai.requirePersistentChange ?? true}
+              className={`switch ${ai.requirePersistentChange ?? true ? 'on' : ''}`}
+              onClick={() =>
+                void onUpdateSettings({
+                  packageAi: {
+                    requirePersistentChange: !(ai.requirePersistentChange ?? true),
+                  },
+                })
+              }
+            />
+          </div>
+
+          <div className="toggle-row">
+            <div>
+              <div className="toggle-label-main">Skip Non-Person Ring Motion</div>
+              <div className="toggle-label-sub">
+                Drop Ring events tagged as vehicles, animals, or other non-person motion
+              </div>
+            </div>
+            <button
+              id="toggle-ai-person-only"
+              type="button"
+              role="switch"
+              aria-checked={ai.personOrPackageEventsOnly ?? true}
+              className={`switch ${ai.personOrPackageEventsOnly ?? true ? 'on' : ''}`}
+              onClick={() =>
+                void onUpdateSettings({
+                  packageAi: {
+                    personOrPackageEventsOnly: !(ai.personOrPackageEventsOnly ?? true),
+                  },
+                })
+              }
+            />
+          </div>
+
+          <div className="toggle-row">
+            <div>
+              <div className="toggle-label-main">Pause While Package Present</div>
+              <div className="toggle-label-sub">
+                Stop re-scanning motion on a camera that already has a detected package
+              </div>
+            </div>
+            <button
+              id="toggle-ai-pause-present"
+              type="button"
+              role="switch"
+              aria-checked={ai.pauseWhilePackagePresent ?? true}
+              className={`switch ${ai.pauseWhilePackagePresent ?? true ? 'on' : ''}`}
+              onClick={() =>
+                void onUpdateSettings({
+                  packageAi: {
+                    pauseWhilePackagePresent: !(ai.pauseWhilePackagePresent ?? true),
+                  },
+                })
+              }
+            />
           </div>
 
           <div className="toggle-row">
@@ -231,8 +418,130 @@ export function PackageAiView({
           </button>
 
           <details className="advanced-drawer">
-            <summary>Advanced Detection Options</summary>
+            <summary>Budget Caps, Active Hours &amp; Advanced Options</summary>
             <div className="advanced-drawer-body">
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  gap: 10,
+                }}
+              >
+                <div className="field">
+                  <label htmlFor="ai-min-scan-interval">
+                    Min Motion Gap (sec)
+                  </label>
+                  <input
+                    id="ai-min-scan-interval"
+                    type="number"
+                    min={0}
+                    max={3600}
+                    step={15}
+                    className="input mono"
+                    value={ai.minScanIntervalSeconds ?? 90}
+                    onChange={(e) =>
+                      void onUpdateSettings({
+                        packageAi: {
+                          minScanIntervalSeconds: Math.max(0, Number(e.target.value) || 0),
+                        },
+                      })
+                    }
+                  />
+                </div>
+
+                <div className="field">
+                  <label htmlFor="ai-daily-cap">
+                    Daily Auto-Scan Cap (0 = off)
+                  </label>
+                  <input
+                    id="ai-daily-cap"
+                    type="number"
+                    min={0}
+                    max={1000}
+                    step={10}
+                    className="input mono"
+                    value={ai.dailyScanLimit ?? 60}
+                    onChange={(e) =>
+                      void onUpdateSettings({
+                        packageAi: {
+                          dailyScanLimit: Math.max(0, Number(e.target.value) || 0),
+                        },
+                      })
+                    }
+                  />
+                </div>
+              </div>
+
+              <div className="toggle-row" style={{ padding: '4px 0' }}>
+                <div>
+                  <div className="toggle-label-main">Active Delivery Hours Only</div>
+                  <div className="toggle-label-sub">
+                    Pause overnight motion scans (doorbell rings &amp; manual scans always work)
+                  </div>
+                </div>
+                <button
+                  id="toggle-ai-active-hours"
+                  type="button"
+                  role="switch"
+                  aria-checked={ai.activeHoursEnabled ?? false}
+                  className={`switch ${ai.activeHoursEnabled ? 'on' : ''}`}
+                  onClick={() =>
+                    void onUpdateSettings({
+                      packageAi: { activeHoursEnabled: !ai.activeHoursEnabled },
+                    })
+                  }
+                />
+              </div>
+
+              {ai.activeHoursEnabled && (
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                    gap: 10,
+                  }}
+                >
+                  <div className="field">
+                    <label htmlFor="ai-hours-start">Start Hour</label>
+                    <select
+                      id="ai-hours-start"
+                      className="select"
+                      value={ai.activeHoursStart ?? 6}
+                      onChange={(e) =>
+                        void onUpdateSettings({
+                          packageAi: { activeHoursStart: Number(e.target.value) },
+                        })
+                      }
+                    >
+                      {HOUR_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label htmlFor="ai-hours-end">End Hour</label>
+                    <select
+                      id="ai-hours-end"
+                      className="select"
+                      value={ai.activeHoursEnd ?? 22}
+                      onChange={(e) =>
+                        void onUpdateSettings({
+                          packageAi: { activeHoursEnd: Number(e.target.value) },
+                        })
+                      }
+                    >
+                      {HOUR_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
+
               <div className="field">
                 <label htmlFor="ai-hint">Custom Porch / Drop-Zone Hint (optional)</label>
                 <input
@@ -514,6 +823,11 @@ export function PackageAiView({
                         Engine: {item.provider} ({item.model})
                       </span>
                       <span>Trigger: {item.trigger}</span>
+                      {typeof item.imagesSubmitted === 'number' && (
+                        <span>
+                          {item.imagesSubmitted} img{item.imagesSubmitted === 1 ? '' : 's'}
+                        </span>
+                      )}
                       <span>{item.latencyMs}ms</span>
                       {item.notified && (
                         <span style={{ color: '#4ade80' }}>Alert Sent</span>

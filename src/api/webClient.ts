@@ -1,4 +1,5 @@
 import type {
+  AiUsageStats,
   AlertSoundPayload,
   AppMode,
   AppSettings,
@@ -72,6 +73,7 @@ const SSE_CHANNELS = [
   'recordings-updated',
   'storage-stats-updated',
   'package-detection',
+  'ai-usage-updated',
   'play-alert-sound',
   'focus-camera',
   'streams-updated',
@@ -514,6 +516,7 @@ export const webRingWatchApi: RingWatchApi = {
     }),
   listPackageDetections: () =>
     apiJson<PackageDetectionRecord[]>('/api/ai/detections'),
+  getAiUsageStats: () => apiJson<AiUsageStats>('/api/ai/usage'),
   clearPackageDetections: async () => {
     await apiJson('/api/ai/detections', { method: 'DELETE' })
   },
@@ -546,6 +549,7 @@ export const webRingWatchApi: RingWatchApi = {
   onRecordingsUpdated: (cb) => sseHub.subscribe<LocalRecordingItem[]>('recordings-updated', cb),
   onStorageStatsUpdated: (cb) => sseHub.subscribe<StorageStats>('storage-stats-updated', cb),
   onPackageDetection: (cb) => sseHub.subscribe<PackageDetectionRecord>('package-detection', cb),
+  onAiUsageUpdated: (cb) => sseHub.subscribe<AiUsageStats>('ai-usage-updated', cb),
   onPlayAlertSound: (cb) => sseHub.subscribe<AlertSoundPayload>('play-alert-sound', cb),
   onFocusCamera: (cb) => sseHub.subscribe<string>('focus-camera', cb),
   onStreamsUpdated: (cb) => sseHub.subscribe<LiveStreamSession[]>('streams-updated', cb),

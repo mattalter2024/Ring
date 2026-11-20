@@ -248,6 +248,9 @@ export class RingWatchServer {
           void this.ringService.autoCaptureIfEnabled(ev.deviceId, 'package')
         }
       },
+      onUsageUpdated: (stats) => {
+        this.broadcast('ai-usage-updated', stats, 'ai:view')
+      },
     })
 
     this.ringService = new RingService({
@@ -1039,6 +1042,7 @@ export class RingWatchServer {
         events: canSensors || canRecs ? this.ringService.getEvents() : [],
         recordings: canRecs ? this.recordingService.listRecordings() : [],
         packageDetections: canAi ? this.aiPackageService.listDetections() : [],
+        aiUsageStats: canAi ? this.aiPackageService.getUsageStats() : undefined,
         activeStreams: canCameras ? this.streamService.listActiveSessions() : [],
         authStatus: this.getAuthStatus(req),
       }
@@ -1469,6 +1473,11 @@ export class RingWatchServer {
       this.sendJson(res, 200, this.aiPackageService.listDetections())
       return
     }
+    if (method === 'GET' && pathname === '/api/ai/usage') {
+      if (!this.requirePerm(res, session, 'ai:view')) return
+      this.sendJson(res, 200, this.aiPackageService.getUsageStats())
+      return
+    }
     if (method === 'DELETE' && pathname === '/api/ai/detections') {
       if (!this.requirePerm(res, session, 'ai:manage')) return
       this.aiPackageService.clearDetections()
@@ -1550,6 +1559,7 @@ export class RingWatchServer {
       this.aiPackageService.syncScheduler()
       this.ringService.syncNvrSettings()
       this.broadcast('settings-updated', updated, 'settings:manage')
+      this.broadcast('ai-usage-updated', this.aiPackageService.getUsageStats(), 'ai:view')
       this.broadcast('storage-stats-updated', this.recordingService.getStorageStats(), 'recordings:view')
       this.sendJson(res, 200, updated)
       return
