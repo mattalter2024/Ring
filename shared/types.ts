@@ -360,10 +360,39 @@ export interface SystemThemeInfo {
   accentColor: string | null
 }
 
+import type { Permission, UserRole } from './rbac'
+export type { Permission, UserRole } from './rbac'
+
+export interface PasskeySummary {
+  id: string
+  name: string
+  deviceType: string
+  backedUp: boolean
+  createdAt: string
+  lastUsedAt?: string
+}
+
+export interface PublicUser {
+  id: string
+  username: string
+  displayName: string
+  role: UserRole
+  permissions: Permission[]
+  customPermissions?: Permission[]
+  hasPassword: boolean
+  passkeys: PasskeySummary[]
+  disabled: boolean
+  createdAt: string
+  lastLoginAt?: string
+}
+
 export interface AuthStatus {
   authEnabled: boolean
   authenticated: boolean
   managedByEnv: boolean
+  hasUsers: boolean
+  currentUser: PublicUser | null
+  permissions: Permission[]
 }
 
 export interface RingWatchBootstrap {
@@ -384,12 +413,61 @@ export interface RingWatchBootstrap {
 
 export interface RingWatchApi {
   getAuthStatus: () => Promise<AuthStatus>
-  login: (password: string) => Promise<{ ok: boolean; error?: string }>
+  login: (
+    password: string,
+    username?: string,
+  ) => Promise<{ ok: boolean; error?: string; user?: PublicUser }>
   logout: () => Promise<void>
   setAuthPassword: (params: {
     currentPassword?: string
     newPassword: string
   }) => Promise<{ ok: boolean; authEnabled: boolean; error?: string }>
+  changeMyPassword: (params: {
+    currentPassword?: string
+    newPassword: string
+  }) => Promise<{ ok: boolean; error?: string }>
+
+  // WebAuthn / Passkeys
+  getPasskeyLoginOptions: (username?: string) => Promise<{
+    challengeId: string
+    options: Record<string, unknown>
+  }>
+  verifyPasskeyLogin: (params: {
+    challengeId: string
+    response: unknown
+  }) => Promise<{ ok: boolean; error?: string; user?: PublicUser }>
+  getPasskeyRegisterOptions: () => Promise<{
+    challengeId: string
+    options: Record<string, unknown>
+  }>
+  verifyPasskeyRegister: (params: {
+    challengeId: string
+    name: string
+    response: unknown
+  }) => Promise<{ ok: boolean; error?: string; passkey?: PasskeySummary }>
+  deleteMyPasskey: (credentialId: string) => Promise<{ ok: boolean; error?: string }>
+
+  // Multi-User & RBAC Administration
+  listUsers: () => Promise<PublicUser[]>
+  createUser: (params: {
+    username: string
+    displayName: string
+    role: UserRole
+    customPermissions?: Permission[]
+    password?: string
+  }) => Promise<PublicUser>
+  updateUser: (
+    userId: string,
+    patch: {
+      displayName?: string
+      role?: UserRole
+      customPermissions?: Permission[]
+      disabled?: boolean
+      password?: string
+    },
+  ) => Promise<PublicUser>
+  deleteUser: (userId: string) => Promise<void>
+  revokeUserPasskey: (userId: string, credentialId: string) => Promise<void>
 
   getBootstrap: () => Promise<RingWatchBootstrap>
   connectWithToken: (refreshToken: string) => Promise<ConnectionStatus>

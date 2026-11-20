@@ -4,10 +4,22 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import type {
+  AuthenticationResponseJSON,
+  RegistrationResponseJSON,
+} from '@simplewebauthn/server'
+import {
+  ALL_PERMISSIONS,
+  hasAnyPermission,
+  hasPermission,
+  type Permission,
+  type UserRole,
+} from '../shared/rbac'
+import type {
   AppMode,
   AppSettingsPatch,
   AuthStatus,
   PackageDetectionRecord,
+  PublicUser,
   RingWatchBootstrap,
 } from '../shared/types'
 import { ConfigStore } from './services/configStore'
@@ -17,15 +29,17 @@ import { NotificationService } from './services/notificationService'
 import { AiPackageService } from './services/aiPackageService'
 import { RingService } from './services/ringService'
 import { BackendLogger } from './services/logger'
+import { AuthService } from './services/authService'
 import {
   FileKeyCryptoAdapter,
-  createSessionToken,
+  createUserSessionToken,
   hashPassword,
   verifyPassword,
-  verifySessionToken,
+  verifyUserSessionToken,
 } from './services/secretCrypto'
 
 const SESSION_COOKIE_NAME = 'ringwatch_session'
+const SESSION_MAX_AGE_SEC = 7 * 24 * 60 * 60
 const MAX_JSON_BODY_BYTES = 1024 * 1024 // 1 MB
 
 const MIME_TYPES: Record<string, string> = {
@@ -43,6 +57,17 @@ const MIME_TYPES: Record<string, string> = {
   '.ico': 'image/x-icon',
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
+}
+
+interface ResolvedSession {
+  authenticated: boolean
+  user: PublicUser | null
+  permissions: Permission[]
+}
+
+interface SseClientEntry {
+  res: http.ServerResponse
+  userId: string | null
 }
 
 function assertSafeDrivePath(drivePath: unknown): string {
@@ -133,6 +158,7 @@ export interface RingWatchServerOptions {
 
 export class RingWatchServer {
   readonly configStore: ConfigStore
+  readonly authService: AuthService
   readonly streamService: StreamService
   readonly recordingService: RecordingService
   readonly notificationService: NotificationService
@@ -151,7 +177,7 @@ export class RingWatchServer {
 
   private server: http.Server | null = null
   private boundPort = 0
-  private readonly sseClients = new Set<http.ServerResponse>()
+  private readonly sseClients = new Set<SseClientEntry>()
   private sseHeartbeatTimer: NodeJS.Timeout | null = null
   private rescanTimer: NodeJS.Timeout | null = null
 
@@ -181,13 +207,17 @@ export class RingWatchServer {
       this.cryptoAdapter,
     )
 
+    // Migrate legacy single password hash (if any) into multi-user AuthService
+    const legacyHash = this.configStore.getAuthPasswordHash()
+    this.authService = new AuthService(options.dataDir, legacyHash)
+
     this.streamService = new StreamService(
       () => this.configStore.getPublicSettings().recordingsDir,
       () => this.recordingService?.getAllStorageRoots() ?? [],
     )
     this.streamService.attachToExternalServer()
     this.streamService.setOnStreamsChanged((sessions) => {
-      this.broadcast('streams-updated', sessions)
+      this.broadcast('streams-updated', sessions, 'cameras:view')
     })
 
     this.recordingService = new RecordingService(
@@ -200,7 +230,7 @@ export class RingWatchServer {
     )
 
     this.notificationService = new NotificationService((channel, payload) => {
-      this.broadcast(channel, payload)
+      this.broadcast(channel, payload, 'ai:view')
     })
 
     this.aiPackageService = new AiPackageService({
@@ -208,7 +238,7 @@ export class RingWatchServer {
       configStore: this.configStore,
       notifications: this.notificationService,
       onDetection: (record) => {
-        this.broadcast('package-detection', record)
+        this.broadcast('package-detection', record, 'ai:view')
       },
       onSecurityEvent: (ev) => {
         this.ringService.recordExternalEvent(ev)
@@ -228,61 +258,161 @@ export class RingWatchServer {
       demoAssetsDir: options.demoAssetsDir,
       callbacks: {
         onConnectionChanged: (status) => this.broadcast('connection-changed', status),
-        onSettingsUpdated: (settings) => this.broadcast('settings-updated', settings),
+        onSettingsUpdated: (settings) =>
+          this.broadcast('settings-updated', settings, 'settings:manage'),
         onLocationsUpdated: (locs) => this.broadcast('locations-updated', locs),
-        onCamerasUpdated: (cams) => this.broadcast('cameras-updated', cams),
-        onSensorsUpdated: (sens) => this.broadcast('sensors-updated', sens),
-        onSecurityEvent: (ev) => this.broadcast('security-event', ev),
-        onEventsUpdated: (evs) => this.broadcast('events-updated', evs),
-        onNvrStatusUpdated: (nvr) => this.broadcast('nvr-status-updated', nvr),
-        onRecordingsUpdated: (recs) => this.broadcast('recordings-updated', recs),
-        onStorageStatsUpdated: (stats) => this.broadcast('storage-stats-updated', stats),
+        onCamerasUpdated: (cams) => this.broadcast('cameras-updated', cams, 'cameras:view'),
+        onSensorsUpdated: (sens) => this.broadcast('sensors-updated', sens, 'sensors:view'),
+        onSecurityEvent: (ev) => this.broadcast('security-event', ev, 'sensors:view'),
+        onEventsUpdated: (evs) => this.broadcast('events-updated', evs, 'sensors:view'),
+        onNvrStatusUpdated: (nvr) =>
+          this.broadcast('nvr-status-updated', nvr, 'recordings:view'),
+        onRecordingsUpdated: (recs) =>
+          this.broadcast('recordings-updated', recs, 'recordings:view'),
+        onStorageStatsUpdated: (stats) =>
+          this.broadcast('storage-stats-updated', stats, 'recordings:view'),
       },
     })
   }
 
-  private getActivePasswordSecret(): string | null {
-    if (this.envAuthPassword) return this.envAuthPassword
-    return this.configStore.getAuthPasswordHash() ?? null
-  }
-
   isAuthEnabled(): boolean {
-    return Boolean(this.getActivePasswordSecret())
+    return (
+      Boolean(this.envAuthPassword) ||
+      this.authService.hasUsers() ||
+      Boolean(this.configStore.getAuthPasswordHash())
+    )
   }
 
-  private isAuthenticated(req: http.IncomingMessage): boolean {
-    if (!this.isAuthEnabled()) return true
+  private resolveSession(req: http.IncomingMessage): ResolvedSession {
+    if (!this.isAuthEnabled()) {
+      return {
+        authenticated: true,
+        user: null,
+        permissions: [...ALL_PERMISSIONS],
+      }
+    }
+
     const cookies = parseCookies(req.headers.cookie)
-    return verifySessionToken(cookies[SESSION_COOKIE_NAME], this.sessionSigningKey)
+    const verified = verifyUserSessionToken(
+      cookies[SESSION_COOKIE_NAME],
+      this.sessionSigningKey,
+    )
+    if (!verified.valid) {
+      return { authenticated: false, user: null, permissions: [] }
+    }
+
+    if (verified.userId === '__env_admin__') {
+      if (this.envAuthPassword || this.configStore.getAuthPasswordHash()) {
+        const ctx = this.authService.getEnvOrOpenAdminContext(true)
+        return { authenticated: true, user: ctx.user, permissions: ctx.permissions }
+      }
+      return { authenticated: false, user: null, permissions: [] }
+    }
+
+    const active = this.authService.getActiveUserWithPermissions(verified.userId)
+    if (!active) {
+      return { authenticated: false, user: null, permissions: [] }
+    }
+    return {
+      authenticated: true,
+      user: active.user,
+      permissions: active.permissions,
+    }
   }
 
   getAuthStatus(req: http.IncomingMessage): AuthStatus {
     const authEnabled = this.isAuthEnabled()
+    const session = this.resolveSession(req)
     return {
       authEnabled,
-      authenticated: authEnabled ? this.isAuthenticated(req) : true,
+      authenticated: session.authenticated,
       managedByEnv: Boolean(this.envAuthPassword),
+      hasUsers: this.authService.hasUsers(),
+      currentUser: session.user,
+      permissions: session.permissions,
     }
+  }
+
+  private resolveWebAuthnContext(req: http.IncomingMessage): {
+    rpID: string
+    expectedOrigin: string
+  } {
+    const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : ''
+    if (originHeader) {
+      try {
+        const parsed = new URL(originHeader)
+        return { rpID: parsed.hostname, expectedOrigin: parsed.origin }
+      } catch {
+        // Fall back to Host header
+      }
+    }
+    const protoHeader =
+      typeof req.headers['x-forwarded-proto'] === 'string'
+        ? req.headers['x-forwarded-proto'].split(',')[0].trim()
+        : 'http'
+    const hostHeader =
+      typeof req.headers.host === 'string' && req.headers.host.trim()
+        ? req.headers.host.trim()
+        : `localhost:${this.boundPort || this.requestedPort}`
+    const parsed = new URL(`${protoHeader}://${hostHeader}`)
+    return { rpID: parsed.hostname, expectedOrigin: parsed.origin }
   }
 
   private buildSessionCookieHeader(token: string, maxAgeSeconds: number): string {
     return `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSeconds}`
   }
 
-  broadcast(channel: string, payload: unknown): void {
+  private getClientPermissions(userId: string | null): Permission[] {
+    if (!this.isAuthEnabled() || userId === '__env_admin__') {
+      return [...ALL_PERMISSIONS]
+    }
+    if (!userId) return []
+    const active = this.authService.getActiveUserWithPermissions(userId)
+    return active ? active.permissions : []
+  }
+
+  broadcast(channel: string, payload: unknown, requiredPerm?: Permission): void {
     if (this.sseClients.size === 0) return
     const frame = `event: ${channel}\ndata: ${JSON.stringify(payload)}\n\n`
     for (const client of Array.from(this.sseClients)) {
       try {
-        if (!client.writableEnded && !client.destroyed) {
-          client.write(frame)
-        } else {
+        if (client.res.writableEnded || client.res.destroyed) {
           this.sseClients.delete(client)
+          continue
         }
+        if (requiredPerm) {
+          const perms = this.getClientPermissions(client.userId)
+          if (!hasPermission(perms, requiredPerm)) continue
+        }
+        client.res.write(frame)
       } catch {
         this.sseClients.delete(client)
       }
     }
+  }
+
+  private requirePerm(
+    res: http.ServerResponse,
+    session: ResolvedSession,
+    perm: Permission,
+  ): boolean {
+    if (hasPermission(session.permissions, perm)) return true
+    this.sendJson(res, 403, {
+      error: `Permission denied: requires "${perm}" access.`,
+    })
+    return false
+  }
+
+  private requireAnyPerm(
+    res: http.ServerResponse,
+    session: ResolvedSession,
+    perms: Permission[],
+  ): boolean {
+    if (hasAnyPermission(session.permissions, perms)) return true
+    this.sendJson(res, 403, {
+      error: `Permission denied: requires one of [${perms.join(', ')}].`,
+    })
+    return false
   }
 
   async start(): Promise<{ port: number; host: string }> {
@@ -310,8 +440,8 @@ export class RingWatchServer {
     this.sseHeartbeatTimer = setInterval(() => {
       for (const client of Array.from(this.sseClients)) {
         try {
-          if (!client.writableEnded && !client.destroyed) {
-            client.write(': ping\n\n')
+          if (!client.res.writableEnded && !client.res.destroyed) {
+            client.res.write(': ping\n\n')
           } else {
             this.sseClients.delete(client)
           }
@@ -324,7 +454,6 @@ export class RingWatchServer {
       this.sseHeartbeatTimer.unref()
     }
 
-    // Initialize Ring, NVR, AI, and storage rescan in background so HTTP server responds immediately
     void this.ringService.initialize().catch((err) => {
       console.warn('[RingWatch Server] Initialization warning:', err)
     })
@@ -332,8 +461,8 @@ export class RingWatchServer {
       this.rescanTimer = null
       try {
         const res = this.recordingService.rescanDirectory()
-        this.broadcast('recordings-updated', res.recordings)
-        this.broadcast('storage-stats-updated', res.stats)
+        this.broadcast('recordings-updated', res.recordings, 'recordings:view')
+        this.broadcast('storage-stats-updated', res.stats, 'recordings:view')
       } catch {
         // Ignore background rescan errors
       }
@@ -356,7 +485,7 @@ export class RingWatchServer {
     }
     for (const client of Array.from(this.sseClients)) {
       try {
-        client.end()
+        client.res.end()
       } catch {
         // ignore
       }
@@ -418,11 +547,17 @@ export class RingWatchServer {
 
     // 1. Authenticated media routes (/media/<token>/hls/... & /media/<token>/recording-id/...)
     if (pathname.startsWith('/media/')) {
-      if (this.isAuthEnabled() && !this.isAuthenticated(req)) {
-        // Media already requires a 192-bit per-session secret token in path;
-        // enforce session cookie too when auth is enabled for defense in depth.
+      const session = this.resolveSession(req)
+      if (!session.authenticated) {
         res.writeHead(401)
         res.end('Unauthorized')
+        return
+      }
+      const isHls = pathname.includes('/hls/')
+      const requiredPerm: Permission = isHls ? 'cameras:view' : 'recordings:view'
+      if (!hasPermission(session.permissions, requiredPerm)) {
+        res.writeHead(403)
+        res.end('Forbidden')
         return
       }
       this.streamService.handleMediaRequest(req, res)
@@ -494,25 +629,90 @@ export class RingWatchServer {
       return
     }
 
+    // Password login (multi-user or env admin override)
     if (method === 'POST' && pathname === '/api/auth/login') {
       const body = await readJsonBody(req)
       const password = typeof body.password === 'string' ? body.password : ''
-      const expected = this.getActivePasswordSecret()
-      if (!expected) {
+      const username = typeof body.username === 'string' ? body.username.trim() : ''
+
+      if (!this.isAuthEnabled()) {
         this.sendJson(res, 200, { ok: true })
         return
       }
-      if (!verifyPassword(password, expected)) {
-        this.sendJson(res, 401, { ok: false, error: 'Incorrect password.' })
+
+      // 1. Try multi-user accounts first
+      if (this.authService.hasUsers()) {
+        const user = this.authService.authenticateWithPassword(password, username || undefined)
+        if (user) {
+          const token = createUserSessionToken(this.sessionSigningKey, user.id)
+          this.sendJson(
+            res,
+            200,
+            { ok: true, user },
+            { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+          )
+          return
+        }
+      }
+
+      // 2. Fallback to RINGWATCH_AUTH_PASSWORD env override or legacy hash
+      const envOrLegacy = this.envAuthPassword ?? this.configStore.getAuthPasswordHash()
+      if (
+        envOrLegacy &&
+        (!username || username.toLowerCase() === 'admin') &&
+        verifyPassword(password, envOrLegacy)
+      ) {
+        const token = createUserSessionToken(this.sessionSigningKey, '__env_admin__')
+        this.sendJson(
+          res,
+          200,
+          { ok: true },
+          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+        )
         return
       }
-      const token = createSessionToken(this.sessionSigningKey)
-      this.sendJson(
-        res,
-        200,
-        { ok: true },
-        { 'Set-Cookie': this.buildSessionCookieHeader(token, 7 * 24 * 60 * 60) },
-      )
+
+      this.sendJson(res, 401, { ok: false, error: 'Invalid username or password.' })
+      return
+    }
+
+    // Passkey (WebAuthn) Sign-In Step 1: Challenge Options
+    if (method === 'POST' && pathname === '/api/auth/passkey/login-options') {
+      const body = await readJsonBody(req)
+      const username = typeof body.username === 'string' ? body.username.trim() : undefined
+      const { rpID, expectedOrigin } = this.resolveWebAuthnContext(req)
+      const result = await this.authService.createPasskeyAuthenticationOptions({
+        username,
+        rpID,
+        expectedOrigin,
+      })
+      this.sendJson(res, 200, result)
+      return
+    }
+
+    // Passkey (WebAuthn) Sign-In Step 2: Verify Assertion & Issue Session Cookie
+    if (method === 'POST' && pathname === '/api/auth/passkey/login-verify') {
+      const body = await readJsonBody(req)
+      const challengeId = typeof body.challengeId === 'string' ? body.challengeId : ''
+      const response = body.response as AuthenticationResponseJSON
+      try {
+        const user = await this.authService.verifyPasskeyAuthentication({
+          challengeId,
+          response,
+        })
+        const token = createUserSessionToken(this.sessionSigningKey, user.id)
+        this.sendJson(
+          res,
+          200,
+          { ok: true, user },
+          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+        )
+      } catch (err) {
+        this.sendJson(res, 401, {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Passkey authentication failed.',
+        })
+      }
       return
     }
 
@@ -526,48 +726,84 @@ export class RingWatchServer {
       return
     }
 
-    // Enforce optional login gate for all protected API routes
-    if (!this.isAuthenticated(req)) {
+    // Enforce authentication for all protected API routes
+    const session = this.resolveSession(req)
+    if (!session.authenticated) {
       this.sendJson(res, 401, { error: 'Authentication required' })
       return
     }
 
-    // Troubleshooting logs API
-    if (method === 'GET' && pathname === '/api/logs') {
-      this.sendJson(res, 200, {
-        logsDir: this.logger.logsDir,
-        logFilePath: this.logger.logFilePath,
-        debugEnabled: this.logger.debugEnabled,
-        lines: this.logger.readRecentLines(400),
+    // Self-service Passkey registration (requires a real user account)
+    if (method === 'POST' && pathname === '/api/auth/passkey/register-options') {
+      if (!session.user || session.user.id === '__env_admin__') {
+        this.sendJson(res, 400, {
+          error: 'Create an Admin user account first before registering a Passkey.',
+        })
+        return
+      }
+      const { rpID, expectedOrigin } = this.resolveWebAuthnContext(req)
+      const result = await this.authService.createPasskeyRegistrationOptions({
+        userId: session.user.id,
+        rpID,
+        expectedOrigin,
       })
+      this.sendJson(res, 200, result)
       return
     }
 
-    if (method === 'GET' && pathname === '/api/logs/download') {
-      const report = this.logger.buildTroubleshootingReport({
-        connection: this.ringService.getConnection(),
-        nvrStatus: this.ringService.getNvrStatus(),
-        storageStats: this.recordingService.getStorageStats(),
-        settings: this.configStore.getPublicSettings(),
-        recentPackageDetections: this.aiPackageService
-          .listDetections()
-          .slice(0, 15)
-          .map(({ snapshotDataUrl: _drop, ...rest }) => rest),
+    if (method === 'POST' && pathname === '/api/auth/passkey/register-verify') {
+      if (!session.user || session.user.id === '__env_admin__') {
+        this.sendJson(res, 400, {
+          error: 'Create an Admin user account first before registering a Passkey.',
+        })
+        return
+      }
+      const body = await readJsonBody(req)
+      const challengeId = typeof body.challengeId === 'string' ? body.challengeId : ''
+      const name = typeof body.name === 'string' ? body.name : 'Passkey'
+      const response = body.response as RegistrationResponseJSON
+      const passkey = await this.authService.verifyPasskeyRegistration({
+        userId: session.user.id,
+        challengeId,
+        name,
+        response,
       })
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-      const buf = Buffer.from(report, 'utf-8')
-      res.writeHead(200, {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Content-Length': buf.length,
-        'Content-Disposition': `attachment; filename="ringwatch-troubleshooting-${stamp}.log"`,
-        'Cache-Control': 'no-store',
-      })
-      res.end(buf)
+      this.sendJson(res, 200, { ok: true, passkey })
       return
     }
 
-    // Update or remove optional login password from Settings UI
+    const myPasskeyMatch = /^\/api\/auth\/passkeys\/([^/]+)$/.exec(pathname)
+    if (method === 'DELETE' && myPasskeyMatch) {
+      if (!session.user || session.user.id === '__env_admin__') {
+        this.sendJson(res, 400, { error: 'No user account active.' })
+        return
+      }
+      this.authService.removePasskey(session.user.id, myPasskeyMatch[1], false)
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+
+    // Self-service password change
+    if (method === 'POST' && pathname === '/api/auth/change-password') {
+      if (!session.user || session.user.id === '__env_admin__') {
+        this.sendJson(res, 400, {
+          ok: false,
+          error: 'No user account active (managed by environment or open mode).',
+        })
+        return
+      }
+      const body = await readJsonBody(req)
+      const currentPassword =
+        typeof body.currentPassword === 'string' ? body.currentPassword : undefined
+      const newPassword = typeof body.newPassword === 'string' ? body.newPassword : ''
+      this.authService.changePassword(session.user.id, currentPassword, newPassword)
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+
+    // Backwards-compatible quick single-password toggle (for legacy clients/tests)
     if (method === 'POST' && pathname === '/api/auth/password') {
+      if (!this.requirePerm(res, session, 'users:manage')) return
       if (this.envAuthPassword) {
         this.sendJson(res, 400, {
           ok: false,
@@ -598,7 +834,7 @@ export class RingWatchServer {
         this.sendJson(
           res,
           200,
-          { ok: true, authEnabled: false },
+          { ok: true, authEnabled: this.isAuthEnabled() },
           { 'Set-Cookie': this.buildSessionCookieHeader('', 0) },
         )
         return
@@ -607,24 +843,129 @@ export class RingWatchServer {
       if (newPassword.length < 4) {
         this.sendJson(res, 400, {
           ok: false,
-          authEnabled: Boolean(existingHash),
+          authEnabled: this.isAuthEnabled(),
           error: 'Password must be at least 4 characters.',
         })
         return
       }
 
       this.configStore.setAuthPasswordHash(hashPassword(newPassword))
-      const token = createSessionToken(this.sessionSigningKey)
+      const token = createUserSessionToken(this.sessionSigningKey, '__env_admin__')
       this.sendJson(
         res,
         200,
         { ok: true, authEnabled: true },
-        { 'Set-Cookie': this.buildSessionCookieHeader(token, 7 * 24 * 60 * 60) },
+        { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
       )
       return
     }
 
-    // Real-time Server-Sent Events stream
+    // Multi-User & RBAC Administration (/api/users)
+    if (method === 'GET' && pathname === '/api/users') {
+      if (!this.requirePerm(res, session, 'users:manage')) return
+      this.sendJson(res, 200, this.authService.listUsers())
+      return
+    }
+
+    if (method === 'POST' && pathname === '/api/users') {
+      if (!this.requirePerm(res, session, 'users:manage')) return
+      const body = await readJsonBody(req)
+      const wasFirstUser = !this.authService.hasUsers()
+      const created = this.authService.createUser({
+        username: String(body.username ?? ''),
+        displayName: String(body.displayName ?? body.username ?? ''),
+        role: (typeof body.role === 'string' ? body.role : 'viewer') as UserRole,
+        customPermissions: Array.isArray(body.customPermissions)
+          ? (body.customPermissions as Permission[])
+          : undefined,
+        password: typeof body.password === 'string' ? body.password : undefined,
+      })
+      // When creating the very first Admin user from open mode, automatically log them in
+      if (wasFirstUser) {
+        const token = createUserSessionToken(this.sessionSigningKey, created.id)
+        this.sendJson(
+          res,
+          201,
+          created,
+          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+        )
+        return
+      }
+      this.sendJson(res, 201, created)
+      return
+    }
+
+    const userPkMatch = /^\/api\/users\/([^/]+)\/passkeys\/([^/]+)$/.exec(pathname)
+    if (method === 'DELETE' && userPkMatch) {
+      if (!this.requirePerm(res, session, 'users:manage')) return
+      this.authService.removePasskey(userPkMatch[1], userPkMatch[2], true)
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+
+    const userMatch = /^\/api\/users\/([^/]+)$/.exec(pathname)
+    if (userMatch) {
+      if (!this.requirePerm(res, session, 'users:manage')) return
+      const targetId = userMatch[1]
+      if (method === 'PATCH') {
+        const body = await readJsonBody(req)
+        const updated = this.authService.updateUser(targetId, {
+          displayName:
+            typeof body.displayName === 'string' ? body.displayName : undefined,
+          role: typeof body.role === 'string' ? (body.role as UserRole) : undefined,
+          customPermissions: Array.isArray(body.customPermissions)
+            ? (body.customPermissions as Permission[])
+            : undefined,
+          disabled: typeof body.disabled === 'boolean' ? body.disabled : undefined,
+          password: typeof body.password === 'string' ? body.password : undefined,
+        })
+        this.sendJson(res, 200, updated)
+        return
+      }
+      if (method === 'DELETE') {
+        this.authService.deleteUser(targetId)
+        this.sendJson(res, 200, { ok: true })
+        return
+      }
+    }
+
+    // Troubleshooting logs API (admin/settings only)
+    if (method === 'GET' && pathname === '/api/logs') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
+      this.sendJson(res, 200, {
+        logsDir: this.logger.logsDir,
+        logFilePath: this.logger.logFilePath,
+        debugEnabled: this.logger.debugEnabled,
+        lines: this.logger.readRecentLines(400),
+      })
+      return
+    }
+
+    if (method === 'GET' && pathname === '/api/logs/download') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
+      const report = this.logger.buildTroubleshootingReport({
+        connection: this.ringService.getConnection(),
+        nvrStatus: this.ringService.getNvrStatus(),
+        storageStats: this.recordingService.getStorageStats(),
+        settings: this.configStore.getPublicSettings(),
+        recentPackageDetections: this.aiPackageService
+          .listDetections()
+          .slice(0, 15)
+          .map(({ snapshotDataUrl: _drop, ...rest }) => rest),
+      })
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      const buf = Buffer.from(report, 'utf-8')
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Length': buf.length,
+        'Content-Disposition': `attachment; filename="ringwatch-troubleshooting-${stamp}.log"`,
+        'Cache-Control': 'no-store',
+      })
+      res.end(buf)
+      return
+    }
+
+    // Real-time Server-Sent Events stream (permission-filtered per subscriber)
     if (method === 'GET' && pathname === '/api/events') {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -633,41 +974,51 @@ export class RingWatchServer {
         'X-Accel-Buffering': 'no',
       })
       res.write('event: connected\ndata: {"ok":true}\n\n')
-      this.sseClients.add(res)
+      const entry: SseClientEntry = {
+        res,
+        userId: session.user?.id ?? (this.isAuthEnabled() ? null : '__env_admin__'),
+      }
+      this.sseClients.add(entry)
       req.on('close', () => {
-        this.sseClients.delete(res)
+        this.sseClients.delete(entry)
       })
       return
     }
 
-    // Bootstrap payload
+    // Permission-scoped Bootstrap payload
     if (method === 'GET' && pathname === '/api/bootstrap') {
+      const canCameras = hasPermission(session.permissions, 'cameras:view')
+      const canRecs = hasPermission(session.permissions, 'recordings:view')
+      const canSensors = hasPermission(session.permissions, 'sensors:view')
+      const canAi = hasPermission(session.permissions, 'ai:view')
       const payload: RingWatchBootstrap = {
         connection: this.ringService.getConnection(),
         settings: this.configStore.getPublicSettings(),
         storageStats: this.recordingService.getStorageStats(),
         nvrStatus: this.ringService.getNvrStatus(),
         locations: this.ringService.getLocations(),
-        cameras: this.ringService.getCameras(),
-        sensors: this.ringService.getSensors(),
-        events: this.ringService.getEvents(),
-        recordings: this.recordingService.listRecordings(),
-        packageDetections: this.aiPackageService.listDetections(),
-        activeStreams: this.streamService.listActiveSessions(),
+        cameras: canCameras ? this.ringService.getCameras() : [],
+        sensors: canSensors ? this.ringService.getSensors() : [],
+        events: canSensors || canRecs ? this.ringService.getEvents() : [],
+        recordings: canRecs ? this.recordingService.listRecordings() : [],
+        packageDetections: canAi ? this.aiPackageService.listDetections() : [],
+        activeStreams: canCameras ? this.streamService.listActiveSessions() : [],
         authStatus: this.getAuthStatus(req),
       }
       this.sendJson(res, 200, payload)
       return
     }
 
-    // Connection & Ring Account
+    // Connection & Ring Account (settings:manage)
     if (method === 'POST' && pathname === '/api/connection/token') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
       const body = await readJsonBody(req)
       const token = typeof body.refreshToken === 'string' ? body.refreshToken : ''
       this.sendJson(res, 200, await this.ringService.connectWithToken(token))
       return
     }
     if (method === 'POST' && pathname === '/api/connection/login') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
       const body = await readJsonBody(req)
       this.sendJson(
         res,
@@ -682,16 +1033,19 @@ export class RingWatchServer {
       return
     }
     if (method === 'POST' && pathname === '/api/connection/disconnect') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
       this.sendJson(res, 200, await this.ringService.disconnectRing())
       return
     }
     if (method === 'POST' && pathname === '/api/connection/mode') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
       const body = await readJsonBody(req)
       const mode = body.mode === 'live' ? 'live' : ('demo' as AppMode)
       this.sendJson(res, 200, await this.ringService.switchMode(mode))
       return
     }
     if (method === 'POST' && pathname === '/api/connection/refresh') {
+      if (!this.requireAnyPerm(res, session, ['cameras:view', 'sensors:view'])) return
       this.sendJson(res, 200, await this.ringService.refreshDevices())
       return
     }
@@ -702,19 +1056,23 @@ export class RingWatchServer {
       const cameraId = camMatch[1]
       const action = camMatch[2]
       if (method === 'POST' && action === 'stream/start') {
+        if (!this.requirePerm(res, session, 'cameras:view')) return
         this.sendJson(res, 200, await this.ringService.startLiveStream(cameraId))
         return
       }
       if (method === 'POST' && action === 'stream/stop') {
+        if (!this.requirePerm(res, session, 'cameras:view')) return
         this.ringService.stopLiveStream(cameraId)
         this.sendJson(res, 200, { ok: true })
         return
       }
       if (method === 'POST' && action === 'snapshot') {
+        if (!this.requirePerm(res, session, 'cameras:view')) return
         this.sendJson(res, 200, await this.ringService.captureSnapshot(cameraId))
         return
       }
       if (method === 'POST' && action === 'light') {
+        if (!this.requirePerm(res, session, 'cameras:control')) return
         const body = await readJsonBody(req)
         this.sendJson(
           res,
@@ -724,6 +1082,7 @@ export class RingWatchServer {
         return
       }
       if (method === 'POST' && action === 'siren') {
+        if (!this.requirePerm(res, session, 'cameras:control')) return
         const body = await readJsonBody(req)
         this.sendJson(
           res,
@@ -733,11 +1092,13 @@ export class RingWatchServer {
         return
       }
       if (method === 'GET' && action === 'cloud-recordings') {
+        if (!this.requirePerm(res, session, 'recordings:view')) return
         this.sendJson(res, 200, await this.ringService.listCloudRecordings(cameraId))
         return
       }
       const cloudDlMatch = /^cloud-recordings\/([^/]+)\/download$/.exec(action)
       if (method === 'POST' && cloudDlMatch) {
+        if (!this.requirePerm(res, session, 'recordings:manage')) return
         this.sendJson(
           res,
           200,
@@ -747,9 +1108,10 @@ export class RingWatchServer {
       }
     }
 
-    // Alarm mode
+    // Alarm mode (sensors:arm)
     const locAlarmMatch = /^\/api\/locations\/([^/]+)\/alarm$/.exec(pathname)
     if (method === 'POST' && locAlarmMatch) {
+      if (!this.requirePerm(res, session, 'sensors:arm')) return
       const body = await readJsonBody(req)
       const mode =
         body.mode === 'some' || body.mode === 'all' ? body.mode : 'none'
@@ -763,10 +1125,12 @@ export class RingWatchServer {
 
     // NVR continuous recording
     if (method === 'GET' && pathname === '/api/nvr/status') {
+      if (!this.requireAnyPerm(res, session, ['nvr:manage', 'recordings:view', 'cameras:view'])) return
       this.sendJson(res, 200, this.ringService.getNvrStatus())
       return
     }
     if (method === 'POST' && pathname === '/api/nvr/start') {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       const body = await readJsonBody(req)
       const cameraIds = Array.isArray(body.cameraIds)
         ? body.cameraIds.filter((x): x is string => typeof x === 'string')
@@ -779,11 +1143,13 @@ export class RingWatchServer {
       return
     }
     if (method === 'POST' && pathname === '/api/nvr/stop') {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       this.sendJson(res, 200, await this.ringService.stopAllCameraRecording())
       return
     }
     const nvrCamMatch = /^\/api\/nvr\/camera\/([^/]+)$/.exec(pathname)
     if (method === 'POST' && nvrCamMatch) {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       const body = await readJsonBody(req)
       this.sendJson(
         res,
@@ -796,16 +1162,19 @@ export class RingWatchServer {
       return
     }
     if (method === 'POST' && pathname === '/api/timeline/sync-cloud') {
+      if (!this.requirePerm(res, session, 'recordings:view')) return
       this.sendJson(res, 200, await this.ringService.syncCloudEventsToTimeline())
       return
     }
 
     // Recordings & local vault
     if (method === 'GET' && pathname === '/api/recordings') {
+      if (!this.requirePerm(res, session, 'recordings:view')) return
       this.sendJson(res, 200, this.recordingService.listRecordings())
       return
     }
     if (method === 'POST' && pathname === '/api/recordings/capture') {
+      if (!this.requirePerm(res, session, 'recordings:manage')) return
       const body = await readJsonBody(req)
       this.sendJson(
         res,
@@ -822,9 +1191,10 @@ export class RingWatchServer {
       return
     }
     if (method === 'POST' && pathname === '/api/recordings/open-folder') {
+      if (!this.requirePerm(res, session, 'recordings:view')) return
       const rootDir = this.configStore.getPublicSettings().recordingsDir
       fs.mkdirSync(rootDir, { recursive: true })
-      this.openHostFolderIfWindows(rootDir)
+      this.openHostFolder(rootDir)
       this.sendJson(res, 200, { ok: true, path: rootDir })
       return
     }
@@ -834,20 +1204,23 @@ export class RingWatchServer {
       const recId = recMatch[1]
       const sub = recMatch[2]
       if (method === 'DELETE' && !sub) {
+        if (!this.requirePerm(res, session, 'recordings:manage')) return
         this.recordingService.deleteRecording(recId)
-        this.broadcast('recordings-updated', this.recordingService.listRecordings())
-        this.broadcast('storage-stats-updated', this.recordingService.getStorageStats())
+        this.broadcast('recordings-updated', this.recordingService.listRecordings(), 'recordings:view')
+        this.broadcast('storage-stats-updated', this.recordingService.getStorageStats(), 'recordings:view')
         this.sendJson(res, 200, { ok: true })
         return
       }
       if (method === 'POST' && sub === 'star') {
+        if (!this.requirePerm(res, session, 'recordings:manage')) return
         const updated = this.recordingService.toggleStar(recId)
-        this.broadcast('recordings-updated', this.recordingService.listRecordings())
-        this.broadcast('storage-stats-updated', this.recordingService.getStorageStats())
+        this.broadcast('recordings-updated', this.recordingService.listRecordings(), 'recordings:view')
+        this.broadcast('storage-stats-updated', this.recordingService.getStorageStats(), 'recordings:view')
         this.sendJson(res, 200, updated)
         return
       }
       if (method === 'GET' && sub === 'download') {
+        if (!this.requirePerm(res, session, 'recordings:view')) return
         const item = this.recordingService.getRecordingById(recId)
         if (!item || !fs.existsSync(item.filePath)) {
           this.sendJson(res, 404, { error: 'Recording not found' })
@@ -866,6 +1239,7 @@ export class RingWatchServer {
         return
       }
       if (method === 'POST' && sub === 'evidence') {
+        if (!this.requirePerm(res, session, 'recordings:manage')) return
         const item = this.recordingService.getRecordingById(recId)
         if (!item || !fs.existsSync(item.filePath)) {
           this.sendJson(res, 404, { error: 'Recording not found' })
@@ -881,9 +1255,10 @@ export class RingWatchServer {
         return
       }
       if (method === 'POST' && sub === 'open-folder') {
+        if (!this.requirePerm(res, session, 'recordings:view')) return
         const item = this.recordingService.getRecordingById(recId)
         if (item && fs.existsSync(item.filePath)) {
-          this.openHostFolderIfWindows(path.dirname(item.filePath), item.filePath)
+          this.openHostFolder(path.dirname(item.filePath), item.filePath)
         }
         this.sendJson(res, 200, { ok: true })
         return
@@ -892,14 +1267,17 @@ export class RingWatchServer {
 
     // Storage management
     if (method === 'GET' && pathname === '/api/storage/stats') {
+      if (!this.requireAnyPerm(res, session, ['nvr:manage', 'recordings:view'])) return
       this.sendJson(res, 200, this.recordingService.getStorageStats())
       return
     }
     if (method === 'GET' && pathname === '/api/storage/drives') {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       this.sendJson(res, 200, await this.recordingService.listStorageDrives())
       return
     }
     if (method === 'POST' && pathname === '/api/storage/primary') {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       const body = await readJsonBody(req)
       const safePath = assertSafeDrivePath(body.drivePath)
       const targetDir = path.join(safePath, 'RingWatch_Recordings')
@@ -907,13 +1285,14 @@ export class RingWatchServer {
       const settings = this.configStore.updateSettings({ recordingsDir: targetDir })
       const { recordings, stats } = this.recordingService.rescanDirectory()
       this.ringService.syncNvrSettings()
-      this.broadcast('settings-updated', settings)
-      this.broadcast('recordings-updated', recordings)
-      this.broadcast('storage-stats-updated', stats)
+      this.broadcast('settings-updated', settings, 'settings:manage')
+      this.broadcast('recordings-updated', recordings, 'recordings:view')
+      this.broadcast('storage-stats-updated', stats, 'recordings:view')
       this.sendJson(res, 200, { settings, stats })
       return
     }
     if (method === 'POST' && pathname === '/api/storage/failover') {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       const body = await readJsonBody(req)
       const safePath = assertSafeDrivePath(body.drivePath)
       const targetDir = path.join(safePath, 'RingWatch_Failover')
@@ -923,37 +1302,41 @@ export class RingWatchServer {
       })
       const stats = this.recordingService.getStorageStats()
       this.ringService.syncNvrSettings()
-      this.broadcast('settings-updated', settings)
-      this.broadcast('storage-stats-updated', stats)
+      this.broadcast('settings-updated', settings, 'settings:manage')
+      this.broadcast('storage-stats-updated', stats, 'recordings:view')
       this.sendJson(res, 200, { settings, stats })
       return
     }
     if (method === 'DELETE' && pathname === '/api/storage/failover') {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       const settings = this.configStore.updateSettings({ failoverRecordingsDir: '' })
       const stats = this.recordingService.getStorageStats()
       this.ringService.syncNvrSettings()
-      this.broadcast('settings-updated', settings)
-      this.broadcast('storage-stats-updated', stats)
+      this.broadcast('settings-updated', settings, 'settings:manage')
+      this.broadcast('storage-stats-updated', stats, 'recordings:view')
       this.sendJson(res, 200, { settings, stats })
       return
     }
     if (method === 'POST' && pathname === '/api/storage/rescan') {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       const { recordings, stats } = this.recordingService.rescanDirectory()
-      this.broadcast('recordings-updated', recordings)
-      this.broadcast('storage-stats-updated', stats)
+      this.broadcast('recordings-updated', recordings, 'recordings:view')
+      this.broadcast('storage-stats-updated', stats, 'recordings:view')
       this.sendJson(res, 200, { recordings, stats })
       return
     }
     if (method === 'POST' && pathname === '/api/storage/prune') {
+      if (!this.requirePerm(res, session, 'nvr:manage')) return
       const result = this.recordingService.enforceRetentionAndQuota()
-      this.broadcast('recordings-updated', this.recordingService.listRecordings())
-      this.broadcast('storage-stats-updated', result.stats)
+      this.broadcast('recordings-updated', this.recordingService.listRecordings(), 'recordings:view')
+      this.broadcast('storage-stats-updated', result.stats, 'recordings:view')
       this.sendJson(res, 200, result)
       return
     }
 
     // AI Package Detection
     if (method === 'POST' && pathname === '/api/ai/scan') {
+      if (!this.requirePerm(res, session, 'ai:manage')) return
       const body = await readJsonBody(req)
       const cameraId = String(body.cameraId ?? '')
       const trigger =
@@ -968,19 +1351,23 @@ export class RingWatchServer {
       return
     }
     if (method === 'GET' && pathname === '/api/ai/detections') {
+      if (!this.requirePerm(res, session, 'ai:view')) return
       this.sendJson(res, 200, this.aiPackageService.listDetections())
       return
     }
     if (method === 'DELETE' && pathname === '/api/ai/detections') {
+      if (!this.requirePerm(res, session, 'ai:manage')) return
       this.aiPackageService.clearDetections()
       this.sendJson(res, 200, { ok: true })
       return
     }
     if (method === 'POST' && pathname === '/api/ai/test-connection') {
+      if (!this.requireAnyPerm(res, session, ['ai:manage', 'settings:manage'])) return
       this.sendJson(res, 200, await this.aiPackageService.testConnection())
       return
     }
     if (method === 'POST' && pathname === '/api/ai/test-alert') {
+      if (!this.requirePerm(res, session, 'ai:manage')) return
       this.aiPackageService.sendTestAlert()
       this.sendJson(res, 200, { ok: true })
       return
@@ -988,6 +1375,7 @@ export class RingWatchServer {
 
     // Demo simulator
     if (method === 'POST' && pathname === '/api/demo/simulate') {
+      if (!this.requireAnyPerm(res, session, ['cameras:control', 'ai:manage', 'settings:manage'])) return
       const body = await readJsonBody(req)
       const kind = String(body.kind ?? 'motion') as
         | 'doorbell'
@@ -999,9 +1387,40 @@ export class RingWatchServer {
       return
     }
 
-    // Settings
+    // Settings (scope: ai:manage for packageAi rules without API keys, nvr:manage for NVR fields, settings:manage for everything)
     if (method === 'PATCH' && pathname === '/api/settings') {
       const body = (await readJsonBody(req)) as AppSettingsPatch
+      const keys = Object.keys(body)
+      const isPureAiRules =
+        keys.length === 1 &&
+        keys[0] === 'packageAi' &&
+        !body.packageAi?.openaiApiKey &&
+        !body.packageAi?.geminiApiKey
+      const nvrKeys = new Set([
+        'continuousSegmentSeconds',
+        'continuousSkipBatteryCams',
+        'continuousAutoStart',
+        'continuousCameraIds',
+        'maxStorageGb',
+        'retentionDays',
+        'lowDiskWarningGb',
+        'minFreeDiskGb',
+        'organizeByDateFolder',
+        'nvrNotificationsEnabled',
+        'preventSleepWhileRecording',
+        'recordingsDir',
+        'failoverRecordingsDir',
+      ])
+      const isPureNvrPatch = keys.length > 0 && keys.every((k) => nvrKeys.has(k))
+
+      if (isPureAiRules) {
+        if (!this.requireAnyPerm(res, session, ['ai:manage', 'settings:manage'])) return
+      } else if (isPureNvrPatch) {
+        if (!this.requireAnyPerm(res, session, ['nvr:manage', 'settings:manage'])) return
+      } else {
+        if (!this.requirePerm(res, session, 'settings:manage')) return
+      }
+
       if (body.recordingsDir !== undefined && body.recordingsDir.trim()) {
         assertSafeDrivePath(body.recordingsDir)
         fs.mkdirSync(body.recordingsDir.trim(), { recursive: true })
@@ -1016,8 +1435,8 @@ export class RingWatchServer {
       const updated = this.configStore.updateSettings(body)
       this.aiPackageService.syncScheduler()
       this.ringService.syncNvrSettings()
-      this.broadcast('settings-updated', updated)
-      this.broadcast('storage-stats-updated', this.recordingService.getStorageStats())
+      this.broadcast('settings-updated', updated, 'settings:manage')
+      this.broadcast('storage-stats-updated', this.recordingService.getStorageStats(), 'recordings:view')
       this.sendJson(res, 200, updated)
       return
     }
@@ -1025,7 +1444,7 @@ export class RingWatchServer {
     this.sendJson(res, 404, { error: `Unknown API endpoint: ${method} ${pathname}` })
   }
 
-  private openHostFolderIfWindows(dirPath: string, selectFile?: string): void {
+  private openHostFolder(dirPath: string, selectFile?: string): void {
     try {
       if (process.platform === 'win32') {
         if (selectFile) {
@@ -1075,7 +1494,6 @@ export class RingWatchServer {
       return
     }
 
-    // SPA fallback to index.html for client-side routes
     if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
       candidate = path.join(this.webDistDir, 'index.html')
       if (!fs.existsSync(candidate)) {

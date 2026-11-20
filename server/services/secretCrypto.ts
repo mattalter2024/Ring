@@ -137,3 +137,55 @@ export function verifySessionToken(token: string | undefined, signingKey: Buffer
   if (a.length !== b.length) return false
   return crypto.timingSafeEqual(a, b)
 }
+
+/**
+ * Create a user-bound HMAC-SHA256 signed session cookie token (valid for 7 days by default).
+ * Format: <base64url(userId)>.<expMs>.<nonce>.<hmacBase64url>
+ */
+export function createUserSessionToken(
+  signingKey: Buffer,
+  userId: string,
+  ttlMs = 7 * 24 * 60 * 60 * 1000,
+): string {
+  const uidEnc = Buffer.from(userId, 'utf-8').toString('base64url')
+  const exp = Date.now() + ttlMs
+  const nonce = crypto.randomBytes(12).toString('hex')
+  const payload = `${uidEnc}.${exp}.${nonce}`
+  const sig = crypto
+    .createHmac('sha256', signingKey)
+    .update(payload)
+    .digest('base64url')
+  return `${payload}.${sig}`
+}
+
+export function verifyUserSessionToken(
+  token: string | undefined,
+  signingKey: Buffer,
+): { valid: boolean; userId: string } {
+  if (!token) return { valid: false, userId: '' }
+  const parts = token.split('.')
+  // Support legacy 3-part env/single-password tokens as '__legacy_admin__'
+  if (parts.length === 3) {
+    return verifySessionToken(token, signingKey)
+      ? { valid: true, userId: '__env_admin__' }
+      : { valid: false, userId: '' }
+  }
+  if (parts.length !== 4) return { valid: false, userId: '' }
+  const [uidEnc, expStr, nonce, sig] = parts
+  const exp = Number(expStr)
+  if (!uidEnc || !Number.isFinite(exp) || Date.now() > exp || !nonce || !sig) {
+    return { valid: false, userId: '' }
+  }
+  const payload = `${uidEnc}.${expStr}.${nonce}`
+  const expectedSig = crypto
+    .createHmac('sha256', signingKey)
+    .update(payload)
+    .digest('base64url')
+  const a = Buffer.from(sig, 'utf-8')
+  const b = Buffer.from(expectedSig, 'utf-8')
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return { valid: false, userId: '' }
+  }
+  const userId = Buffer.from(uidEnc, 'base64url').toString('utf-8')
+  return userId ? { valid: true, userId } : { valid: false, userId: '' }
+}

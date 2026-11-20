@@ -14,6 +14,13 @@ import type {
   SecurityEvent,
   StorageStats,
 } from '@shared/types'
+import {
+  startAuthentication,
+  startRegistration,
+  type PublicKeyCredentialCreationOptionsJSON,
+  type PublicKeyCredentialRequestOptionsJSON,
+} from '@simplewebauthn/browser'
+import { ALL_PERMISSIONS, hasPermission, type Permission } from '@shared/rbac'
 import { webRingWatchApi } from '@/api/webClient'
 import { playAlertChime } from '@/utils/audioChime'
 import { applySystemTheme } from '@/utils/theme'
@@ -108,6 +115,9 @@ const DEFAULT_AUTH_STATUS: AuthStatus = {
   authEnabled: false,
   authenticated: true,
   managedByEnv: false,
+  hasUsers: false,
+  currentUser: null,
+  permissions: [...ALL_PERMISSIONS],
 }
 
 export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void) {
@@ -273,17 +283,82 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     }
   }, [authStatus.authEnabled, authStatus.authenticated, pushToast])
 
+  const refreshAuthStatus = useCallback(async () => {
+    const status = await webRingWatchApi.getAuthStatus()
+    setAuthStatus(status)
+    if (!status.authEnabled || status.authenticated) {
+      await loadBootstrap()
+    }
+  }, [loadBootstrap])
+
   const login = useCallback(
-    async (password: string) => {
-      const res = await webRingWatchApi.login(password)
+    async (password: string, username?: string) => {
+      const res = await webRingWatchApi.login(password, username)
       if (res.ok) {
-        const status = await webRingWatchApi.getAuthStatus()
-        setAuthStatus(status)
-        await loadBootstrap()
+        await refreshAuthStatus()
       }
       return res
     },
-    [loadBootstrap],
+    [refreshAuthStatus],
+  )
+
+  const loginWithPasskey = useCallback(
+    async (username?: string): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        const { challengeId, options } =
+          await webRingWatchApi.getPasskeyLoginOptions(username)
+        const assertion = await startAuthentication({
+          optionsJSON: options as unknown as PublicKeyCredentialRequestOptionsJSON,
+        })
+        const verified = await webRingWatchApi.verifyPasskeyLogin({
+          challengeId,
+          response: assertion,
+        })
+        if (verified.ok) {
+          await refreshAuthStatus()
+        }
+        return verified
+      } catch (err) {
+        return {
+          ok: false,
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Passkey sign-in was cancelled or failed.',
+        }
+      }
+    },
+    [refreshAuthStatus],
+  )
+
+  const registerPasskey = useCallback(
+    async (name: string): Promise<{ ok: boolean; error?: string }> => {
+      try {
+        const { challengeId, options } =
+          await webRingWatchApi.getPasskeyRegisterOptions()
+        const attestation = await startRegistration({
+          optionsJSON: options as unknown as PublicKeyCredentialCreationOptionsJSON,
+        })
+        const verified = await webRingWatchApi.verifyPasskeyRegister({
+          challengeId,
+          name,
+          response: attestation,
+        })
+        if (verified.ok) {
+          await refreshAuthStatus()
+        }
+        return verified
+      } catch (err) {
+        return {
+          ok: false,
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Passkey registration was cancelled or failed.',
+        }
+      }
+    },
+    [refreshAuthStatus],
   )
 
   const logout = useCallback(async () => {
@@ -304,11 +379,20 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     [],
   )
 
+  const can = useCallback(
+    (perm: Permission) => hasPermission(authStatus.permissions, perm),
+    [authStatus.permissions],
+  )
+
   return {
     api: webRingWatchApi,
     loading,
     authStatus,
+    can,
+    refreshAuthStatus,
     login,
+    loginWithPasskey,
+    registerPasskey,
     logout,
     setAuthPassword,
     connection,

@@ -145,11 +145,15 @@ export const sseHub = new SseHub()
 
 export const webRingWatchApi: RingWatchApi = {
   getAuthStatus: () => apiJson<AuthStatus>('/api/auth/status'),
-  login: async (password: string) => {
+  login: async (password: string, username?: string) => {
     try {
-      const res = await apiJson<{ ok: boolean; error?: string }>('/api/auth/login', {
+      const res = await apiJson<{
+        ok: boolean
+        error?: string
+        user?: import('@shared/types').PublicUser
+      }>('/api/auth/login', {
         method: 'POST',
-        body: { password },
+        body: { password, username },
       })
       if (res.ok) sseHub.reconnect()
       return res
@@ -177,6 +181,103 @@ export const webRingWatchApi: RingWatchApi = {
         error: err instanceof Error ? err.message : 'Failed to update password',
       }
     }
+  },
+  changeMyPassword: async (params) => {
+    try {
+      return await apiJson<{ ok: boolean; error?: string }>(
+        '/api/auth/change-password',
+        { method: 'POST', body: params },
+      )
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed to change password',
+      }
+    }
+  },
+
+  getPasskeyLoginOptions: (username?: string) =>
+    apiJson<{ challengeId: string; options: Record<string, unknown> }>(
+      '/api/auth/passkey/login-options',
+      { method: 'POST', body: { username } },
+    ),
+  verifyPasskeyLogin: async (params) => {
+    try {
+      const res = await apiJson<{
+        ok: boolean
+        error?: string
+        user?: import('@shared/types').PublicUser
+      }>('/api/auth/passkey/login-verify', {
+        method: 'POST',
+        body: params,
+      })
+      if (res.ok) sseHub.reconnect()
+      return res
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Passkey sign-in failed',
+      }
+    }
+  },
+  getPasskeyRegisterOptions: () =>
+    apiJson<{ challengeId: string; options: Record<string, unknown> }>(
+      '/api/auth/passkey/register-options',
+      { method: 'POST' },
+    ),
+  verifyPasskeyRegister: async (params) => {
+    try {
+      return await apiJson<{
+        ok: boolean
+        error?: string
+        passkey?: import('@shared/types').PasskeySummary
+      }>('/api/auth/passkey/register-verify', {
+        method: 'POST',
+        body: params,
+      })
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Passkey registration failed',
+      }
+    }
+  },
+  deleteMyPasskey: async (credentialId: string) => {
+    try {
+      return await apiJson<{ ok: boolean; error?: string }>(
+        `/api/auth/passkeys/${encodeURIComponent(credentialId)}`,
+        { method: 'DELETE' },
+      )
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed to remove passkey',
+      }
+    }
+  },
+
+  listUsers: () =>
+    apiJson<import('@shared/types').PublicUser[]>('/api/users'),
+  createUser: (params) =>
+    apiJson<import('@shared/types').PublicUser>('/api/users', {
+      method: 'POST',
+      body: params,
+    }),
+  updateUser: (userId, patch) =>
+    apiJson<import('@shared/types').PublicUser>(
+      `/api/users/${encodeURIComponent(userId)}`,
+      { method: 'PATCH', body: patch },
+    ),
+  deleteUser: async (userId) => {
+    await apiJson(`/api/users/${encodeURIComponent(userId)}`, {
+      method: 'DELETE',
+    })
+  },
+  revokeUserPasskey: async (userId, credentialId) => {
+    await apiJson(
+      `/api/users/${encodeURIComponent(userId)}/passkeys/${encodeURIComponent(credentialId)}`,
+      { method: 'DELETE' },
+    )
   },
 
   getBootstrap: () => apiJson<RingWatchBootstrap>('/api/bootstrap'),

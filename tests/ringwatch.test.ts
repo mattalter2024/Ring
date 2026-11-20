@@ -1935,10 +1935,12 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
       // 2. Open mode by default (no password set) -> authEnabled: false, /api/bootstrap allowed
       const authStatusRes = await fetch(`${base}/api/auth/status`)
       expect(authStatusRes.status).toBe(200)
-      expect(await authStatusRes.json()).toEqual({
+      expect(await authStatusRes.json()).toMatchObject({
         authEnabled: false,
         authenticated: true,
         managedByEnv: false,
+        hasUsers: false,
+        currentUser: null,
       })
 
       const bootRes = await fetch(`${base}/api/bootstrap`)
@@ -2128,6 +2130,212 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
     expect(winLabels.isMac).toBe(false)
     expect(winLabels.fileManagerName).toBe('Explorer')
     expect(winLabels.shortcutModifier).toBe('Ctrl')
+  })
+
+  it('enforces multi-user accounts, RBAC roles/custom permissions, live session revocation, and WebAuthn Passkey challenges', async () => {
+    const recDir = path.join(tmpDir, 'recordings')
+    const webDir = path.join(tmpDir, 'web-dist')
+    fs.mkdirSync(webDir, { recursive: true })
+    fs.writeFileSync(path.join(webDir, 'index.html'), '<html>RingWatch</html>', 'utf-8')
+
+    const preStore = new ConfigStore(tmpDir, recDir)
+    preStore.updateSettings({ continuousAutoStart: false })
+
+    const server = new RingWatchServer({
+      dataDir: tmpDir,
+      defaultRecordingsDir: recDir,
+      webDistDir: webDir,
+      demoAssetsDir: path.resolve(process.cwd(), 'public', 'demo'),
+      host: '127.0.0.1',
+      port: 0,
+    })
+
+    const { port } = await server.start()
+    const base = `http://127.0.0.1:${port}`
+
+    try {
+      // Seed a fake MP4 to test media RBAC
+      fs.mkdirSync(recDir, { recursive: true })
+      fs.writeFileSync(path.join(recDir, 'rbac_clip.mp4'), Buffer.alloc(2048, 0x33))
+      const mediaUrl = server.streamService.getRecordingPlaybackUrl('rbac_clip.mp4')
+
+      // 1. First user created must be Admin and automatically sets an authenticated session cookie
+      const badFirst = await fetch(`${base}/api/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'viewer1',
+          displayName: 'Viewer',
+          role: 'viewer',
+          password: 'password123',
+        }),
+      })
+      expect(badFirst.status).toBe(400)
+      await badFirst.text()
+
+      const adminCreate = await fetch(`${base}/api/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'matt',
+          displayName: 'Matt Admin',
+          role: 'admin',
+          password: 'admin-password',
+        }),
+      })
+      expect(adminCreate.status).toBe(201)
+      const adminUser = (await adminCreate.json()) as { id: string; role: string }
+      expect(adminUser.role).toBe('admin')
+      const adminCookie = (adminCreate.headers.get('set-cookie') ?? '').split(';')[0]
+      expect(adminCookie).toContain('ringwatch_session=')
+
+      // 2. Unauthenticated requests are now blocked (401)
+      const unauth = await fetch(`${base}/api/bootstrap`)
+      expect(unauth.status).toBe(401)
+      await unauth.text()
+
+      // 3. Admin creates a Guest (live-only) and a Custom-permission user
+      const guestCreate = await fetch(`${base}/api/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+        body: JSON.stringify({
+          username: 'guest1',
+          displayName: 'House Guest',
+          role: 'guest',
+          password: 'guest-password',
+        }),
+      })
+      expect(guestCreate.status).toBe(201)
+      const guestUser = (await guestCreate.json()) as { id: string; permissions: string[] }
+      expect(guestUser.permissions).toEqual(['cameras:view', 'ai:view'])
+
+      const customCreate = await fetch(`${base}/api/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+        body: JSON.stringify({
+          username: 'deliverybot',
+          displayName: 'Delivery Monitor',
+          role: 'custom',
+          customPermissions: ['cameras:view', 'ai:view', 'ai:manage'],
+          password: 'custom-password',
+        }),
+      })
+      expect(customCreate.status).toBe(201)
+      await customCreate.text()
+
+      // 4. Cannot demote or delete the last active Admin
+      const demoteAdmin = await fetch(`${base}/api/users/${adminUser.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+        body: JSON.stringify({ role: 'viewer' }),
+      })
+      expect(demoteAdmin.status).toBe(400)
+      await demoteAdmin.text()
+
+      // 5. Sign in as Guest and verify strict RBAC enforcement
+      const guestLogin = await fetch(`${base}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'guest1', password: 'guest-password' }),
+      })
+      expect(guestLogin.status).toBe(200)
+      await guestLogin.text()
+      const guestCookie = (guestLogin.headers.get('set-cookie') ?? '').split(';')[0]
+
+      // Guest can load bootstrap, but recordings & sensors are scrubbed empty
+      const guestBoot = await fetch(`${base}/api/bootstrap`, {
+        headers: { Cookie: guestCookie },
+      })
+      expect(guestBoot.status).toBe(200)
+      const guestBootJson = (await guestBoot.json()) as {
+        recordings: unknown[]
+        sensors: unknown[]
+      }
+      expect(guestBootJson.recordings).toEqual([])
+      expect(guestBootJson.sensors).toEqual([])
+
+      // Guest is blocked (403) from recordings, recording media, NVR, alarm, settings, logs, and users
+      expect((await fetch(`${base}/api/recordings`, { headers: { Cookie: guestCookie } })).status).toBe(403)
+      expect((await fetch(`${base}${mediaUrl}`, { headers: { Cookie: guestCookie } })).status).toBe(403)
+      expect((await fetch(`${base}/api/users`, { headers: { Cookie: guestCookie } })).status).toBe(403)
+      expect((await fetch(`${base}/api/logs`, { headers: { Cookie: guestCookie } })).status).toBe(403)
+      expect(
+        (
+          await fetch(`${base}/api/nvr/stop`, {
+            method: 'POST',
+            headers: { Cookie: guestCookie },
+          })
+        ).status,
+      ).toBe(403)
+
+      // 6. Custom user can trigger AI test alert (ai:manage) but is blocked (403) from recordings & users
+      const customLogin = await fetch(`${base}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'deliverybot', password: 'custom-password' }),
+      })
+      expect(customLogin.status).toBe(200)
+      await customLogin.text()
+      const customCookie = (customLogin.headers.get('set-cookie') ?? '').split(';')[0]
+
+      const customAiOk = await fetch(`${base}/api/ai/test-alert`, {
+        method: 'POST',
+        headers: { Cookie: customCookie },
+      })
+      expect(customAiOk.status).toBe(200)
+      await customAiOk.text()
+      expect((await fetch(`${base}/api/recordings`, { headers: { Cookie: customCookie } })).status).toBe(403)
+
+      // 7. Admin disabling Guest immediately invalidates Guest's live session cookie (401)
+      const disableGuest = await fetch(`${base}/api/users/${guestUser.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+        body: JSON.stringify({ disabled: true }),
+      })
+      expect(disableGuest.status).toBe(200)
+      await disableGuest.text()
+
+      const guestRevoked = await fetch(`${base}/api/bootstrap`, {
+        headers: { Cookie: guestCookie },
+      })
+      expect(guestRevoked.status).toBe(401)
+      await guestRevoked.text()
+
+      // 8. WebAuthn Passkey registration options generate valid FIDO2 challenge & reject bogus attestation
+      const regOptsRes = await fetch(`${base}/api/auth/passkey/register-options`, {
+        method: 'POST',
+        headers: {
+          Cookie: adminCookie,
+          Origin: `http://localhost:${port}`,
+        },
+      })
+      expect(regOptsRes.status).toBe(200)
+      const regOpts = (await regOptsRes.json()) as {
+        challengeId: string
+        options: { challenge: string; rp: { id: string }; user: { name: string } }
+      }
+      expect(regOpts.challengeId).toBeTruthy()
+      expect(regOpts.options.challenge).toBeTruthy()
+      expect(regOpts.options.rp.id).toBe('localhost')
+      expect(regOpts.options.user.name).toBe('matt')
+
+      const badRegVerify = await fetch(`${base}/api/auth/passkey/register-verify`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: adminCookie,
+        },
+        body: JSON.stringify({
+          challengeId: regOpts.challengeId,
+          name: 'Fake Key',
+          response: { id: 'bad', rawId: 'bad', type: 'public-key', response: {} },
+        }),
+      })
+      expect(badRegVerify.status).toBe(400)
+      await badRegVerify.text()
+    } finally {
+      await server.stop()
+    }
   })
 })
 

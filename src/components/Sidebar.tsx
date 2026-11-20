@@ -2,13 +2,21 @@ import {
   Camera,
   Clock,
   Film,
+  Fingerprint,
   HardDrive,
+  LogOut,
   Package,
   Radio,
   Settings,
   Shield,
 } from 'lucide-react'
-import type { ConnectionStatus, NvrStatus, StorageStats } from '@shared/types'
+import { hasPermission, type Permission } from '@shared/rbac'
+import type {
+  AuthStatus,
+  ConnectionStatus,
+  NvrStatus,
+  StorageStats,
+} from '@shared/types'
 
 export type NavTab =
   | 'cameras'
@@ -17,6 +25,7 @@ export type NavTab =
   | 'recordings'
   | 'sensors'
   | 'package-ai'
+  | 'access'
   | 'settings'
 
 interface SidebarProps {
@@ -25,10 +34,12 @@ interface SidebarProps {
   connection: ConnectionStatus
   nvrStatus: NvrStatus
   storageStats: StorageStats
+  authStatus: AuthStatus
   streamingCount: number
   recordingsCount: number
   faultedSensorCount: number
   detectedPackagesCount: number
+  onLogout: () => Promise<void>
 }
 
 export function Sidebar({
@@ -37,10 +48,12 @@ export function Sidebar({
   connection,
   nvrStatus,
   storageStats,
+  authStatus,
   streamingCount,
   recordingsCount,
   faultedSensorCount,
   detectedPackagesCount,
+  onLogout,
 }: SidebarProps) {
   const nvrBadge = storageStats.usingFailover
     ? { text: 'FAILOVER', tone: 'alert' as const }
@@ -52,10 +65,11 @@ export function Sidebar({
           ? { text: '24/7', tone: 'live' as const }
           : undefined
 
-  const navItems: Array<{
+  const allNavItems: Array<{
     id: NavTab
     label: string
     icon: typeof Camera
+    requiredPerm?: Permission
     badge?: string
     badgeTone?: 'live' | 'alert'
   }> = [
@@ -63,6 +77,7 @@ export function Sidebar({
       id: 'cameras',
       label: 'Live Cameras',
       icon: Camera,
+      requiredPerm: 'cameras:view',
       badge: streamingCount > 0 ? `${streamingCount} LIVE` : undefined,
       badgeTone: 'live',
     },
@@ -70,17 +85,20 @@ export function Sidebar({
       id: 'timeline',
       label: 'Timeline',
       icon: Clock,
+      requiredPerm: 'recordings:view',
     },
     {
       id: 'recordings',
       label: 'Recordings',
       icon: Film,
+      requiredPerm: 'recordings:view',
       badge: recordingsCount > 0 ? String(recordingsCount) : undefined,
     },
     {
       id: 'nvr',
       label: 'NVR & Storage',
       icon: HardDrive,
+      requiredPerm: 'nvr:manage',
       badge: nvrBadge?.text,
       badgeTone: nvrBadge?.tone,
     },
@@ -88,6 +106,7 @@ export function Sidebar({
       id: 'package-ai',
       label: 'AI Packages',
       icon: Package,
+      requiredPerm: 'ai:view',
       badge: detectedPackagesCount > 0 ? String(detectedPackagesCount) : undefined,
       badgeTone: detectedPackagesCount > 0 ? 'alert' : undefined,
     },
@@ -95,15 +114,27 @@ export function Sidebar({
       id: 'sensors',
       label: 'Sensors',
       icon: Radio,
+      requiredPerm: 'sensors:view',
       badge: faultedSensorCount > 0 ? `${faultedSensorCount} OPEN` : undefined,
       badgeTone: 'alert',
+    },
+    {
+      id: 'access',
+      label: 'Access & Passkeys',
+      icon: Fingerprint,
     },
     {
       id: 'settings',
       label: 'Settings',
       icon: Settings,
+      requiredPerm: 'settings:manage',
     },
   ]
+
+  const navItems = allNavItems.filter(
+    (item) =>
+      !item.requiredPerm || hasPermission(authStatus.permissions, item.requiredPerm),
+  )
 
   const statusDotClass = !connection.connected
     ? 'err'
@@ -148,6 +179,44 @@ export function Sidebar({
       </nav>
 
       <div className="sidebar-footer">
+        {authStatus.currentUser && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 6,
+              paddingBottom: 8,
+              marginBottom: 8,
+              borderBottom: '1px solid var(--border-subtle)',
+            }}
+          >
+            <div style={{ minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: 12,
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}
+              >
+                {authStatus.currentUser.displayName}
+              </div>
+              <div style={{ fontSize: 10.5, color: 'var(--text-muted)', textTransform: 'capitalize' }}>
+                {authStatus.currentUser.role} role
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn btn-icon"
+              title="Sign out"
+              onClick={() => void onLogout()}
+            >
+              <LogOut size={13} />
+            </button>
+          </div>
+        )}
         <div className="connection-row">
           <span className={`status-dot ${statusDotClass}`} />
           <span>

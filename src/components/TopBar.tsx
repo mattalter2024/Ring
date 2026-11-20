@@ -57,6 +57,10 @@ const TAB_COPY: Record<NavTab, { title: string; subtitle: string }> = {
     title: 'Sensors',
     subtitle: 'Ring Alarm mode, sensors, and activity',
   },
+  access: {
+    title: 'Access & Passkeys',
+    subtitle: 'Passkey sign-in, user accounts, and RBAC permission sets',
+  },
   settings: {
     title: 'Settings',
     subtitle: 'Ring account, Vision AI, and app preferences',

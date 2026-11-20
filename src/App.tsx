@@ -17,6 +17,7 @@ import { RecordingsView } from '@/components/RecordingsView'
 import { SensorsView } from '@/components/SensorsView'
 import { PackageAiView } from '@/components/PackageAiView'
 import { SettingsView } from '@/components/SettingsView'
+import { UsersAccessView } from '@/components/UsersAccessView'
 import { LoginGate } from '@/components/LoginGate'
 import { playAlertChime } from '@/utils/audioChime'
 import { formatBytes } from '@/utils/format'
@@ -44,7 +45,11 @@ export function App() {
     api,
     loading,
     authStatus,
+    can,
+    refreshAuthStatus,
     login,
+    loginWithPasskey,
+    registerPasskey,
     logout,
     setAuthPassword,
     connection,
@@ -904,13 +909,40 @@ export function App() {
     }
   }
 
+  useEffect(() => {
+    const tabPerm: Partial<Record<NavTab, Parameters<typeof can>[0]>> = {
+      cameras: 'cameras:view',
+      timeline: 'recordings:view',
+      recordings: 'recordings:view',
+      nvr: 'nvr:manage',
+      'package-ai': 'ai:view',
+      sensors: 'sensors:view',
+      settings: 'settings:manage',
+    }
+    const reqPerm = tabPerm[activeTab]
+    if (reqPerm && !can(reqPerm)) {
+      const order: NavTab[] = ['cameras', 'timeline', 'recordings', 'package-ai', 'sensors', 'nvr', 'settings', 'access']
+      const allowed = order.find((t) => {
+        const p = tabPerm[t]
+        return !p || can(p)
+      })
+      setActiveTab(allowed ?? 'access')
+    }
+  }, [activeTab, can])
+
   const faultedSensorCount = sensors.filter((s) => s.faulted).length
   const detectedPackagesCount = packageDetections.filter(
     (d) => d.packageDetected,
   ).length
 
   if (!loading && authStatus.authEnabled && !authStatus.authenticated) {
-    return <LoginGate onLogin={login} />
+    return (
+      <LoginGate
+        hasUsers={authStatus.hasUsers}
+        onLogin={login}
+        onPasskeyLogin={loginWithPasskey}
+      />
+    )
   }
 
   return (
@@ -921,10 +953,12 @@ export function App() {
         connection={connection}
         nvrStatus={nvrStatus}
         storageStats={storageStats}
+        authStatus={authStatus}
         streamingCount={Object.keys(streamsByCamera).length}
         recordingsCount={recordings.length}
         faultedSensorCount={faultedSensorCount}
         detectedPackagesCount={detectedPackagesCount}
+        onLogout={logout}
       />
 
       <div className="workspace-column">
@@ -1069,6 +1103,15 @@ export function App() {
               }}
               onTestAlert={handleTestAlert}
               onGoToSettings={() => setActiveTab('settings')}
+            />
+          ) : activeTab === 'access' ? (
+            <UsersAccessView
+              api={api}
+              authStatus={authStatus}
+              onRefreshAuth={refreshAuthStatus}
+              onRegisterPasskey={registerPasskey}
+              onLogout={logout}
+              onToast={pushToast}
             />
           ) : (
             <SettingsView
