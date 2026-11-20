@@ -1637,6 +1637,51 @@ describe('Enhanced Delivery Detection (Baseline Diff, Ground Crop, Motion-End & 
     rmSpy.mockRestore()
     fs.rmSync(prepared.dirPath, { recursive: true, force: true })
   })
+
+  it('strips bloated base64 thumbnails from continuous NVR segments and avoids per-call fs.existsSync scans in listRecordings', () => {
+    const recDir = path.join(tmpDir, 'perf-vault')
+    fs.mkdirSync(recDir, { recursive: true })
+    const segPath = path.join(recDir, 'front_continuous_2026-01-01_0001.mp4')
+    fs.writeFileSync(segPath, Buffer.alloc(8192, 0x00))
+
+    // Seed a legacy bloated index containing a 100KB base64 thumbnail on a continuous clip
+    const bloatedThumb = `data:image/jpeg;base64,${'A'.repeat(100_000)}`
+    fs.writeFileSync(
+      path.join(tmpDir, 'recordings-index.json'),
+      JSON.stringify([
+        {
+          id: 'legacy-seg-1',
+          cameraId: 'cam-1',
+          cameraName: 'Front',
+          filePath: segPath,
+          fileName: path.basename(segPath),
+          createdAt: new Date().toISOString(),
+          durationSeconds: 120,
+          sizeBytes: 8192,
+          trigger: 'continuous',
+          starred: false,
+          thumbnailDataUrl: bloatedThumb,
+        },
+      ]),
+      'utf-8',
+    )
+
+    const store = new ConfigStore(tmpDir, recDir)
+    const streamService = new StreamService(() => recDir)
+    const recService = new RecordingService(tmpDir, store, streamService)
+
+    const existsSpy = vi.spyOn(fs, 'existsSync')
+    const listed = recService.listRecordings()
+    expect(listed).toHaveLength(1)
+    expect(listed[0].thumbnailDataUrl).toBeUndefined()
+    // listRecordings() must NOT hammer disk with fs.existsSync on every call
+    expect(existsSpy).not.toHaveBeenCalled()
+    existsSpy.mockRestore()
+
+    recService.flushIndexSync()
+    const savedRaw = fs.readFileSync(path.join(tmpDir, 'recordings-index.json'), 'utf-8')
+    expect(savedRaw.length).toBeLessThan(1000)
+  })
 })
 
 

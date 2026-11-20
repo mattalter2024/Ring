@@ -208,9 +208,14 @@ export class RingService implements SnapshotSource {
     }
   }
 
+  private saveEventsTimer: NodeJS.Timeout | null = null
+
   private saveEventsToDisk(): void {
     if (!this.eventsLogPath) return
-    try {
+    if (this.saveEventsTimer) return
+    this.saveEventsTimer = setTimeout(() => {
+      this.saveEventsTimer = null
+      if (!this.eventsLogPath) return
       // Omit large inline base64 snapshots when persisting to keep events-log.json fast and compact
       const slim = this.events.slice(0, 500).map((ev) => {
         if (ev.snapshotDataUrl && ev.snapshotDataUrl.startsWith('data:')) {
@@ -219,9 +224,14 @@ export class RingService implements SnapshotSource {
         }
         return ev
       })
-      fs.writeFileSync(this.eventsLogPath, JSON.stringify(slim, null, 2), 'utf-8')
-    } catch {
-      // Ignore write failures
+      void fs.promises
+        .writeFile(this.eventsLogPath, JSON.stringify(slim), 'utf-8')
+        .catch(() => {
+          // Ignore transient write failures
+        })
+    }, 500)
+    if (typeof this.saveEventsTimer.unref === 'function') {
+      this.saveEventsTimer.unref()
     }
   }
 
@@ -1315,6 +1325,20 @@ export class RingService implements SnapshotSource {
     this.subscriptions.push(
       cam.onData.subscribe(() => {
         const updated = this.mapLiveCamera(cam, locationId, locationName)
+        const prev = this.cameras.find((c) => c.id === camId)
+        if (
+          prev &&
+          prev.name === updated.name &&
+          prev.online === updated.online &&
+          prev.batteryPercent === updated.batteryPercent &&
+          prev.rssi === updated.rssi &&
+          prev.lightOn === updated.lightOn &&
+          prev.sirenOn === updated.sirenOn &&
+          prev.isStreaming === updated.isStreaming &&
+          prev.isRecording === updated.isRecording
+        ) {
+          return
+        }
         this.cameras = this.cameras.map((c) => (c.id === camId ? updated : c))
         this.callbacks.onCamerasUpdated(this.getCameras())
       }),
@@ -2414,9 +2438,6 @@ export class RingService implements SnapshotSource {
             sessionStartMs + Math.max(0, startSec) * 1000,
           ).toISOString()
           const duration = Math.max(1, Math.round(endSec - startSec))
-          const thumb =
-            this.snapshotCache.get(worker.cameraId)?.dataUrl ??
-            camInfo.lastSnapshotDataUrl
 
           const saved = this.recordingService.registerRecordedSegment({
             cameraId: worker.cameraId,
@@ -2425,7 +2446,6 @@ export class RingService implements SnapshotSource {
             createdAt,
             durationSeconds: duration,
             trigger: 'continuous',
-            thumbnailDataUrl: thumb,
           })
 
           indexedFiles.add(key)
@@ -2474,9 +2494,6 @@ export class RingService implements SnapshotSource {
               2,
               Math.min(segmentSeconds, Math.round((Date.now() - estStartMs) / 1000)),
             )
-            const thumb =
-              this.snapshotCache.get(worker.cameraId)?.dataUrl ??
-              camInfo.lastSnapshotDataUrl
 
             const saved = this.recordingService.registerRecordedSegment({
               cameraId: worker.cameraId,
@@ -2485,7 +2502,6 @@ export class RingService implements SnapshotSource {
               createdAt: new Date(estStartMs).toISOString(),
               durationSeconds: estDur,
               trigger: 'continuous',
-              thumbnailDataUrl: thumb,
             })
             indexedFiles.add(key)
             if (saved) {

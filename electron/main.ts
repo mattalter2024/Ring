@@ -186,12 +186,18 @@ function createTray(): void {
   rebuildTrayMenu()
 }
 
-function rebuildTrayMenu(): void {
+let lastTrayRebuildMs = 0
+
+function rebuildTrayMenu(precomputedStats?: import('../shared/types').StorageStats): void {
   if (!tray) return
+  const now = Date.now()
+  if (precomputedStats && now - lastTrayRebuildMs < 2000) return
+  lastTrayRebuildMs = now
+
   const aiEnabled = configStore.getPublicSettings().packageAi.enabled
   const nvr = ringService?.getNvrStatus()
   const nvrActive = nvr?.active ?? false
-  const stats = recordingService?.getStorageStats()
+  const stats = precomputedStats ?? recordingService?.getStorageStats()
   const freeGb =
     stats?.freeDiskBytes !== null && stats?.freeDiskBytes !== undefined
       ? `${(stats.freeDiskBytes / (1024 * 1024 * 1024)).toFixed(1)} GB free`
@@ -706,8 +712,6 @@ if (!singleInstanceLock) {
       configStore,
       streamService,
     )
-    recordingService.rescanDirectory()
-    recordingService.enforceRetentionAndQuota()
 
     notificationService = new NotificationService(
       resolveIconPath(),
@@ -764,21 +768,42 @@ if (!singleInstanceLock) {
           sendToRenderer('ringwatch:recordings-updated', recordings),
         onStorageStatsUpdated: (stats) => {
           sendToRenderer('ringwatch:storage-stats-updated', stats)
-          rebuildTrayMenu()
+          rebuildTrayMenu(stats)
         },
       },
     })
 
     registerIpcHandlers()
-    await ringService.initialize()
+    await streamService.startServer()
+    // Open window immediately so startup feels instantaneous instead of waiting on Ring cloud & disk scan
     createMainWindow()
     createTray()
+
+    // Run Ring cloud connection and disk vault reconciliation in the background
+    void (async () => {
+      try {
+        await ringService.initialize()
+      } catch (err) {
+        console.warn('[RingWatch] Background Ring initialization error:', err)
+      }
+      setTimeout(() => {
+        try {
+          const rescanned = recordingService.rescanDirectory()
+          const pruned = recordingService.enforceRetentionAndQuota()
+          sendToRenderer('ringwatch:recordings-updated', recordingService.listRecordings())
+          sendToRenderer('ringwatch:storage-stats-updated', pruned.stats ?? rescanned.stats)
+        } catch {
+          // ignore background rescan error
+        }
+      }, 1500)
+    })()
   })
 
   app.on('before-quit', () => {
     isQuitting = true
     setPowerSaveBlock(false)
     ringService?.shutdown()
+    recordingService?.flushIndexSync()
   })
 
   app.on('window-all-closed', () => {

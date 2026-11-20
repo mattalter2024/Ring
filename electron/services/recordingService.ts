@@ -44,6 +44,12 @@ export class RecordingService {
   private readonly configStore: ConfigStore
   private readonly streamService: StreamService
   private recordings: LocalRecordingItem[] = []
+  private recordingsById = new Map<string, LocalRecordingItem>()
+  private recordingsByPath = new Map<string, LocalRecordingItem>()
+  private statsCache: { stats: StorageStats; computedAtMs: number; settingsKey: string } | null =
+    null
+  private saveIndexTimer: NodeJS.Timeout | null = null
+  private saveIndexDirty = false
 
   constructor(
     userDataDir: string,
@@ -54,6 +60,7 @@ export class RecordingService {
     this.configStore = configStore
     this.streamService = streamService
     this.recordings = this.loadIndex()
+    this.rebuildLookupMaps()
     this.streamService.setRecordingPathResolver((id) => this.getRecordingById(id)?.filePath)
   }
 
@@ -369,29 +376,106 @@ export class RecordingService {
     return drives
   }
 
+  private rebuildLookupMaps(): void {
+    this.recordingsById.clear()
+    this.recordingsByPath.clear()
+    for (const r of this.recordings) {
+      this.recordingsById.set(r.id, r)
+      this.recordingsByPath.set(path.resolve(r.filePath).toLowerCase(), r)
+    }
+    this.statsCache = null
+  }
+
+  private sortRecordingsDesc(): void {
+    this.recordings.sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    )
+  }
+
+  private stripExcessThumbnails(items: LocalRecordingItem[]): {
+    cleaned: LocalRecordingItem[]
+    strippedAny: boolean
+  } {
+    let strippedAny = false
+    let keptEventThumbs = 0
+    const cleaned = items.map((item) => {
+      if (!item.thumbnailDataUrl) return item
+      // Continuous 24/7 NVR clips reuse the camera's live snapshot in the UI;
+      // storing a 200KB base64 JPEG on every 2-minute segment bloats RAM/IPC/JSON to 100s of MB.
+      if (item.trigger === 'continuous') {
+        strippedAny = true
+        const { thumbnailDataUrl: _drop, ...rest } = item
+        return rest
+      }
+      if (keptEventThumbs >= 60) {
+        strippedAny = true
+        const { thumbnailDataUrl: _drop, ...rest } = item
+        return rest
+      }
+      keptEventThumbs++
+      return item
+    })
+    return { cleaned, strippedAny }
+  }
+
   private loadIndex(): LocalRecordingItem[] {
     if (!fs.existsSync(this.indexPath)) return []
     try {
       const parsed = JSON.parse(fs.readFileSync(this.indexPath, 'utf-8'))
       if (!Array.isArray(parsed)) return []
-      return parsed.filter(
+      const existing = parsed.filter(
         (item: LocalRecordingItem) =>
           Boolean(item?.filePath) && fs.existsSync(item.filePath),
       )
+      existing.sort(
+        (a: LocalRecordingItem, b: LocalRecordingItem) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      )
+      const { cleaned, strippedAny } = this.stripExcessThumbnails(existing)
+      if (strippedAny) {
+        // Immediately shrink bloated legacy recordings-index.json in background
+        this.saveIndexDirty = true
+        this.scheduleAsyncIndexSave(100)
+      }
+      return cleaned
     } catch {
       return []
     }
   }
 
+  private scheduleAsyncIndexSave(delayMs = 600): void {
+    if (this.saveIndexTimer) return
+    this.saveIndexTimer = setTimeout(() => {
+      this.saveIndexTimer = null
+      if (!this.saveIndexDirty) return
+      this.saveIndexDirty = false
+      const serialized = JSON.stringify(this.recordings)
+      void fs.promises.writeFile(this.indexPath, serialized, 'utf-8').catch(() => {
+        // Ignore transient write failures
+      })
+    }, delayMs)
+    if (typeof this.saveIndexTimer.unref === 'function') {
+      this.saveIndexTimer.unref()
+    }
+  }
+
   private saveIndex(): void {
+    this.rebuildLookupMaps()
+    this.saveIndexDirty = true
+    this.scheduleAsyncIndexSave(500)
+  }
+
+  flushIndexSync(): void {
+    if (this.saveIndexTimer) {
+      clearTimeout(this.saveIndexTimer)
+      this.saveIndexTimer = null
+    }
+    if (!this.saveIndexDirty) return
+    this.saveIndexDirty = false
     try {
-      fs.writeFileSync(
-        this.indexPath,
-        JSON.stringify(this.recordings, null, 2),
-        'utf-8',
-      )
+      fs.writeFileSync(this.indexPath, JSON.stringify(this.recordings), 'utf-8')
     } catch {
-      // Ignore write failures
+      // Ignore write failures during shutdown
     }
   }
 
@@ -407,30 +491,34 @@ export class RecordingService {
   }
 
   listRecordings(): LocalRecordingItem[] {
-    this.recordings = this.recordings
-      .filter((r) => fs.existsSync(r.filePath))
-      .sort(
-        (a, b) =>
-          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
-      )
     return this.withPlaybackUrls(this.recordings)
   }
 
   getRecordingById(id: string): LocalRecordingItem | undefined {
-    return this.recordings.find((r) => r.id === id)
+    return this.recordingsById.get(id)
   }
 
   getStorageStats(overrideFreeDiskBytes?: number): StorageStats {
     const settings = this.configStore.getPublicSettings()
+    const settingsKey = `${settings.recordingsDir}|${settings.failoverRecordingsDir}|${settings.maxStorageGb}|${settings.retentionDays}|${settings.lowDiskWarningGb}|${settings.minFreeDiskGb}`
+    const nowMs = Date.now()
+    if (
+      overrideFreeDiskBytes === undefined &&
+      this.statsCache &&
+      this.statsCache.settingsKey === settingsKey &&
+      nowMs - this.statsCache.computedAtMs < 2000
+    ) {
+      return this.statsCache.stats
+    }
+
     const resolved = this.resolveActiveStorageDir()
-    const active = this.listRecordings()
+    const active = this.recordings
 
     let totalBytes = 0
     let protectedBytes = 0
     let starredClips = 0
     const cameraMap = new Map<string, CameraStorageUsage>()
 
-    const nowMs = Date.now()
     const recentCutoffMs = nowMs - 24 * 60 * 60 * 1000
     let recentBytes = 0
     let oldestRecentMs = nowMs
@@ -521,7 +609,7 @@ export class RecordingService {
       (a, b) => b.totalBytes - a.totalBytes,
     )
 
-    return {
+    const result: StorageStats = {
       recordingsDir: settings.recordingsDir,
       activeRecordingsDir: resolved.activeDir,
       failoverRecordingsDir: settings.failoverRecordingsDir,
@@ -544,6 +632,11 @@ export class RecordingService {
       newestClipAt: active.length > 0 ? active[0].createdAt : undefined,
       perCameraUsage,
     }
+
+    if (overrideFreeDiskBytes === undefined) {
+      this.statsCache = { stats: result, computedAtMs: nowMs, settingsKey }
+    }
+    return result
   }
 
   toggleStar(id: string): LocalRecordingItem {
@@ -995,9 +1088,7 @@ export class RecordingService {
     if (stat.size < 2048) return null
 
     const normalizedPath = path.resolve(params.filePath).toLowerCase()
-    const existing = this.recordings.find(
-      (r) => path.resolve(r.filePath).toLowerCase() === normalizedPath,
-    )
+    const existing = this.recordingsByPath.get(normalizedPath)
     if (existing) {
       return {
         ...existing,
@@ -1018,14 +1109,14 @@ export class RecordingService {
       sizeBytes: stat.size,
       trigger: params.trigger,
       starred: false,
-      thumbnailDataUrl: params.thumbnailDataUrl,
+      ...(params.trigger !== 'continuous' && params.thumbnailDataUrl
+        ? { thumbnailDataUrl: params.thumbnailDataUrl }
+        : {}),
       playbackUrl: this.buildPlaybackUrl({ id, fileName }),
     }
 
     this.recordings.unshift(item)
-    this.recordings.sort(
-      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
-    )
+    this.sortRecordingsDesc()
     this.saveIndex()
     this.enforceRetentionAndQuota(undefined, undefined, item.id)
     return item

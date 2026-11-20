@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   CloudDownload,
   Download,
@@ -62,11 +62,16 @@ export function RecordingsView({
   )
   const [filterCameraId, setFilterCameraId] = useState<string>('all')
   const [starredOnly, setStarredOnly] = useState(false)
+  const [visibleLimit, setVisibleLimit] = useState(60)
   const [cloudCameraId, setCloudCameraId] = useState<string>(cameras[0]?.id ?? '')
   const [cloudItems, setCloudItems] = useState<CloudRecordingItem[]>([])
   const [loadingCloud, setLoadingCloud] = useState(false)
   const [downloadingId, setDownloadingId] = useState<string | null>(null)
   const [capturing, setCapturing] = useState(false)
+
+  useEffect(() => {
+    setVisibleLimit(60)
+  }, [filterCameraId, starredOnly])
 
   useEffect(() => {
     if (!cloudCameraId && cameras[0]?.id) {
@@ -98,11 +103,28 @@ export function RecordingsView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, cloudCameraId])
 
-  const filteredLocal = recordings.filter((r) => {
-    if (filterCameraId !== 'all' && r.cameraId !== filterCameraId) return false
-    if (starredOnly && !r.starred) return false
-    return true
-  })
+  const cameraSnapshotById = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const c of cameras) {
+      if (c.lastSnapshotDataUrl) map.set(c.id, c.lastSnapshotDataUrl)
+    }
+    return map
+  }, [cameras])
+
+  const filteredLocal = useMemo(
+    () =>
+      recordings.filter((r) => {
+        if (filterCameraId !== 'all' && r.cameraId !== filterCameraId) return false
+        if (starredOnly && !r.starred) return false
+        return true
+      }),
+    [recordings, filterCameraId, starredOnly],
+  )
+
+  const visibleLocal = useMemo(
+    () => filteredLocal.slice(0, visibleLimit),
+    [filteredLocal, visibleLimit],
+  )
 
   const selectedLocal =
     filteredLocal.find((r) => r.id === selectedLocalId) ?? filteredLocal[0] ?? null
@@ -257,7 +279,10 @@ export function RecordingsView({
               </div>
             ) : (
               <div className="recording-list">
-                {filteredLocal.map((rec) => (
+                {visibleLocal.map((rec) => {
+                  const thumbSrc =
+                    rec.thumbnailDataUrl || cameraSnapshotById.get(rec.cameraId)
+                  return (
                   <div
                     key={rec.id}
                     className={`recording-row ${
@@ -265,10 +290,12 @@ export function RecordingsView({
                     }`}
                     onClick={() => setSelectedLocalId(rec.id)}
                   >
-                    {rec.thumbnailDataUrl ? (
+                    {thumbSrc ? (
                       <img
-                        src={rec.thumbnailDataUrl}
+                        src={thumbSrc}
                         alt={rec.cameraName}
+                        loading="lazy"
+                        decoding="async"
                         className="recording-thumb"
                       />
                     ) : (
@@ -366,7 +393,18 @@ export function RecordingsView({
                       </button>
                     </div>
                   </div>
-                ))}
+                  )
+                })}
+                {filteredLocal.length > visibleLocal.length && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    style={{ width: '100%', justifyContent: 'center', marginTop: 4 }}
+                    onClick={() => setVisibleLimit((n) => n + 80)}
+                  >
+                    Show More ({filteredLocal.length - visibleLocal.length} remaining)
+                  </button>
+                )}
               </div>
             )}
           </div>

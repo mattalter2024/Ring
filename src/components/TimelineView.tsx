@@ -150,11 +150,21 @@ export function TimelineView({
   const clipSwitchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastReactSyncRef = useRef(0)
 
+  const [clipListLimit, setClipListLimit] = useState(80)
+
+  useEffect(() => {
+    setClipListLimit(80)
+  }, [dateKey, selectedCameraId, clipListScope])
+
   useEffect(() => {
     if (!nvrStatus.active) return
-    const timer = setInterval(() => setNowMs(Date.now()), 5000)
+    const timer = setInterval(() => {
+      if (!document.hidden && dateKey === toLocalDateKey(new Date())) {
+        setNowMs(Date.now())
+      }
+    }, 15_000)
     return () => clearInterval(timer)
-  }, [nvrStatus.active])
+  }, [nvrStatus.active, dateKey])
 
   const { startMs: dayStartMs, endMs: dayEndMs } = useMemo(
     () => getDayRangeMs(dateKey),
@@ -1384,34 +1394,46 @@ export function TimelineView({
                       : `No local clips on ${dateKey}.`}
                   </div>
                 ) : (
-                  displayedClipList.map((clip) => (
-                    <button
-                      key={clip.id}
-                      type="button"
-                      className={`mini-cam-item ${
-                        activeClip?.id === clip.id ? 'selected' : ''
-                      }`}
-                      onClick={() => selectClip(clip)}
-                    >
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div
-                          style={{
-                            fontWeight: 600,
-                            fontSize: 12.5,
-                            whiteSpace: 'nowrap',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                          }}
-                        >
-                          {clip.cameraName}
+                  <>
+                    {displayedClipList.slice(0, clipListLimit).map((clip) => (
+                      <button
+                        key={clip.id}
+                        type="button"
+                        className={`mini-cam-item ${
+                          activeClip?.id === clip.id ? 'selected' : ''
+                        }`}
+                        onClick={() => selectClip(clip)}
+                      >
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div
+                            style={{
+                              fontWeight: 600,
+                              fontSize: 12.5,
+                              whiteSpace: 'nowrap',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                            }}
+                          >
+                            {clip.cameraName}
+                          </div>
+                          <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                            {formatTimestamp(clip.createdAt)} · {formatDuration(clip.durationSeconds)}
+                          </div>
                         </div>
-                        <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                          {formatTimestamp(clip.createdAt)} · {formatDuration(clip.durationSeconds)}
-                        </div>
-                      </div>
-                      <span className="chip">{clip.trigger}</span>
-                    </button>
-                  ))
+                        <span className="chip">{clip.trigger}</span>
+                      </button>
+                    ))}
+                    {displayedClipList.length > clipListLimit && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        style={{ width: '100%', justifyContent: 'center', marginTop: 4 }}
+                        onClick={() => setClipListLimit((n) => n + 100)}
+                      >
+                        Show More ({displayedClipList.length - clipListLimit} remaining)
+                      </button>
+                    )}
+                  </>
                 )}
               </div>
             </div>

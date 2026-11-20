@@ -28,7 +28,6 @@ export function App() {
   const [autoLiveEnabled, setAutoLiveEnabled] = useState(true)
   const [connectingCameraIds, setConnectingCameraIds] = useState<Record<string, boolean>>({})
 
-  const [autoLiveTick, setAutoLiveTick] = useState(0)
   const connectingRef = useRef<Set<string>>(new Set())
   const manuallyStoppedRef = useRef<Set<string>>(new Set())
   const lastAutoFailRef = useRef<Record<string, number>>({})
@@ -208,67 +207,82 @@ export function App() {
     [streamsByCamera, startStreamInternal],
   )
 
-  // Periodic 5-second watchdog so any camera whose live stream dropped or failed retries automatically
-  useEffect(() => {
-    if (loading || activeTab !== 'cameras' || !autoLiveEnabled) return
-    const timer = setInterval(() => {
-      setAutoLiveTick((t) => t + 1)
-    }, 5000)
-    return () => clearInterval(timer)
-  }, [loading, activeTab, autoLiveEnabled])
+  // Keep latest live-stream state in refs so the 5-second watchdog never triggers idle React re-renders
+  const autoLiveStateRef = useRef({
+    cameras,
+    streamsByCamera,
+    nvrCameras: nvrStatus.cameras,
+    mode: connection.mode,
+  })
+  autoLiveStateRef.current = {
+    cameras,
+    streamsByCamera,
+    nvrCameras: nvrStatus.cameras,
+    mode: connection.mode,
+  }
 
-  // Automatically keep all online cameras streaming live when viewing the Live Cameras tab
-  useEffect(() => {
-    if (loading || activeTab !== 'cameras' || !autoLiveEnabled || cameras.length === 0) {
-      return
-    }
+  const ensureOnlineCamerasLive = useCallback(() => {
+    const {
+      cameras: currentCameras,
+      streamsByCamera: currentStreams,
+      nvrCameras,
+      mode,
+    } = autoLiveStateRef.current
+    if (currentCameras.length === 0) return
 
     const now = Date.now()
-    const eligible = cameras.filter((cam) => {
+    const eligible = currentCameras.filter((cam) => {
       if (!cam.online) return false
-      if (streamsByCamera[cam.id]) return false
+      if (currentStreams[cam.id]) return false
       if (connectingRef.current.has(cam.id)) return false
       if (manuallyStoppedRef.current.has(cam.id)) return false
-      const nvrRecording = nvrStatus.cameras[cam.id]?.state === 'recording'
+      const nvrRecording = nvrCameras[cam.id]?.state === 'recording'
       const lastFail = lastAutoFailRef.current[cam.id] ?? 0
       const failCount = failCountRef.current[cam.id] ?? 0
       const retryCooldownMs = Math.min(15_000, Math.max(5_000, failCount * 5_000))
-      // Attach immediately if NVR already has a live feed; otherwise retry after short backoff
       if (!nvrRecording && lastFail > 0 && now - lastFail < retryCooldownMs) return false
       return true
     })
 
     if (eligible.length === 0) return
 
-    const timers: Array<ReturnType<typeof setTimeout>> = []
     eligible.forEach((cam, idx) => {
-      const nvrRecording = nvrStatus.cameras[cam.id]?.state === 'recording'
-      const delayMs = connection.mode === 'demo' || nvrRecording ? 0 : idx * 250
+      const nvrRecording = nvrCameras[cam.id]?.state === 'recording'
+      const delayMs = mode === 'demo' || nvrRecording ? 0 : idx * 250
       if (delayMs === 0) {
         void startStreamInternal(cam.id, true)
       } else {
-        timers.push(
-          setTimeout(() => {
-            void startStreamInternal(cam.id, true)
-          }, delayMs),
-        )
+        setTimeout(() => {
+          void startStreamInternal(cam.id, true)
+        }, delayMs)
       }
     })
+  }, [startStreamInternal])
 
-    return () => {
-      for (const t of timers) clearTimeout(t)
-    }
+  // Trigger immediately when cameras, streams, or NVR status changes while viewing Live Cameras
+  useEffect(() => {
+    if (loading || activeTab !== 'cameras' || !autoLiveEnabled) return
+    ensureOnlineCamerasLive()
   }, [
     loading,
     activeTab,
     autoLiveEnabled,
-    autoLiveTick,
     cameras,
     streamsByCamera,
     nvrStatus.cameras,
-    connection.mode,
-    startStreamInternal,
+    ensureOnlineCamerasLive,
   ])
+
+  // Silent 5-second background watchdog with zero idle React re-renders
+  useEffect(() => {
+    if (loading || activeTab !== 'cameras' || !autoLiveEnabled) return
+    const timer = setInterval(() => {
+      if (!document.hidden) {
+        ensureOnlineCamerasLive()
+      }
+    }, 5000)
+    return () => clearInterval(timer)
+  }, [loading, activeTab, autoLiveEnabled, ensureOnlineCamerasLive])
 
   const handleCaptureRecording = async (
     cameraId: string,

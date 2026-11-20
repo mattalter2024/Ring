@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
 import { Loader2, Volume2, VolumeX } from 'lucide-react'
 import type { LiveStreamSession, RingCameraInfo } from '@shared/types'
@@ -10,7 +10,7 @@ interface LiveVideoPlayerProps {
   onStreamStalled?: (cameraId: string) => void
 }
 
-export function LiveVideoPlayer({
+export const LiveVideoPlayer = memo(function LiveVideoPlayer({
   camera,
   session,
   isConnecting = false,
@@ -76,8 +76,9 @@ export function LiveVideoPlayer({
           liveSyncDuration: 2,
           liveMaxLatencyDuration: 6,
           maxLiveSyncPlaybackRate: 1.35,
-          maxBufferLength: 10,
-          backBufferLength: 6,
+          maxBufferLength: 6,
+          maxMaxBufferLength: 10,
+          backBufferLength: 2,
           maxBufferHole: 1.0,
           fragLoadingMaxRetry: 6,
           fragLoadingRetryDelay: 500,
@@ -248,7 +249,15 @@ export function LiveVideoPlayer({
       rafId = requestAnimationFrame(draw)
     }
 
-    rafId = requestAnimationFrame(draw)
+    const guardedDraw = (now: number) => {
+      if (document.hidden) {
+        rafId = requestAnimationFrame(guardedDraw)
+        return
+      }
+      draw(now)
+    }
+
+    rafId = requestAnimationFrame(guardedDraw)
     return () => cancelAnimationFrame(rafId)
   }, [session, camera.lastSnapshotDataUrl, camera.demoImage, camera.name])
 
@@ -317,4 +326,4 @@ export function LiveVideoPlayer({
       )}
     </>
   )
-}
+})
