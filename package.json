@@ -1,6 +1,6 @@
 {
   "name": "ringwatch",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Standalone Node.js 24/7 NVR & AI Package Detection backend with modern React web frontend for Ring cameras and alarm sensors.",
   "main": "dist-server/server/index.js",
   "author": "RingWatch",

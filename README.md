@@ -55,7 +55,7 @@ Configure Ring account sign-in, encrypted Cloud Vision AI keys, browser desktop 
 - **24/7 Continuous Local NVR**: Records fragmented MP4 segments continuously to your local disk, external USB drive, or NAS with automatic failover, rolling quota/retention pruning, star-protected clips, and watchdog auto-recovery.
 - **Native Windows Service & Taskbar Tray Icon**: Runs headless 24/7 as `RingWatchNvrService` (`RingWatchService.exe`) with automatic boot startup and crash recovery, paired with a native system tray icon (`RingWatchTray.exe`) offering Green/Amber/Red status, Start/Stop/Restart without UAC prompts, Live Log Viewer, Verbose Debug toggle, and one-click Troubleshooting Log export.
 - **Cross-Platform Web UI (Windows & macOS)**: Native Apple SF typography & Safari HLS playback on macOS, Fluent/Segoe styling on Windows, smooth trackpad pinch-to-zoom & horizontal swipe on the Timeline, and installable PWA support.
-- **AI Package Detection**: Supports OpenAI Vision and Google Gemini Vision with illumination-normalized local NVR visual scene-change detection (so package detection triggers reliably even during continuous 24/7 streaming), two-stage motion follow-up scans, and automatic Gemini 503 failover.
+- **Cost-Optimized AI Package Detection**: Supports OpenAI Vision (`gpt-4.1-nano` / `gpt-4o-mini` / `gpt-4.1-mini` / `gpt-4o`) and Google Gemini Vision (with `thinkingBudget: 0` & automatic 503 failover) behind a **6-layer cost-saver pipeline**: `$0` local persistent-baseline frame gating, single settled scans, two-stage low-res triage → selective high-res confirm (`Economy` / `Balanced` / `High Accuracy`), per-camera motion throttle, already-present pause, daily auto-scan cap, active delivery hours, Ring non-person CV filtering, and live **AI Usage & Savings Today** telemetry.
 - **Multi-User Auth, Passkeys & RBAC**:
   - **Passkeys (WebAuthn / FIDO2)** + scrypt password sign-in with signed HTTP-only session cookies.
   - **4 Role Presets** (**Administrator**, **Home Operator**, **Read-Only Viewer**, **Guest Live Only**) plus **Custom Permission Sets** across 11 granular permissions enforced on every REST endpoint, media stream, and SSE event channel.
@@ -76,7 +76,7 @@ Configure Ring account sign-in, encrypted Cloud Vision AI keys, browser desktop 
 
 ### Option 1 — Windows Self-Contained Release Package (Recommended, No Node.js Required)
 
-1. Download **`RingWatch-Windows-Server-v2.0.0.zip`** from the [**Latest GitHub Release**](https://github.com/mattalter2024/Ring/releases/latest).
+1. Download **`RingWatch-Windows-Server-v2.1.0.zip`** from the [**Latest GitHub Release**](https://github.com/mattalter2024/Ring/releases/latest).
 2. Unzip it to a permanent folder (for example, `C:\RingWatch\`).
 3. **Install as a 24/7 Windows Service + Taskbar Tray Icon**:
    - Double-click **`install-windows-service.bat`** and approve the Administrator prompt.
@@ -90,11 +90,11 @@ Configure Ring account sign-in, encrypted Cloud Vision AI keys, browser desktop 
 
 ### Option 2 — macOS / Linux / Cross-Platform Release Package (Node.js 20+ / 24 LTS)
 
-1. Download **`RingWatch-CrossPlatform-v2.0.0.tar.gz`** from the [**Latest GitHub Release**](https://github.com/mattalter2024/Ring/releases/latest) (or clone this repo).
+1. Download **`RingWatch-CrossPlatform-v2.1.0.tar.gz`** from the [**Latest GitHub Release**](https://github.com/mattalter2024/Ring/releases/latest) (or clone this repo).
 2. Extract and start:
 
 ```bash
-tar -xzf RingWatch-CrossPlatform-v2.0.0.tar.gz
+tar -xzf RingWatch-CrossPlatform-v2.1.0.tar.gz
 cd RingWatch-CrossPlatform
 npm ci --omit=dev
 npm start
