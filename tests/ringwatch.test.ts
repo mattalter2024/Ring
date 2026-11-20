@@ -1410,6 +1410,217 @@ describe('Security Hardening', () => {
   })
 })
 
+describe('Enhanced Delivery Detection (Baseline Diff, Ground Crop, Motion-End & Smart Cooldown)', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('sends BEFORE baseline + AFTER current + zoomed delivery crop to Gemini, retries on 400 mediaResolution, and notifies on new deliveries', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    store.updateSettings({
+      mode: 'live',
+      packageAi: {
+        enabled: true,
+        provider: 'gemini',
+        geminiModel: 'gemini-3-flash-preview',
+        geminiApiKey: 'AIza-test-delivery',
+        cooldownMinutes: 10,
+      },
+    })
+
+    const notifySpy = vi.fn()
+    const service = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: { notifyPackageAlert: notifySpy } as unknown as NotificationService,
+      onDetection: vi.fn(),
+      onSecurityEvent: vi.fn(),
+      retryDelayMs: 0,
+      motionFollowUpDelaysMs: [],
+      motionEndDelayMs: 40,
+    })
+
+    let frameSeq = 0
+    const frames = [
+      Buffer.from('empty-porch-frame').toString('base64'),
+      Buffer.from('porch-with-1-box').toString('base64'),
+      Buffer.from('porch-with-2-boxes').toString('base64'),
+    ]
+    service.attachSnapshotSource({
+      getCameraMeta: (id) => ({ id, name: 'Front Porch' }),
+      listCameraIds: () => ['cam-porch'],
+      captureSnapshotBase64: async () => {
+        const b64 = frames[Math.min(frameSeq++, frames.length - 1)]
+        return { base64: b64, dataUrl: `data:image/jpeg;base64,${b64}` }
+      },
+      cropDeliveryZoneBase64: async (b64) => `crop_${b64}`,
+    })
+
+    let fetchCount = 0
+    let secondScanImageCount = 0
+    let sawMediaResolutionHigh = false
+    let retriedWithoutMediaResolution = false
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+        fetchCount++
+        const body = JSON.parse(String(init?.body ?? '{}')) as {
+          contents?: Array<{ parts?: Array<{ text?: string; inline_data?: { data: string } }> }>
+          generationConfig?: { mediaResolution?: string }
+        }
+        const inlineImages =
+          body.contents?.[0]?.parts?.filter((p) => Boolean(p.inline_data)) ?? []
+
+        // Scan 1: empty porch -> saves clean baseline (2 images: current + zoom crop)
+        if (fetchCount === 1) {
+          expect(inlineImages.length).toBe(2)
+          expect(body.generationConfig?.mediaResolution).toBe('MEDIA_RESOLUTION_HIGH')
+          sawMediaResolutionHigh = true
+          return {
+            ok: true,
+            json: async () => ({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        text: JSON.stringify({
+                          sceneScan: 'Empty welcome mat and steps',
+                          newObjectsFromBaseline: 'No baseline provided',
+                          packageDetected: false,
+                          confidence: 0.95,
+                          packageCount: 0,
+                          carrierHint: null,
+                          placement: null,
+                          personPresent: false,
+                          summary: 'Empty porch.',
+                        }),
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+          }
+        }
+
+        // Scan 2 (attempt 1): simulate HTTP 400 rejecting mediaResolution -> service must strip & retry!
+        if (fetchCount === 2) {
+          secondScanImageCount = inlineImages.length
+          return {
+            ok: false,
+            status: 400,
+            text: async () => 'Invalid JSON payload received. Unknown name "mediaResolution"',
+          }
+        }
+
+        // Scan 2 (retry without mediaResolution): 1st box detected with 0.56 confidence (now passes 0.50 default!)
+        if (fetchCount === 3) {
+          expect(body.generationConfig?.mediaResolution).toBeUndefined()
+          retriedWithoutMediaResolution = true
+          return {
+            ok: true,
+            json: async () => ({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        text: JSON.stringify({
+                          sceneScan: 'Small brown box near front step',
+                          newObjectsFromBaseline: 'New brown cardboard box appeared on porch step',
+                          packageDetected: true,
+                          confidence: 0.56,
+                          packageCount: 1,
+                          carrierHint: 'Amazon',
+                          placement: 'Front step',
+                          personPresent: false,
+                          summary: 'New Amazon cardboard box left on the front step.',
+                        }),
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+          }
+        }
+
+        // Scan 3 (within 10m cooldown): a 2nd package arrives -> must bypass cooldown & alert!
+        return {
+          ok: true,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        sceneScan: 'Two boxes now on front step',
+                        newObjectsFromBaseline: 'Second white mailer added beside brown box',
+                        packageDetected: true,
+                        confidence: 0.88,
+                        packageCount: 2,
+                        carrierHint: 'USPS',
+                        placement: 'Front step',
+                        personPresent: false,
+                        summary: 'Two packages now on the front step.',
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        }
+      }),
+    )
+
+    // 1. Clean baseline capture
+    const clean = await service.scanCamera('cam-porch', 'motion')
+    expect(clean.packageDetected).toBe(false)
+    expect(sawMediaResolutionHigh).toBe(true)
+
+    // 2. Motion ends -> unobstructed verification scan sends 3 images (baseline + current + zoom crop)
+    service.handleMotionEnded('cam-porch')
+    await new Promise((r) => setTimeout(r, 120))
+    expect(secondScanImageCount).toBe(3)
+    expect(retriedWithoutMediaResolution).toBe(true)
+    expect(notifySpy).toHaveBeenCalledTimes(1)
+
+    // 3. Second delivery arrives during cooldown (packageCount increases 1 -> 2) -> bypasses cooldown!
+    const secondDelivery = await service.scanCamera('cam-porch', 'motion')
+    expect(secondDelivery.packageDetected).toBe(true)
+    expect(secondDelivery.notified).toBe(true)
+    expect(notifySpy).toHaveBeenCalledTimes(2)
+
+    service.stop()
+  })
+
+  it('crops the lower 68% delivery zone from a real JPEG via FFmpeg', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    const streamService = new StreamService(() => store.getPublicSettings().recordingsDir)
+    const recordingService = new RecordingService(tmpDir, store, streamService)
+
+    const sampleJpg = path.resolve(process.cwd(), 'public', 'demo', 'front_porch.jpg')
+    const rawBuf = fs.readFileSync(sampleJpg)
+    const cropped = await recordingService.createDeliveryZoneCrop(rawBuf)
+    expect(cropped).not.toBeNull()
+    expect(cropped![0]).toBe(0xff)
+    expect(cropped![1]).toBe(0xd8)
+    expect(cropped!.length).toBeGreaterThan(1024)
+  })
+})
+
 
 
 

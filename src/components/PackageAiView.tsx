@@ -277,7 +277,7 @@ export function PackageAiView({
                 <input
                   id="ai-confidence"
                   type="range"
-                  min={50}
+                  min={35}
                   max={95}
                   step={5}
                   value={Math.round(ai.minConfidence * 100)}

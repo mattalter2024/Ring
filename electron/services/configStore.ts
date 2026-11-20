@@ -13,7 +13,7 @@ interface StoredSecrets {
   geminiApiKey?: string
 }
 
-const CURRENT_CONFIG_VERSION = 2
+const CURRENT_CONFIG_VERSION = 3
 
 interface PersistedConfigFile {
   configVersion?: number
@@ -82,7 +82,7 @@ const DEFAULT_PACKAGE_AI: Omit<PackageAiConfig, 'hasOpenaiKey' | 'hasGeminiKey'>
   triggerOnMotion: true,
   triggerOnDoorbell: true,
   intervalMinutes: 0,
-  minConfidence: 0.65,
+  minConfidence: 0.5,
   cooldownMinutes: 5,
   desktopNotifications: true,
   alertSound: 'crisp-chime',
@@ -180,6 +180,18 @@ export class ConfigStore {
         merged.organizeByDateFolder = true
         if (parsed.launchAtLogin === undefined) {
           merged.launchAtLogin = true
+        }
+        migrated = true
+      }
+
+      // One-time v2 -> v3 upgrade: lower unmodified 0.65 confidence default to 0.50
+      // so small/shadowed/plain delivery boxes aren't silently filtered out.
+      if (priorVersion < 3) {
+        if (
+          parsed.packageAi?.minConfidence === undefined ||
+          Math.abs(parsed.packageAi.minConfidence - 0.65) < 0.001
+        ) {
+          merged.packageAi.minConfidence = 0.5
         }
         migrated = true
       }

@@ -1374,6 +1374,102 @@ export class RecordingService {
     ])
   }
 
+  /**
+   * Produces a high-detail cropped JPEG focused on the lower 68% ground/porch/walkway/driveway
+   * delivery zone of a wide-angle Ring camera frame so small boxes and flat mailers appear
+   * significantly larger to Cloud Vision models.
+   */
+  async createDeliveryZoneCrop(jpegBuffer: Buffer): Promise<Buffer | null> {
+    if (!jpegBuffer || jpegBuffer.length < 1024) return null
+    if (jpegBuffer[0] !== 0xff || jpegBuffer[1] !== 0xd8) return null
+
+    const ffmpegBin = this.resolveFfmpegBinary()
+    return new Promise((resolve) => {
+      let settled = false
+      const chunks: Buffer[] = []
+      let totalBytes = 0
+
+      let child: ReturnType<typeof spawn>
+      try {
+        child = spawn(
+          ffmpegBin,
+          [
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-f',
+            'image2pipe',
+            '-vcodec',
+            'mjpeg',
+            '-i',
+            'pipe:0',
+            '-vf',
+            'crop=iw:trunc(ih*0.68/2)*2:0:trunc(ih*0.32/2)*2',
+            '-frames:v',
+            '1',
+            '-q:v',
+            '2',
+            '-f',
+            'image2pipe',
+            '-vcodec',
+            'mjpeg',
+            'pipe:1',
+          ],
+          { windowsHide: true },
+        )
+      } catch {
+        resolve(null)
+        return
+      }
+
+      const finish = (buf: Buffer | null) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(buf)
+      }
+
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          // ignore
+        }
+        finish(null)
+      }, 3500)
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        totalBytes += chunk.length
+        if (totalBytes <= 10 * 1024 * 1024) {
+          chunks.push(chunk)
+        }
+      })
+
+      child.on('error', () => finish(null))
+      child.on('close', (code) => {
+        if (code !== 0 || chunks.length === 0) {
+          finish(null)
+          return
+        }
+        const out = Buffer.concat(chunks)
+        if (out.length >= 256 && out[0] === 0xff && out[1] === 0xd8) {
+          finish(out)
+        } else {
+          finish(null)
+        }
+      })
+
+      child.stdin?.on('error', () => {
+        // Ignore EPIPE if ffmpeg exits early
+      })
+      try {
+        child.stdin?.end(jpegBuffer)
+      } catch {
+        finish(null)
+      }
+    })
+  }
+
   resolveFfmpegBinary(): string {
     const custom = this.configStore.getPublicSettings().ffmpegPath
     if (custom && !custom.includes('\0')) {

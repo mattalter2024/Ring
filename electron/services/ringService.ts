@@ -153,6 +153,8 @@ export class RingService implements SnapshotSource {
   private lastLowDiskNotifiedAt = 0
   private lastCriticalDiskNotifiedAt = 0
   private lastFailoverNotifiedAt = 0
+  private lastCloudEventPollAt = 0
+  private readonly seenRingEventIds = new Set<string>()
   private snapshotCache = new Map<string, { dataUrl: string; capturedAt: string }>()
 
   private connection: ConnectionStatus = {
@@ -465,11 +467,70 @@ export class RingService implements SnapshotSource {
           })
         }
       }
+      if (nowMs - this.lastCloudEventPollAt >= 60_000) {
+        this.lastCloudEventPollAt = nowMs
+        void this.pollRecentRingEventsForAi()
+      }
     }
 
     this.syncPowerSaveBlocker()
     this.callbacks.onStorageStatsUpdated(stats)
     this.callbacks.onNvrStatusUpdated?.(this.getNvrStatus())
+  }
+
+  /**
+   * Lightweight catch-all: if Ring push notifications (FCM) drop after Windows sleep or network hiccups,
+   * poll recent Ring cloud events every 60s so deliveries still get scanned automatically.
+   */
+  private async pollRecentRingEventsForAi(): Promise<void> {
+    if (this.connection.mode !== 'live' || this.liveCamerasById.size === 0) return
+    const aiCfg = this.configStore.getPublicSettings().packageAi
+    if (!aiCfg.enabled || (!aiCfg.triggerOnMotion && !aiCfg.triggerOnDoorbell)) return
+
+    const cutoffMs = Date.now() - 3 * 60 * 1000
+    for (const [camId, liveCam] of this.liveCamerasById.entries()) {
+      if (
+        aiCfg.monitoredCameraIds.length > 0 &&
+        !aiCfg.monitoredCameraIds.includes(camId)
+      ) {
+        continue
+      }
+      try {
+        const res = await liveCam.getEvents({ limit: 3 })
+        const list = res?.events ?? []
+        let triggered = false
+        for (const ev of list) {
+          const evId = `${camId}:${ev.ding_id_str}`
+          if (this.seenRingEventIds.has(evId)) continue
+          this.seenRingEventIds.add(evId)
+          if (this.seenRingEventIds.size > 500) {
+            const first = this.seenRingEventIds.values().next().value
+            if (first) this.seenRingEventIds.delete(first)
+          }
+
+          const createdMs = new Date(ev.created_at).getTime()
+          if (!Number.isFinite(createdMs) || createdMs < cutoffMs) continue
+
+          const kindLower = String(ev.kind ?? '').toLowerCase()
+          const trigger: 'motion' | 'doorbell' | null =
+            kindLower === 'ding'
+              ? 'doorbell'
+              : kindLower.includes('motion') ||
+                  kindLower.includes('package') ||
+                  kindLower.includes('person') ||
+                  kindLower.includes('loiter')
+                ? 'motion'
+                : null
+
+          if (trigger && !triggered) {
+            triggered = true
+            void this.aiPackageService.handleAutoTrigger(camId, trigger)
+          }
+        }
+      } catch {
+        // Ignore transient Ring cloud API errors during background catch-all poll
+      }
+    }
   }
 
   getNvrStatus(): NvrStatus {
@@ -1299,10 +1360,37 @@ export class RingService implements SnapshotSource {
           })
           void this.aiPackageService.handleAutoTrigger(camId, 'motion')
           void this.autoCaptureIfEnabled(camId, 'motion')
+        } else if (!motion && lastMotionState) {
+          // Motion just ended (driver left the porch) — verify the unobstructed porch
+          this.aiPackageService.handleMotionEnded(camId)
         }
         lastMotionState = motion
       }),
     )
+
+    // Also listen to raw Ring push notifications so repeat motion, person, or package alerts
+    // arriving during an already-active motion window still trigger AI delivery checks.
+    if (cam.onNewNotification) {
+      this.subscriptions.push(
+        cam.onNewNotification.subscribe((notification) => {
+          const category = String(notification?.android_config?.category ?? '').toLowerCase()
+          const dingId = notification?.data?.event?.ding?.id
+          if (dingId) {
+            this.seenRingEventIds.add(`${camId}:${dingId}`)
+          }
+          if (category.includes('ding') && !category.includes('motion')) {
+            return // Already handled by onDoorbellPressed
+          }
+          if (
+            category.includes('motion') ||
+            category.includes('package') ||
+            category.includes('person')
+          ) {
+            void this.aiPackageService.handleAutoTrigger(camId, 'motion')
+          }
+        }),
+      )
+    }
   }
 
   async autoCaptureIfEnabled(
@@ -1411,17 +1499,18 @@ export class RingService implements SnapshotSource {
   private async tryExtractLiveHlsSnapshot(
     cameraId: string,
     waitTimeoutMs = 3500,
+    maxAgeMs = 25_000,
   ): Promise<Buffer | null> {
     const segPath = this.streamService.hasActiveFeed(cameraId)
-      ? await this.streamService.waitForLatestHlsSegment(cameraId, waitTimeoutMs)
-      : this.streamService.getLatestHlsSegmentPath(cameraId)
+      ? await this.streamService.waitForLatestHlsSegment(cameraId, waitTimeoutMs, maxAgeMs)
+      : this.streamService.getLatestHlsSegmentPath(cameraId, maxAgeMs)
     if (!segPath) return null
     return this.recordingService.extractJpegFrame(segPath)
   }
 
   private async tryExtractRecentRecordingSnapshot(
     cameraId: string,
-    maxAgeMs = 15 * 60 * 1000,
+    maxAgeMs = 2 * 60 * 1000,
   ): Promise<Buffer | null> {
     const now = Date.now()
     const recs = this.recordingService
@@ -1435,6 +1524,16 @@ export class RingService implements SnapshotSource {
       if (frame) return frame
     }
     return null
+  }
+
+  async cropDeliveryZoneBase64(jpegBase64: string): Promise<string | null> {
+    try {
+      const rawBuf = Buffer.from(jpegBase64, 'base64')
+      const cropped = await this.recordingService.createDeliveryZoneCrop(rawBuf)
+      return cropped ? cropped.toString('base64') : null
+    } catch {
+      return null
+    }
   }
 
   private async tryUnforcedCloudSnapshot(

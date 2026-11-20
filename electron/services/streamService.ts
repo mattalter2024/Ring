@@ -401,7 +401,11 @@ export class StreamService {
     return Boolean(active && active.dirPath)
   }
 
-  getLatestHlsSegmentPath(cameraId: string): string | null {
+  getLatestHlsSegmentPath(cameraId: string, maxAgeMs?: number): string | null {
+    const nowMs = Date.now()
+    const isFresh = (mtimeMs: number) =>
+      maxAgeMs === undefined || maxAgeMs <= 0 || nowMs - mtimeMs <= maxAgeMs
+
     const candidateDirs: string[] = []
     const nvrDir = this.nvrHlsFeeds.get(cameraId)?.dirPath
     if (nvrDir) candidateDirs.push(nvrDir)
@@ -426,7 +430,7 @@ export class StreamService {
             const segPath = path.resolve(dirPath, path.basename(lines[i]))
             if (fs.existsSync(segPath)) {
               const stat = fs.statSync(segPath)
-              if (stat.isFile() && stat.size >= 1024) {
+              if (stat.isFile() && stat.size >= 1024 && isFresh(stat.mtimeMs)) {
                 return segPath
               }
             }
@@ -448,7 +452,7 @@ export class StreamService {
             const fullPath = path.join(dirPath, name)
             try {
               const stat = fs.statSync(fullPath)
-              return stat.isFile() && stat.size >= 1024
+              return stat.isFile() && stat.size >= 1024 && isFresh(stat.mtimeMs)
                 ? { fullPath, name, mtimeMs: stat.mtimeMs }
                 : null
             } catch {
@@ -472,17 +476,18 @@ export class StreamService {
   async waitForLatestHlsSegment(
     cameraId: string,
     timeoutMs = 3500,
+    maxAgeMs?: number,
   ): Promise<string | null> {
-    const immediate = this.getLatestHlsSegmentPath(cameraId)
+    const immediate = this.getLatestHlsSegmentPath(cameraId, maxAgeMs)
     if (immediate) return immediate
 
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline && this.hasActiveFeed(cameraId)) {
       await new Promise((r) => setTimeout(r, 250))
-      const found = this.getLatestHlsSegmentPath(cameraId)
+      const found = this.getLatestHlsSegmentPath(cameraId, maxAgeMs)
       if (found) return found
     }
-    return this.getLatestHlsSegmentPath(cameraId)
+    return this.getLatestHlsSegmentPath(cameraId, maxAgeMs)
   }
 
   clearPendingNvrCamera(cameraId: string): void {
