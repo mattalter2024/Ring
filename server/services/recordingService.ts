@@ -1562,6 +1562,7 @@ export class RecordingService {
     const dir = this.resolveClipDirectory(params.cameraName, createdDate)
     const fileName = this.buildFileName(params.cameraName, params.trigger, createdDate)
     const filePath = path.join(dir, fileName)
+    const tmpPath = `${filePath}.tmp`
 
     const clipSeconds = Math.min(Math.max(4, params.durationSeconds), 10)
     const ffmpegBin = this.resolveFfmpegBinary()
@@ -1583,9 +1584,17 @@ export class RecordingService {
         'ultrafast',
         '-movflags',
         '+faststart',
-        filePath,
+        '-f',
+        'mp4',
+        tmpPath,
       ])
+      fs.renameSync(tmpPath, filePath)
     } catch (err) {
+      try {
+        fs.rmSync(tmpPath, { force: true })
+      } catch {
+        // ignore cleanup
+      }
       throw new Error(
         `FFmpeg is required to encode demo MP4 clips (${err instanceof Error ? err.message : String(err)})`,
       )

@@ -17,23 +17,29 @@
 
 ## App Screenshots
 
+### Passkey & Multi-User Sign-In Gate
+![RingWatch Passkey Sign-In Gate](https://raw.githubusercontent.com/mattalter2024/Ring/main/docs/screenshots/01-login-passkey.png)
+
 ### Live Cameras Wall
-![RingWatch Live Cameras Wall](https://raw.githubusercontent.com/mattalter2024/Ring/v2.0.0/docs/screenshots/01-live-cameras.png)
+![RingWatch Live Cameras Wall](https://raw.githubusercontent.com/mattalter2024/Ring/main/docs/screenshots/02-live-cameras.png)
 
 ### Interactive Multi-Camera Timeline
-![RingWatch Interactive Timeline](https://raw.githubusercontent.com/mattalter2024/Ring/v2.0.0/docs/screenshots/02-timeline.png)
+![RingWatch Interactive Timeline](https://raw.githubusercontent.com/mattalter2024/Ring/main/docs/screenshots/03-timeline.png)
 
 ### Local MP4 Recordings Vault
-![RingWatch Local MP4 Vault](https://raw.githubusercontent.com/mattalter2024/Ring/v2.0.0/docs/screenshots/03-recordings-vault.png)
+![RingWatch Local MP4 Vault](https://raw.githubusercontent.com/mattalter2024/Ring/main/docs/screenshots/04-recordings-vault.png)
 
 ### 24/7 NVR & Storage Console
-![RingWatch NVR and Storage Console](https://raw.githubusercontent.com/mattalter2024/Ring/v2.0.0/docs/screenshots/04-nvr-storage.png)
+![RingWatch NVR and Storage Console](https://raw.githubusercontent.com/mattalter2024/Ring/main/docs/screenshots/05-nvr-storage.png)
 
 ### AI Package Detection & Alerts
-![RingWatch AI Package Detection](https://raw.githubusercontent.com/mattalter2024/Ring/v2.0.0/docs/screenshots/05-ai-packages.png)
+![RingWatch AI Package Detection](https://raw.githubusercontent.com/mattalter2024/Ring/main/docs/screenshots/06-ai-packages.png)
 
 ### Multi-User Passkeys & RBAC Permissions
-![RingWatch Access and Passkeys](https://raw.githubusercontent.com/mattalter2024/Ring/v2.0.0/docs/screenshots/06-access-passkeys.png)
+![RingWatch Access and Passkeys](https://raw.githubusercontent.com/mattalter2024/Ring/main/docs/screenshots/07-access-passkeys.png)
+
+### Settings, Vision AI & Troubleshooting Logs
+![RingWatch Settings](https://raw.githubusercontent.com/mattalter2024/Ring/main/docs/screenshots/08-settings.png)
 
 ---
 

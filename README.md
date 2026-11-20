@@ -8,35 +8,45 @@ It pairs a lightweight **Standalone Node.js Backend** (with a native Windows Ser
 
 ## Screenshots
 
-### Live Cameras Wall
-Real-time low-latency HLS multi-camera view, 24/7 NVR recording status badges, instant snapshots, floodlight/siren controls, and one-click AI scans.
+### Passkey & Multi-User Sign-In Gate
+Passwordless sign-in with **FIDO2 Passkeys** (Windows Hello, macOS Touch ID, Face ID, or security keys) alongside multi-user username/password authentication.
 
-![RingWatch Live Cameras Wall](docs/screenshots/01-live-cameras.png)
+![RingWatch Passkey Sign-In Gate](docs/screenshots/01-login-passkey.png)
+
+### Live Cameras Wall
+Real-time low-latency HLS multi-camera view, 24/7 NVR recording status badges, instant snapshots, floodlight/siren controls, one-click AI scans, and role-aware sidebar.
+
+![RingWatch Live Cameras Wall](docs/screenshots/02-live-cameras.png)
 
 ### Interactive Multi-Camera Timeline
 Smooth 60fps multi-track timeline scrubbing (`24h` down to `15m` zoom) with Windows mouse-wheel & macOS trackpad pinch/swipe support, motion/doorbell/AI/sensor markers, and one-click **Clear All**.
 
-![RingWatch Interactive Timeline](docs/screenshots/02-timeline.png)
+![RingWatch Interactive Timeline](docs/screenshots/03-timeline.png)
 
 ### Local MP4 Recordings Vault
-Browse, filter, star/protect, stream (`HTTP 206 Range`), import `.mp4` files, export clips with tamper-evident **SHA-256 Evidence Bundles**, sync Ring Cloud clips, or clear the vault in one click.
+Browse, filter, star/protect, stream (`HTTP 206 Range`), import `.mp4` files from any browser, export clips with tamper-evident **SHA-256 Evidence Bundles**, sync Ring Cloud clips, or clear the vault in one click.
 
-![RingWatch Local MP4 Recordings Vault](docs/screenshots/03-recordings-vault.png)
+![RingWatch Local MP4 Recordings Vault](docs/screenshots/04-recordings-vault.png)
 
 ### 24/7 NVR & Storage Console
-Manage continuous per-camera recording, automatic internal/USB/NAS drive detection, primary + failover storage vaults, rolling storage quotas, retention policies, and disk health alerts.
+Manage continuous per-camera recording, automatic internal/USB/NAS drive detection, primary + failover storage vaults, rolling storage quotas, retention policies, **Open Vault**, **Folder Path**, and **Clear All Videos**.
 
-![RingWatch 24/7 NVR and Storage Console](docs/screenshots/04-nvr-storage.png)
+![RingWatch 24/7 NVR and Storage Console](docs/screenshots/05-nvr-storage.png)
 
 ### AI Package Detection & Alerts
-Automatic box and parcel detection powered by **OpenAI Vision (GPT-4o / 4.1)** or **Google Gemini Vision** with before/after baseline comparison, zoomed ground/porch delivery-zone crop, local NVR scene-change triggering, and customizable chime + browser desktop alerts.
+Automatic box and parcel detection powered by **Google Gemini Vision** or **OpenAI Vision (GPT-4o / 4.1)** with before/after baseline comparison, zoomed ground/porch delivery-zone crop, local NVR scene-change triggering, and customizable chime + browser desktop alerts.
 
-![RingWatch AI Package Detection](docs/screenshots/05-ai-packages.png)
+![RingWatch AI Package Detection](docs/screenshots/06-ai-packages.png)
 
 ### Multi-User Passkeys (WebAuthn) & RBAC Permissions
-Secure LAN access with passwordless **FIDO2 Passkeys** (Windows Hello, macOS Touch ID, Face ID, YubiKey / security keys) and fine-grained **Role-Based Access Control** (4 built-in role presets + 11 customizable permissions).
+Enroll Windows Hello / Touch ID passkeys and assign **4 built-in role presets** or customize all **11 granular RBAC permissions** across Cameras, Recordings & NVR, Alarm & Sensors, AI Packages, and Administration.
 
-![RingWatch Multi-User Passkeys and RBAC](docs/screenshots/06-access-passkeys.png)
+![RingWatch Multi-User Passkeys and RBAC](docs/screenshots/07-access-passkeys.png)
+
+### Settings, Encrypted Credentials & Troubleshooting Logs
+Configure Ring account sign-in, encrypted Cloud Vision AI keys, browser desktop alerts, web access controls, and one-click **Troubleshooting Log** downloads.
+
+![RingWatch Settings](docs/screenshots/08-settings.png)
 
 ---
 

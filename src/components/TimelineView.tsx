@@ -1354,10 +1354,13 @@ export function TimelineView({
 
         {/* Right Side Inspector & Camera Clip List */}
         <aside className="panel">
-          <div className="panel-header">
-            <h3>Clips &amp; Details</h3>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+          <div className="panel-header" style={{ flexWrap: 'wrap', gap: 6 }}>
+            <h3 style={{ whiteSpace: 'nowrap' }}>Clips &amp; Details</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+              <span
+                className="mono"
+                style={{ fontSize: 11.5, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}
+              >
                 {dateKey}
               </span>
               <button
@@ -1382,7 +1385,7 @@ export function TimelineView({
                   id="btn-timeline-clear-all"
                   type="button"
                   className="btn btn-danger btn-sm"
-                  style={{ padding: '4px 8px', fontSize: 11.5 }}
+                  style={{ padding: '4px 8px', fontSize: 11.5, whiteSpace: 'nowrap' }}
                   title="Permanently delete all local video recordings from disk"
                   disabled={clearingAll || recordings.length === 0}
                   onClick={async () => {
