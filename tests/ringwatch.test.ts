@@ -2035,6 +2035,73 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
       await server.stop()
     }
   })
+
+  it('redacts secrets in troubleshooting logs, serves /api/logs/download, and guards /api/internal/shutdown with control token', async () => {
+    const recDir = path.join(tmpDir, 'recordings')
+    const webDir = path.join(tmpDir, 'web-dist')
+    fs.mkdirSync(webDir, { recursive: true })
+    fs.writeFileSync(path.join(webDir, 'index.html'), '<html>RingWatch</html>', 'utf-8')
+
+    const preStore = new ConfigStore(tmpDir, recDir)
+    preStore.updateSettings({ continuousAutoStart: false })
+
+    let shutdownCalled = false
+    const server = new RingWatchServer({
+      dataDir: tmpDir,
+      defaultRecordingsDir: recDir,
+      webDistDir: webDir,
+      demoAssetsDir: path.resolve(process.cwd(), 'public', 'demo'),
+      host: '127.0.0.1',
+      port: 0,
+      controlToken: 'svc-secret-control-token-123',
+      onRequestShutdown: () => {
+        shutdownCalled = true
+      },
+    })
+
+    const { port } = await server.start()
+    const base = `http://127.0.0.1:${port}`
+
+    try {
+      server.logger.info('Connected with sk-proj-supersecretkey1234567890 and Bearer abcdef123456')
+
+      const logsRes = await fetch(`${base}/api/logs`)
+      expect(logsRes.status).toBe(200)
+      const logsJson = (await logsRes.json()) as { lines: string[]; logsDir: string }
+      const joined = logsJson.lines.join('\n')
+      expect(joined).toContain('[REDACTED_OPENAI_KEY]')
+      expect(joined).toContain('Bearer [REDACTED]')
+      expect(joined).not.toContain('sk-proj-supersecretkey1234567890')
+
+      const dlRes = await fetch(`${base}/api/logs/download`)
+      expect(dlRes.status).toBe(200)
+      expect(dlRes.headers.get('content-disposition')).toContain('ringwatch-troubleshooting-')
+      const reportText = await dlRes.text()
+      expect(reportText).toContain('SYSTEM & NVR DIAGNOSTICS')
+      expect(reportText).toContain('[REDACTED_OPENAI_KEY]')
+
+      // Missing or wrong control token must be rejected with 403
+      const badShut = await fetch(`${base}/api/internal/shutdown`, {
+        method: 'POST',
+        headers: { 'X-RingWatch-Control': 'wrong-token' },
+      })
+      expect(badShut.status).toBe(403)
+      await badShut.text()
+      expect(shutdownCalled).toBe(false)
+
+      // Valid control token triggers graceful shutdown callback
+      const okShut = await fetch(`${base}/api/internal/shutdown`, {
+        method: 'POST',
+        headers: { 'X-RingWatch-Control': 'svc-secret-control-token-123' },
+      })
+      expect(okShut.status).toBe(200)
+      await okShut.text()
+      await new Promise((r) => setTimeout(r, 120))
+      expect(shutdownCalled).toBe(true)
+    } finally {
+      await server.stop()
+    }
+  })
 })
 
 

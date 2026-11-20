@@ -640,8 +640,16 @@ export function SettingsView({
               </div>
             )}
 
-            {authStatus.authEnabled && (
-              <div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <a
+                href="/api/logs/download"
+                download
+                className="btn btn-sm"
+                style={{ textDecoration: 'none' }}
+              >
+                Download Troubleshooting Logs
+              </a>
+              {authStatus.authEnabled && (
                 <button
                   type="button"
                   className="btn btn-sm"
@@ -650,8 +658,8 @@ export function SettingsView({
                   <LogOut size={13} />
                   Sign Out of Web UI
                 </button>
-              </div>
-            )}
+              )}
+            </div>
 
             <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
               External drives, failover folders, and 24/7 retention rules are managed in{' '}

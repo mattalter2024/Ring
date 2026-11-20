@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { RingWatchServer } from './httpServer'
+import { BackendLogger } from './services/logger'
 
 // Keep 24/7 unattended NVR resilient against transient Windows OS/socket errors (EBUSY/ENOTEMPTY/EPIPE)
 const TRANSIENT_ERROR_CODES = new Set([
@@ -48,6 +49,13 @@ function resolveDefaultRecordingsDir(): string {
   return path.join(os.homedir(), 'Videos', 'RingWatch')
 }
 
+function resolveLogsDir(dataDir: string): string {
+  if (process.env.RINGWATCH_LOG_DIR?.trim()) {
+    return path.resolve(process.env.RINGWATCH_LOG_DIR.trim())
+  }
+  return path.join(dataDir, 'logs')
+}
+
 function resolveDemoAssetsDir(root: string): string {
   const distDemo = path.join(root, 'dist', 'demo')
   if (fs.existsSync(distDemo)) return distDemo
@@ -74,8 +82,28 @@ async function main(): Promise<void> {
   const port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 3456
   const dataDir = resolveDefaultDataDir()
   const defaultRecordingsDir = resolveDefaultRecordingsDir()
+  const logsDir = resolveLogsDir(dataDir)
+  const debugEnabled =
+    process.env.RINGWATCH_DEBUG === '1' ||
+    process.env.RINGWATCH_DEBUG?.toLowerCase() === 'true'
   const webDistDir = path.join(root, 'dist')
   const demoAssetsDir = resolveDemoAssetsDir(root)
+
+  const logger = new BackendLogger({ logsDir, debugEnabled })
+  logger.installConsoleCapture()
+
+  let shuttingDown = false
+  let serverRef: RingWatchServer | null = null
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    console.log(`[RingWatch Server] Received ${signal}, shutting down cleanly...`)
+    try {
+      await serverRef?.stop()
+    } finally {
+      process.exit(0)
+    }
+  }
 
   const server = new RingWatchServer({
     dataDir,
@@ -85,7 +113,13 @@ async function main(): Promise<void> {
     host,
     port,
     envAuthPassword: process.env.RINGWATCH_AUTH_PASSWORD,
+    logger,
+    controlToken: process.env.RINGWATCH_CONTROL_TOKEN,
+    onRequestShutdown: () => {
+      void shutdown('WINDOWS_SERVICE_STOP')
+    },
   })
+  serverRef = server
 
   const bound = await server.start()
   console.log('')
@@ -100,23 +134,12 @@ async function main(): Promise<void> {
   }
   console.log(`  Data Folder  : ${dataDir}`)
   console.log(`  Recordings   : ${server.configStore.getPublicSettings().recordingsDir}`)
+  console.log(`  Logs Folder  : ${logsDir}${debugEnabled ? ' (VERBOSE DEBUG ON)' : ''}`)
   console.log(
     `  Web Login    : ${server.isAuthEnabled() ? 'Enabled (password protected)' : 'Disabled (open on LAN — configure in Settings or RINGWATCH_AUTH_PASSWORD)'}`,
   )
   console.log('==============================================================')
   console.log('')
-
-  let shuttingDown = false
-  const shutdown = async (signal: string) => {
-    if (shuttingDown) return
-    shuttingDown = true
-    console.log(`\n[RingWatch Server] Received ${signal}, shutting down cleanly...`)
-    try {
-      await server.stop()
-    } finally {
-      process.exit(0)
-    }
-  }
 
   process.on('SIGINT', () => void shutdown('SIGINT'))
   process.on('SIGTERM', () => void shutdown('SIGTERM'))

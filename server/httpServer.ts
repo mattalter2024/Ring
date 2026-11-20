@@ -1,4 +1,5 @@
 import http from 'node:http'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
@@ -15,6 +16,7 @@ import { RecordingService } from './services/recordingService'
 import { NotificationService } from './services/notificationService'
 import { AiPackageService } from './services/aiPackageService'
 import { RingService } from './services/ringService'
+import { BackendLogger } from './services/logger'
 import {
   FileKeyCryptoAdapter,
   createSessionToken,
@@ -123,6 +125,9 @@ export interface RingWatchServerOptions {
   host?: string
   port?: number
   envAuthPassword?: string
+  logger?: BackendLogger
+  controlToken?: string
+  onRequestShutdown?: () => void
 }
 
 export class RingWatchServer {
@@ -132,6 +137,7 @@ export class RingWatchServer {
   readonly notificationService: NotificationService
   readonly aiPackageService: AiPackageService
   readonly ringService: RingService
+  readonly logger: BackendLogger
 
   private readonly cryptoAdapter: FileKeyCryptoAdapter
   private readonly sessionSigningKey: Buffer
@@ -139,6 +145,8 @@ export class RingWatchServer {
   private readonly host: string
   private readonly requestedPort: number
   private readonly envAuthPassword: string | null
+  private readonly controlTokenBuf: Buffer | null
+  private readonly onRequestShutdown?: () => void
 
   private server: http.Server | null = null
   private boundPort = 0
@@ -152,6 +160,16 @@ export class RingWatchServer {
     this.host = options.host ?? '0.0.0.0'
     this.requestedPort = options.port ?? 3456
     this.envAuthPassword = options.envAuthPassword?.trim() || null
+    this.logger =
+      options.logger ??
+      new BackendLogger({
+        logsDir: path.join(options.dataDir, 'logs'),
+        debugEnabled: false,
+      })
+    this.controlTokenBuf = options.controlToken?.trim()
+      ? Buffer.from(options.controlToken.trim(), 'utf-8')
+      : null
+    this.onRequestShutdown = options.onRequestShutdown
 
     this.cryptoAdapter = new FileKeyCryptoAdapter(options.dataDir)
     this.sessionSigningKey = this.cryptoAdapter.getSessionSigningKey()
@@ -442,7 +460,31 @@ export class RingWatchServer {
         nvrActive: this.ringService.getNvrStatus().active,
         authEnabled: this.isAuthEnabled(),
         uptimeSeconds: Math.round(process.uptime()),
+        logsDir: this.logger.logsDir,
+        debugEnabled: this.logger.debugEnabled,
       })
+      return
+    }
+
+    // Internal localhost-only graceful shutdown hook for the Windows Service wrapper
+    if (method === 'POST' && pathname === '/api/internal/shutdown') {
+      const headerToken = String(req.headers['x-ringwatch-control'] ?? '').trim()
+      if (!this.controlTokenBuf || !headerToken) {
+        this.sendJson(res, 403, { error: 'Forbidden' })
+        return
+      }
+      const candBuf = Buffer.from(headerToken, 'utf-8')
+      if (
+        candBuf.length !== this.controlTokenBuf.length ||
+        !crypto.timingSafeEqual(candBuf, this.controlTokenBuf)
+      ) {
+        this.sendJson(res, 403, { error: 'Forbidden' })
+        return
+      }
+      this.sendJson(res, 200, { ok: true, shuttingDown: true })
+      setTimeout(() => {
+        this.onRequestShutdown?.()
+      }, 50)
       return
     }
 
@@ -486,6 +528,40 @@ export class RingWatchServer {
     // Enforce optional login gate for all protected API routes
     if (!this.isAuthenticated(req)) {
       this.sendJson(res, 401, { error: 'Authentication required' })
+      return
+    }
+
+    // Troubleshooting logs API
+    if (method === 'GET' && pathname === '/api/logs') {
+      this.sendJson(res, 200, {
+        logsDir: this.logger.logsDir,
+        logFilePath: this.logger.logFilePath,
+        debugEnabled: this.logger.debugEnabled,
+        lines: this.logger.readRecentLines(400),
+      })
+      return
+    }
+
+    if (method === 'GET' && pathname === '/api/logs/download') {
+      const report = this.logger.buildTroubleshootingReport({
+        connection: this.ringService.getConnection(),
+        nvrStatus: this.ringService.getNvrStatus(),
+        storageStats: this.recordingService.getStorageStats(),
+        settings: this.configStore.getPublicSettings(),
+        recentPackageDetections: this.aiPackageService
+          .listDetections()
+          .slice(0, 15)
+          .map(({ snapshotDataUrl: _drop, ...rest }) => rest),
+      })
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      const buf = Buffer.from(report, 'utf-8')
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Length': buf.length,
+        'Content-Disposition': `attachment; filename="ringwatch-troubleshooting-${stamp}.log"`,
+        'Cache-Control': 'no-store',
+      })
+      res.end(buf)
       return
     }
 

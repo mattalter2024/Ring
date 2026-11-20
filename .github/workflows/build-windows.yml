@@ -38,7 +38,36 @@ jobs:
       - name: Build Web Frontend & Node.js Backend
         run: npm run build
 
-      - name: Package self-contained Windows Web + NVR Backend ZIP (includes node.exe + production deps)
+      - name: Compile Windows Service (RingWatchService.exe) & Taskbar Tray Icon (RingWatchTray.exe)
+        shell: pwsh
+        run: |
+          $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) {
+            throw "Could not find .NET Framework csc.exe at $csc"
+          }
+          New-Item -ItemType Directory -Force -Path "release/native" | Out-Null
+
+          & $csc /nologo /optimize /target:exe `
+            /out:"release/native/RingWatchService.exe" `
+            /win32icon:"build/icon.ico" `
+            /r:System.ServiceProcess.dll `
+            /r:System.Web.Extensions.dll `
+            "windows/RingWatchService.cs"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to compile RingWatchService.exe" }
+
+          & $csc /nologo /optimize /target:winexe `
+            /out:"release/native/RingWatchTray.exe" `
+            /win32icon:"build/icon.ico" `
+            /r:System.Windows.Forms.dll `
+            /r:System.Drawing.dll `
+            /r:System.ServiceProcess.dll `
+            /r:System.Web.Extensions.dll `
+            "windows/RingWatchTray.cs"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to compile RingWatchTray.exe" }
+
+          Write-Host "Compiled RingWatchService.exe and RingWatchTray.exe cleanly." -ForegroundColor Green
+
+      - name: Package self-contained Windows Web + NVR Backend ZIP (includes node.exe, service & tray icon)
         shell: pwsh
         run: |
           # Prune devDependencies so only production runtime deps (ring-client-api, ffmpeg.exe, etc.) are bundled
@@ -47,13 +76,17 @@ jobs:
           $stage = "release/RingWatch-Server"
           if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
           New-Item -ItemType Directory -Force -Path "$stage/runtime" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/build" | Out-Null
 
           $nodeSrc = (Get-Command node).Source
           Copy-Item $nodeSrc "$stage/runtime/node.exe"
+          Copy-Item "release/native/RingWatchService.exe" "$stage/RingWatchService.exe"
+          Copy-Item "release/native/RingWatchTray.exe" "$stage/RingWatchTray.exe"
+          Copy-Item "build/icon.ico" "$stage/build/icon.ico"
           Copy-Item -Recurse dist "$stage/dist"
           Copy-Item -Recurse dist-server "$stage/dist-server"
           Copy-Item -Recurse node_modules "$stage/node_modules"
-          Copy-Item package.json, start-ringwatch.bat, install-windows-startup.ps1, README.md $stage
+          Copy-Item package.json, start-ringwatch.bat, install-windows-service.bat, uninstall-windows-service.bat, install-windows-service.ps1, README.md $stage
 
           # Smoke-test the self-contained bundle using ONLY its bundled runtime/node.exe
           $smokeData = Join-Path $env:TEMP "ringwatch-ci-smoke"

@@ -14,15 +14,21 @@ RingWatch is split into two cleanly separated parts:
 
 ## Quick Start on Windows
 
-### Option 1 — Pre-Built Self-Contained ZIP (No Node.js or FFmpeg install needed)
+### Option 1 — Install as a Windows Service + Taskbar Icon (Recommended, No Node.js install needed)
 1. Download **`RingWatch-Windows-Server.zip`** from the latest **Build RingWatch Web & Backend** GitHub Actions run.
-2. Unzip it anywhere (e.g. `C:\RingWatch\`).
-3. Double-click **`start-ringwatch.bat`**.
-4. Your browser opens **`http://localhost:3456`** automatically (or open `http://<your-pc-ip>:3456` from another device on your LAN).
+2. Unzip it to a permanent folder (e.g. `C:\RingWatch\`).
+3. Double-click **`install-windows-service.bat`** (approve the Administrator prompt).
+   - Installs and starts the **`RingWatchNvrService`** Windows Service (`Automatic` boot start + automatic crash recovery).
+   - Launches the **RingWatch Taskbar Tray Icon** (`RingWatchTray.exe`) showing live **Green (Running)** / **Amber (Starting)** / **Red (Stopped)** status.
+   - Right-click the tray icon anytime for **Open Web UI**, **Start / Stop / Restart Backend**, **View Live Logs**, **Export Troubleshooting Log**, **Open Logs Folder**, and **Verbose Debug Logging**.
+   - To uninstall later, double-click **`uninstall-windows-service.bat`**.
 
-*(The ZIP already bundles `runtime\node.exe`, `ffmpeg.exe`, and all runtime dependencies.)*
+### Option 2 — Quick Foreground Launch (No Service Install)
+- Unzip `RingWatch-Windows-Server.zip` and double-click **`start-ringwatch.bat`**. Your browser opens **`http://localhost:3456`** automatically.
 
-### Option 2 — Run from Source (Node.js 20+ / 24 LTS)
+*(The ZIP already bundles `runtime\node.exe`, `ffmpeg.exe`, `RingWatchService.exe`, `RingWatchTray.exe`, and all runtime dependencies.)*
+
+### Option 3 — Run from Source (Node.js 20+ / 24 LTS)
 
 ```powershell
 # 1. Install dependencies
@@ -33,13 +39,6 @@ npm run build
 
 # 3. Start the NVR & AI backend (also serves the Web UI)
 npm start
-```
-
-### Optional: Auto-Start in Background on Windows Boot
-```powershell
-.\install-windows-startup.ps1
-# To remove later:
-.\install-windows-startup.ps1 -Uninstall
 ```
 
 ---
