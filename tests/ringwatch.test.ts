@@ -2643,7 +2643,11 @@ describe('AI Spend Reduction (Cost-Saver Pipeline #1–#6)', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
-    fs.rmSync(tmpDir, { recursive: true, force: true })
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    } catch {
+      // Ignore transient Windows NTFS file handle locks in temp test dir
+    }
   })
 
   it('skips Cloud Vision at $0 when post-motion snapshot matches clean baseline luma grid (#1) and triggers when a box appears', async () => {
