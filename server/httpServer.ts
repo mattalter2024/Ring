@@ -144,6 +144,7 @@ export class RingWatchServer {
   private boundPort = 0
   private readonly sseClients = new Set<http.ServerResponse>()
   private sseHeartbeatTimer: NodeJS.Timeout | null = null
+  private rescanTimer: NodeJS.Timeout | null = null
 
   constructor(options: RingWatchServerOptions) {
     fs.mkdirSync(options.dataDir, { recursive: true })
@@ -308,7 +309,8 @@ export class RingWatchServer {
     void this.ringService.initialize().catch((err) => {
       console.warn('[RingWatch Server] Initialization warning:', err)
     })
-    setTimeout(() => {
+    this.rescanTimer = setTimeout(() => {
+      this.rescanTimer = null
       try {
         const res = this.recordingService.rescanDirectory()
         this.broadcast('recordings-updated', res.recordings)
@@ -316,12 +318,19 @@ export class RingWatchServer {
       } catch {
         // Ignore background rescan errors
       }
-    }, 2000).unref?.()
+    }, 2000)
+    if (typeof this.rescanTimer.unref === 'function') {
+      this.rescanTimer.unref()
+    }
 
     return { port: this.boundPort, host: this.host }
   }
 
   async stop(): Promise<void> {
+    if (this.rescanTimer) {
+      clearTimeout(this.rescanTimer)
+      this.rescanTimer = null
+    }
     if (this.sseHeartbeatTimer) {
       clearInterval(this.sseHeartbeatTimer)
       this.sseHeartbeatTimer = null

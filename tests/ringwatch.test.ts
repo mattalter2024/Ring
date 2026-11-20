@@ -1874,7 +1874,11 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
   })
 
   afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true })
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    } catch {
+      // Ignore transient Windows NTFS file handle locks in temp test dir
+    }
   })
 
   it('encrypts secrets with FileKeyCryptoAdapter (AES-256-GCM) and verifies scrypt passwords & HMAC sessions', () => {
@@ -1957,6 +1961,7 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
       })
       expect(mediaRes.status).toBe(206)
       expect(mediaRes.headers.get('content-range')).toBe('bytes 0-1023/4096')
+      await mediaRes.arrayBuffer()
 
       // 4. Enable optional login gate via /api/auth/password
       const setPassRes = await fetch(`${base}/api/auth/password`, {
@@ -1970,8 +1975,10 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
       // 5. Unauthenticated requests are now blocked with 401
       const unauthBoot = await fetch(`${base}/api/bootstrap`)
       expect(unauthBoot.status).toBe(401)
+      await unauthBoot.text()
       const unauthMedia = await fetch(`${base}${relUrl}`)
       expect(unauthMedia.status).toBe(401)
+      await unauthMedia.text()
 
       // 6. Wrong password rejected with 401
       const badLogin = await fetch(`${base}/api/auth/login`, {
@@ -1980,6 +1987,7 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
         body: JSON.stringify({ password: 'wrong-password' }),
       })
       expect(badLogin.status).toBe(401)
+      await badLogin.text()
 
       // 7. Correct password sets HttpOnly session cookie that unlocks /api/bootstrap & /media
       const goodLogin = await fetch(`${base}/api/auth/login`, {
@@ -1988,6 +1996,7 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
         body: JSON.stringify({ password: 'nvr-secret-2026' }),
       })
       expect(goodLogin.status).toBe(200)
+      await goodLogin.text()
       const setCookie = goodLogin.headers.get('set-cookie') ?? ''
       expect(setCookie).toContain('ringwatch_session=')
       expect(setCookie).toContain('HttpOnly')
@@ -1997,11 +2006,13 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
         headers: { Cookie: cookieHeader },
       })
       expect(authedBoot.status).toBe(200)
+      await authedBoot.text()
 
       const authedMedia = await fetch(`${base}${relUrl}`, {
         headers: { Cookie: cookieHeader },
       })
       expect(authedMedia.status).toBe(200)
+      await authedMedia.arrayBuffer()
 
       // 8. Disabling password returns to open mode
       const disableRes = await fetch(`${base}/api/auth/password`, {
@@ -2017,7 +2028,9 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
       })
       expect(disableRes.status).toBe(200)
       expect(await disableRes.json()).toEqual({ ok: true, authEnabled: false })
-      expect((await fetch(`${base}/api/bootstrap`)).status).toBe(200)
+      const openAgain = await fetch(`${base}/api/bootstrap`)
+      expect(openAgain.status).toBe(200)
+      await openAgain.text()
     } finally {
       await server.stop()
     }
