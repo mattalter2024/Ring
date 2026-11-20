@@ -12,7 +12,17 @@ RingWatch is split into two cleanly separated parts:
 
 ---
 
-## Quick Start on Windows (Node.js 20+ / 24 LTS)
+## Quick Start on Windows
+
+### Option 1 — Pre-Built Self-Contained ZIP (No Node.js or FFmpeg install needed)
+1. Download **`RingWatch-Windows-Server.zip`** from the latest **Build RingWatch Web & Backend** GitHub Actions run.
+2. Unzip it anywhere (e.g. `C:\RingWatch\`).
+3. Double-click **`start-ringwatch.bat`**.
+4. Your browser opens **`http://localhost:3456`** automatically (or open `http://<your-pc-ip>:3456` from another device on your LAN).
+
+*(The ZIP already bundles `runtime\node.exe`, `ffmpeg.exe`, and all runtime dependencies.)*
+
+### Option 2 — Run from Source (Node.js 20+ / 24 LTS)
 
 ```powershell
 # 1. Install dependencies
@@ -24,10 +34,6 @@ npm run build
 # 3. Start the NVR & AI backend (also serves the Web UI)
 npm start
 ```
-
-Open **http://localhost:3456** in Chrome, Edge, or any browser (or `http://<your-pc-ip>:3456` from another device on your LAN).
-
-Or simply double-click **`start-ringwatch.bat`**.
 
 ### Optional: Auto-Start in Background on Windows Boot
 ```powershell

@@ -38,14 +38,60 @@ jobs:
       - name: Build Web Frontend & Node.js Backend
         run: npm run build
 
-      - name: Package standalone Windows Web + NVR Backend ZIP
+      - name: Package self-contained Windows Web + NVR Backend ZIP (includes node.exe + production deps)
         shell: pwsh
         run: |
+          # Prune devDependencies so only production runtime deps (ring-client-api, ffmpeg.exe, etc.) are bundled
+          npm prune --omit=dev
+
           $stage = "release/RingWatch-Server"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force -Path "$stage/runtime" | Out-Null
+
+          $nodeSrc = (Get-Command node).Source
+          Copy-Item $nodeSrc "$stage/runtime/node.exe"
           Copy-Item -Recurse dist "$stage/dist"
           Copy-Item -Recurse dist-server "$stage/dist-server"
-          Copy-Item package.json, package-lock.json, start-ringwatch.bat, install-windows-startup.ps1, README.md $stage
+          Copy-Item -Recurse node_modules "$stage/node_modules"
+          Copy-Item package.json, start-ringwatch.bat, install-windows-startup.ps1, README.md $stage
+
+          # Smoke-test the self-contained bundle using ONLY its bundled runtime/node.exe
+          $smokeData = Join-Path $env:TEMP "ringwatch-ci-smoke"
+          if (Test-Path $smokeData) { Remove-Item -Recurse -Force $smokeData }
+          $env:PORT = "13456"
+          $env:HOST = "127.0.0.1"
+          $env:RINGWATCH_DATA_DIR = $smokeData
+          $env:RINGWATCH_RECORDINGS_DIR = Join-Path $smokeData "recordings"
+          $proc = Start-Process -FilePath (Resolve-Path "$stage/runtime/node.exe") `
+            -ArgumentList "dist-server\server\index.js" `
+            -WorkingDirectory (Resolve-Path $stage) `
+            -PassThru -NoNewWindow
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Milliseconds 300
+              try {
+                $resp = Invoke-RestMethod -Uri "http://127.0.0.1:13456/api/health" -TimeoutSec 2
+                if ($resp.ok -eq $true) {
+                  $html = (Invoke-WebRequest -Uri "http://127.0.0.1:13456/" -UseBasicParsing -TimeoutSec 2).Content
+                  if ($html -match "RingWatch") {
+                    Write-Host "Self-contained Windows smoke test PASSED!" -ForegroundColor Green
+                    $ok = $true
+                    break
+                  }
+                }
+              } catch {}
+            }
+            if (-not $ok) {
+              throw "Self-contained Windows bundle failed smoke test!"
+            }
+          } finally {
+            if ($proc -and -not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -Recurse -Force $smokeData -ErrorAction SilentlyContinue
+          }
+
           Compress-Archive -Path "$stage/*" -DestinationPath "release/RingWatch-Windows-Server.zip" -Force
 
       - name: Upload Windows Server Bundle

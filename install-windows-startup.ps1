@@ -19,7 +19,22 @@ if ($Uninstall) {
   exit 0
 }
 
-$NodeExe = (Get-Command node -ErrorAction Stop).Source
+$BundledNode = Join-Path $RepoDir "runtime\node.exe"
+$ProgramFilesNode = Join-Path $env:ProgramFiles "nodejs\node.exe"
+$LocalNode = Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe"
+
+if (Test-Path $BundledNode) {
+  $NodeExe = $BundledNode
+} elseif (Get-Command node -ErrorAction SilentlyContinue) {
+  $NodeExe = (Get-Command node).Source
+} elseif (Test-Path $ProgramFilesNode) {
+  $NodeExe = $ProgramFilesNode
+} elseif (Test-Path $LocalNode) {
+  $NodeExe = $LocalNode
+} else {
+  throw "Node.js not found. Use the self-contained RingWatch-Windows-Server.zip or install Node.js 24 LTS from https://nodejs.org/"
+}
+
 if (-not (Test-Path $EntryScript)) {
   Write-Host "Building RingWatch Web UI & Backend first..." -ForegroundColor Cyan
   Push-Location $RepoDir
@@ -59,5 +74,6 @@ Register-ScheduledTask `
 Start-ScheduledTask -TaskName $TaskName
 Write-Host ""
 Write-Host "RingWatch NVR & AI Backend installed and started!" -ForegroundColor Green
+Write-Host "Node runtime : $NodeExe" -ForegroundColor Gray
 Write-Host "Open http://localhost:$Port in your browser." -ForegroundColor Cyan
 Write-Host "To uninstall later: .\install-windows-startup.ps1 -Uninstall" -ForegroundColor Gray
