@@ -48,21 +48,21 @@ jobs:
           New-Item -ItemType Directory -Force -Path "release/native" | Out-Null
 
           & $csc /nologo /optimize /target:exe `
-            /out:"release/native/RingWatchService.exe" `
-            /win32icon:"build/icon.ico" `
+            /out:"release\native\RingWatchService.exe" `
+            /win32icon:"build\icon.ico" `
             /r:System.ServiceProcess.dll `
             /r:System.Web.Extensions.dll `
-            "windows/RingWatchService.cs"
+            "windows\RingWatchService.cs"
           if ($LASTEXITCODE -ne 0) { throw "Failed to compile RingWatchService.exe" }
 
           & $csc /nologo /optimize /target:winexe `
-            /out:"release/native/RingWatchTray.exe" `
-            /win32icon:"build/icon.ico" `
+            /out:"release\native\RingWatchTray.exe" `
+            /win32icon:"build\icon.ico" `
             /r:System.Windows.Forms.dll `
             /r:System.Drawing.dll `
             /r:System.ServiceProcess.dll `
             /r:System.Web.Extensions.dll `
-            "windows/RingWatchTray.cs"
+            "windows\RingWatchTray.cs"
           if ($LASTEXITCODE -ne 0) { throw "Failed to compile RingWatchTray.exe" }
 
           Write-Host "Compiled RingWatchService.exe and RingWatchTray.exe cleanly." -ForegroundColor Green
