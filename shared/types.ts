@@ -391,6 +391,7 @@ export interface AuthStatus {
   authenticated: boolean
   managedByEnv: boolean
   hasUsers: boolean
+  hasPasskeys?: boolean
   currentUser: PublicUser | null
   permissions: Permission[]
 }
@@ -427,7 +428,7 @@ export interface RingWatchApi {
     newPassword: string
   }) => Promise<{ ok: boolean; error?: string }>
 
-  // WebAuthn / Passkeys
+  // WebAuthn / Passkeys (Touch ID, Windows Hello, 1Password, Bitwarden, Security Keys)
   getPasskeyLoginOptions: (username?: string) => Promise<{
     challengeId: string
     options: Record<string, unknown>
@@ -436,7 +437,9 @@ export interface RingWatchApi {
     challengeId: string
     response: unknown
   }) => Promise<{ ok: boolean; error?: string; user?: PublicUser }>
-  getPasskeyRegisterOptions: () => Promise<{
+  getPasskeyRegisterOptions: (
+    authenticatorType?: 'any' | 'platform' | 'cross-platform',
+  ) => Promise<{
     challengeId: string
     options: Record<string, unknown>
   }>

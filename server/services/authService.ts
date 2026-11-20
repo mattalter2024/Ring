@@ -353,17 +353,30 @@ export class AuthService {
     return toPublicUser(candidate)
   }
 
+  hasAnyPasskeys(): boolean {
+    return this.users.some((u) => !u.disabled && u.passkeys.length > 0)
+  }
+
   /**
    * Generate FIDO2 / WebAuthn registration options for the currently authenticated user.
+   * Uses discoverable credentials (residentKey: 'required') and ES256/RS256 so Touch ID,
+   * Windows Hello, 1Password, Bitwarden, iCloud Keychain, and hardware keys all work seamlessly.
    */
   async createPasskeyRegistrationOptions(params: {
     userId: string
     rpID: string
     expectedOrigin: string
+    authenticatorType?: 'any' | 'platform' | 'cross-platform'
   }): Promise<{ challengeId: string; options: Record<string, unknown> }> {
     this.pruneExpiredChallenges()
     const user = this.users.find((u) => u.id === params.userId && !u.disabled)
     if (!user) throw new Error('User not found.')
+
+    const attachment =
+      params.authenticatorType === 'platform' ||
+      params.authenticatorType === 'cross-platform'
+        ? params.authenticatorType
+        : undefined
 
     const options = await generateRegistrationOptions({
       rpName: 'RingWatch Security Hub',
@@ -372,13 +385,16 @@ export class AuthService {
       userDisplayName: user.displayName,
       userID: Buffer.from(user.id, 'utf-8'),
       attestationType: 'none',
+      supportedAlgorithmIDs: [-7, -257],
       excludeCredentials: user.passkeys.map((pk) => ({
         id: pk.id,
         transports: pk.transports,
       })),
       authenticatorSelection: {
-        residentKey: 'preferred',
+        residentKey: 'required',
+        requireResidentKey: true,
         userVerification: 'preferred',
+        ...(attachment ? { authenticatorAttachment: attachment } : {}),
       },
     })
 

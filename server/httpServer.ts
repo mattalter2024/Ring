@@ -330,6 +330,7 @@ export class RingWatchServer {
       authenticated: session.authenticated,
       managedByEnv: Boolean(this.envAuthPassword),
       hasUsers: this.authService.hasUsers(),
+      hasPasskeys: this.authService.hasAnyPasskeys(),
       currentUser: session.user,
       permissions: session.permissions,
     }
@@ -339,25 +340,54 @@ export class RingWatchServer {
     rpID: string
     expectedOrigin: string
   } {
+    const envRpId = (process.env.RINGWATCH_WEBAUTHN_RP_ID ?? '').trim()
+    const envOrigin = (process.env.RINGWATCH_WEBAUTHN_ORIGIN ?? '').trim()
+
+    let rpID = ''
+    let expectedOrigin = ''
+
     const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : ''
     if (originHeader) {
       try {
         const parsed = new URL(originHeader)
-        return { rpID: parsed.hostname, expectedOrigin: parsed.origin }
+        rpID = parsed.hostname
+        expectedOrigin = parsed.origin
       } catch {
         // Fall back to Host header
       }
     }
-    const protoHeader =
-      typeof req.headers['x-forwarded-proto'] === 'string'
-        ? req.headers['x-forwarded-proto'].split(',')[0].trim()
-        : 'http'
-    const hostHeader =
-      typeof req.headers.host === 'string' && req.headers.host.trim()
-        ? req.headers.host.trim()
-        : `localhost:${this.boundPort || this.requestedPort}`
-    const parsed = new URL(`${protoHeader}://${hostHeader}`)
-    return { rpID: parsed.hostname, expectedOrigin: parsed.origin }
+
+    if (!rpID || !expectedOrigin) {
+      const protoHeader =
+        typeof req.headers['x-forwarded-proto'] === 'string'
+          ? req.headers['x-forwarded-proto'].split(',')[0].trim()
+          : 'http'
+      const forwardedHost =
+        typeof req.headers['x-forwarded-host'] === 'string'
+          ? req.headers['x-forwarded-host'].split(',')[0].trim()
+          : ''
+      const hostHeader =
+        forwardedHost ||
+        (typeof req.headers.host === 'string' && req.headers.host.trim()
+          ? req.headers.host.trim()
+          : `localhost:${this.boundPort || this.requestedPort}`)
+      const parsed = new URL(`${protoHeader}://${hostHeader}`)
+      rpID = parsed.hostname
+      expectedOrigin = parsed.origin
+    }
+
+    if (envRpId) rpID = envRpId
+    if (envOrigin) expectedOrigin = envOrigin
+
+    const isIpv4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(rpID)
+    const isIpv6 = rpID.includes(':') || rpID.startsWith('[')
+    if (isIpv4 || isIpv6) {
+      throw new Error(
+        `Passkeys (Touch ID, 1Password, Windows Hello) require a domain name rather than an IP address (${rpID}). Open http://localhost:${this.boundPort || this.requestedPort} on this device or access RingWatch via an HTTPS hostname.`,
+      )
+    }
+
+    return { rpID, expectedOrigin }
   }
 
   private buildSessionCookieHeader(token: string, maxAgeSeconds: number): string {
@@ -743,11 +773,16 @@ export class RingWatchServer {
         })
         return
       }
+      const body = await readJsonBody(req)
+      const rawType = typeof body.authenticatorType === 'string' ? body.authenticatorType : 'any'
+      const authenticatorType: 'any' | 'platform' | 'cross-platform' =
+        rawType === 'platform' || rawType === 'cross-platform' ? rawType : 'any'
       const { rpID, expectedOrigin } = this.resolveWebAuthnContext(req)
       const result = await this.authService.createPasskeyRegistrationOptions({
         userId: session.user.id,
         rpID,
         expectedOrigin,
+        authenticatorType,
       })
       this.sendJson(res, 200, result)
       return

@@ -220,10 +220,10 @@ export const webRingWatchApi: RingWatchApi = {
       }
     }
   },
-  getPasskeyRegisterOptions: () =>
+  getPasskeyRegisterOptions: (authenticatorType?: 'any' | 'platform' | 'cross-platform') =>
     apiJson<{ challengeId: string; options: Record<string, unknown> }>(
       '/api/auth/passkey/register-options',
-      { method: 'POST' },
+      { method: 'POST', body: authenticatorType ? { authenticatorType } : {} },
     ),
   verifyPasskeyRegister: async (params) => {
     try {

@@ -2301,23 +2301,67 @@ describe('Standalone Web + Backend Server (REST, Mounted Media & Optional Login 
       expect(guestRevoked.status).toBe(401)
       await guestRevoked.text()
 
-      // 8. WebAuthn Passkey registration options generate valid FIDO2 challenge & reject bogus attestation
+      // 8. WebAuthn Passkey registration options generate discoverable credentials for 1Password/Bitwarden/Touch ID/Windows Hello
       const regOptsRes = await fetch(`${base}/api/auth/passkey/register-options`, {
         method: 'POST',
         headers: {
+          'Content-Type': 'application/json',
           Cookie: adminCookie,
           Origin: `http://localhost:${port}`,
         },
+        body: JSON.stringify({ authenticatorType: 'any' }),
       })
       expect(regOptsRes.status).toBe(200)
       const regOpts = (await regOptsRes.json()) as {
         challengeId: string
-        options: { challenge: string; rp: { id: string }; user: { name: string } }
+        options: {
+          challenge: string
+          rp: { id: string }
+          user: { name: string }
+          authenticatorSelection?: {
+            residentKey?: string
+            requireResidentKey?: boolean
+            authenticatorAttachment?: string
+          }
+        }
       }
       expect(regOpts.challengeId).toBeTruthy()
       expect(regOpts.options.challenge).toBeTruthy()
       expect(regOpts.options.rp.id).toBe('localhost')
       expect(regOpts.options.user.name).toBe('matt')
+      expect(regOpts.options.authenticatorSelection?.residentKey).toBe('required')
+      expect(regOpts.options.authenticatorSelection?.requireResidentKey).toBe(true)
+      expect(regOpts.options.authenticatorSelection?.authenticatorAttachment).toBeUndefined()
+
+      // Platform-specific mode (Mac Touch ID / Windows Hello) sets authenticatorAttachment: 'platform'
+      const platformOptsRes = await fetch(`${base}/api/auth/passkey/register-options`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: adminCookie,
+          Origin: `http://localhost:${port}`,
+        },
+        body: JSON.stringify({ authenticatorType: 'platform' }),
+      })
+      expect(platformOptsRes.status).toBe(200)
+      const platformOpts = (await platformOptsRes.json()) as {
+        options: { authenticatorSelection?: { authenticatorAttachment?: string } }
+      }
+      expect(platformOpts.options.authenticatorSelection?.authenticatorAttachment).toBe('platform')
+
+      // Raw IP address origin (127.0.0.1) is rejected cleanly with actionable guidance
+      const ipOptsRes = await fetch(`${base}/api/auth/passkey/register-options`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: adminCookie,
+          Origin: `http://127.0.0.1:${port}`,
+        },
+        body: JSON.stringify({}),
+      })
+      expect(ipOptsRes.status).toBe(400)
+      const ipErr = (await ipOptsRes.json()) as { error: string }
+      expect(ipErr.error).toContain('localhost')
 
       const badRegVerify = await fetch(`${base}/api/auth/passkey/register-verify`, {
         method: 'POST',

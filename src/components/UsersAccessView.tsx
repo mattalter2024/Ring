@@ -27,7 +27,10 @@ interface UsersAccessViewProps {
   api: RingWatchApi
   authStatus: AuthStatus
   onRefreshAuth: () => Promise<void>
-  onRegisterPasskey: (name: string) => Promise<{ ok: boolean; error?: string }>
+  onRegisterPasskey: (
+    name: string,
+    authenticatorType?: 'any' | 'platform' | 'cross-platform',
+  ) => Promise<{ ok: boolean; error?: string }>
   onLogout: () => Promise<void>
   onToast: (title: string, body: string, tone?: 'ok' | 'warn' | 'err' | 'info') => void
 }
@@ -39,6 +42,17 @@ const PERM_GROUPS = [
   'AI Packages',
   'Administration',
 ] as const
+
+const PASSKEY_PRESETS: Array<{
+  label: string
+  type: 'any' | 'platform' | 'cross-platform'
+}> = [
+  { label: '1Password', type: 'any' },
+  { label: 'Mac Touch ID', type: 'platform' },
+  { label: 'Bitwarden', type: 'any' },
+  { label: 'Windows Hello', type: 'platform' },
+  { label: 'Security Key / Phone', type: 'cross-platform' },
+]
 
 function roleBadgeLabel(role: UserRole): string {
   if (role === 'custom') return 'Custom'
@@ -55,10 +69,21 @@ export function UsersAccessView({
 }: UsersAccessViewProps) {
   const canManageUsers = hasPermission(authStatus.permissions, 'users:manage')
   const currentUser = authStatus.currentUser
+  const hostname = typeof window !== 'undefined' ? window.location.hostname : 'localhost'
+  const isIpHost =
+    /^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) ||
+    hostname.includes(':') ||
+    hostname.startsWith('[')
+  const isLoopbackIp = hostname === '127.0.0.1' || hostname === '[::1]'
+  const localhostSwitchUrl =
+    typeof window !== 'undefined' && isLoopbackIp
+      ? `${window.location.protocol}//localhost${window.location.port ? `:${window.location.port}` : ''}${window.location.pathname}`
+      : null
   const webAuthnSupported =
     typeof window !== 'undefined' &&
     typeof window.PublicKeyCredential !== 'undefined' &&
-    window.isSecureContext
+    window.isSecureContext &&
+    !isIpHost
 
   const [users, setUsers] = useState<PublicUser[]>([])
   const [loadingUsers, setLoadingUsers] = useState(false)
@@ -67,8 +92,11 @@ export function UsersAccessView({
   const [passkeyName, setPasskeyName] = useState(() =>
     typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac')
       ? 'Mac Touch ID'
-      : 'Windows Hello',
+      : '1Password / Windows Hello',
   )
+  const [passkeyAuthType, setPasskeyAuthType] = useState<
+    'any' | 'platform' | 'cross-platform'
+  >('any')
   const [passkeyBusy, setPasskeyBusy] = useState(false)
 
   // Self password change state
@@ -254,11 +282,15 @@ export function UsersAccessView({
   const handleRegisterPasskeyClick = async () => {
     setPasskeyBusy(true)
     try {
-      const res = await onRegisterPasskey(passkeyName.trim() || 'Passkey')
+      const res = await onRegisterPasskey(passkeyName.trim() || 'Passkey', passkeyAuthType)
       if (res.ok) {
         await onRefreshAuth()
         await loadUsers()
-        onToast('Passkey Registered', 'You can now sign in with Touch ID, Windows Hello, or your security key.', 'ok')
+        onToast(
+          'Passkey Registered',
+          'Saved! You can now sign in with Touch ID, 1Password, Bitwarden, Windows Hello, or your security key.',
+          'ok',
+        )
       } else {
         onToast('Passkey Failed', res.error ?? 'Could not register passkey.', 'err')
       }
@@ -436,30 +468,86 @@ export function UsersAccessView({
                     Registered Passkeys ({currentUser.passkeys.length})
                   </div>
 
-                  {!webAuthnSupported && (
+                  {localhostSwitchUrl && (
                     <div
                       style={{
                         padding: '8px 10px',
                         borderRadius: 7,
                         background: 'var(--status-warn-soft)',
+                        border: '1px solid rgba(245, 158, 11, 0.35)',
                         fontSize: 12,
-                        color: 'var(--text-warn)',
+                        color: 'var(--text-primary)',
                       }}
                     >
-                      Passkeys require <code>http://localhost</code> or an <code>https://</code>{' '}
-                      URL. Open RingWatch on <code>localhost</code> or via HTTPS to register Touch ID
-                      or Windows Hello.
+                      Passkeys require <code>localhost</code> instead of <code>127.0.0.1</code>.{' '}
+                      <a
+                        href={localhostSwitchUrl}
+                        style={{ color: 'var(--accent-text)', fontWeight: 600 }}
+                      >
+                        Switch to localhost
+                      </a>{' '}
+                      to register Touch ID, 1Password, Bitwarden, or Windows Hello.
                     </div>
                   )}
 
-                  <div style={{ display: 'flex', gap: 6 }}>
+                  {!webAuthnSupported && !localhostSwitchUrl && (
+                    <div
+                      style={{
+                        padding: '8px 10px',
+                        borderRadius: 7,
+                        background: 'var(--status-warn-soft)',
+                        border: '1px solid rgba(245, 158, 11, 0.35)',
+                        fontSize: 12,
+                        color: 'var(--text-primary)',
+                      }}
+                    >
+                      Passkeys require <code>http://localhost</code> or an <code>https://</code>{' '}
+                      hostname (not a raw LAN IP). Open RingWatch on <code>localhost</code> or over
+                      HTTPS to register Touch ID, 1Password, Bitwarden, or Windows Hello.
+                    </div>
+                  )}
+
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                    {PASSKEY_PRESETS.map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        className={`btn btn-sm ${passkeyName === preset.label ? 'btn-primary' : ''}`}
+                        style={{ padding: '3px 8px', fontSize: 11.5 }}
+                        onClick={() => {
+                          setPasskeyName(preset.label)
+                          setPasskeyAuthType(preset.type)
+                        }}
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                     <input
                       type="text"
                       className="input"
-                      placeholder="Passkey label (e.g. MacBook Touch ID)"
+                      style={{ flex: '1 1 160px' }}
+                      placeholder="Passkey label (e.g. 1Password, Mac Touch ID)"
                       value={passkeyName}
                       onChange={(e) => setPasskeyName(e.target.value)}
                     />
+                    <select
+                      aria-label="Passkey storage location"
+                      className="select"
+                      style={{ width: 175, fontSize: 12 }}
+                      value={passkeyAuthType}
+                      onChange={(e) =>
+                        setPasskeyAuthType(
+                          e.target.value as 'any' | 'platform' | 'cross-platform',
+                        )
+                      }
+                    >
+                      <option value="any">Any (1Password / Bitwarden / OS)</option>
+                      <option value="platform">This Device (Touch ID / Hello)</option>
+                      <option value="cross-platform">Security Key / Phone QR</option>
+                    </select>
                     <button
                       type="button"
                       className="btn btn-primary btn-sm"
@@ -473,8 +561,10 @@ export function UsersAccessView({
 
                   {currentUser.passkeys.length === 0 ? (
                     <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                      No passkeys yet. Add Touch ID, Windows Hello, or a hardware security key for
-                      one-tap passwordless sign-in.
+                      No passkeys yet. Choose <strong>Any</strong> to save into{' '}
+                      <strong>1Password</strong>, <strong>Bitwarden</strong>,{' '}
+                      <strong>Apple Passwords / iCloud Keychain</strong>, or pick{' '}
+                      <strong>This Device</strong> for Touch ID / Windows Hello.
                     </div>
                   ) : (
                     <div className="form-stack" style={{ gap: 6 }}>
@@ -493,10 +583,14 @@ export function UsersAccessView({
                           }}
                         >
                           <div>
-                            <div style={{ fontWeight: 600, fontSize: 12.5 }}>{pk.name}</div>
-                            <div style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
-                              {pk.backedUp ? 'Synced Passkey' : 'Device Passkey'} · Added{' '}
-                              {formatRelativeTime(pk.createdAt)}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                              <span style={{ fontWeight: 600, fontSize: 12.5 }}>{pk.name}</span>
+                              <span className={`chip ${pk.backedUp ? 'accent' : ''}`} style={{ fontSize: 10.5 }}>
+                                {pk.backedUp ? 'Synced (1Password / iCloud)' : 'Device-Bound'}
+                              </span>
+                            </div>
+                            <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2 }}>
+                              Added {formatRelativeTime(pk.createdAt)}
                               {pk.lastUsedAt ? ` · Last used ${formatRelativeTime(pk.lastUsedAt)}` : ''}
                             </div>
                           </div>

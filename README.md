@@ -128,16 +128,53 @@ npm run dev
 
 ---
 
+## Privacy, Ring Login Credentials & Secret Storage
+
+RingWatch is **100% self-hosted on your own machine** with **zero external telemetry, zero cloud relay servers, and zero third-party analytics**.
+
+### How Your Ring Login Credentials Are Used
+- **Never Saved to Disk**: When you sign in via **Settings -> Ring Account**, your Ring **email**, **password**, and **2FA verification code** are sent directly over HTTPS from your local RingWatch backend to Ring's official OAuth endpoint (`ring-client-api`) **solely to exchange them for an OAuth refresh token**.
+- **Immediately Discarded**: Your Ring email, password, and 2FA code are **never written to disk, never saved in config files, never written to logs, and never sent to any third-party server**. The temporary in-memory login client is cleared immediately after authentication succeeds.
+- **Password-Free Token Option**: If you prefer not to enter your Ring password into RingWatch at all, open **Settings -> Ring Account -> Sign in with Refresh Token (Advanced)** and paste an OAuth refresh token generated locally via `npx -p ring-client-api ring-auth-cli`.
+
+### What Is Stored Locally (and How It Is Protected)
+| Credential / Secret | Stored on Disk? | Location & Encryption |
+| --- | --- | --- |
+| **Ring Email, Password & 2FA Code** | **No — Never stored** | Used transiently in memory only during OAuth sign-in, then discarded. |
+| **Ring OAuth Refresh Token** | **Yes — Encrypted locally** | Stored inside `ringwatch-config.json` in `RINGWATCH_DATA_DIR`, encrypted at rest using **AES-256-GCM** with a unique random 256-bit local key (`.ringwatch-secret.key`, file permissions `0600`) and a random 96-bit IV + 128-bit auth tag per secret. Auto-updates silently when Ring rotates tokens. |
+| **OpenAI / Gemini Vision API Keys** *(optional)* | **Yes — Encrypted locally** | Same **AES-256-GCM** encryption inside `ringwatch-config.json`. Only used if you enable AI Package Detection and supply your own key. |
+| **Web UI Passwords** *(optional)* | **Hashed only** | Stored in `ringwatch-users.json` as salted **scrypt** hashes (`scrypt$<16-byte-salt>$<32-byte-hash>`), verified with timing-safe comparison. |
+| **WebAuthn Passkeys** *(Touch ID, 1Password, Bitwarden, Windows Hello)* | **Public key only** | `ringwatch-users.json` stores only the FIDO2 credential ID and public key. Your biometrics and private key never leave Touch ID, Windows Hello, 1Password, Bitwarden, iCloud Keychain, or your hardware security key. |
+
+### Additional Credential Safeguards
+- **Never Exposed to the Browser**: API responses (`GET /api/bootstrap`, `PATCH /api/settings`) only return boolean indicators (`hasRingToken`, `hasOpenaiKey`, `hasGeminiKey`) — raw tokens and API keys never leave the local backend.
+- **Automatic Log Redaction**: Rotating backend logs (`ringwatch-backend.log`) and **Troubleshooting Log** downloads automatically scrub `Bearer` tokens, `refresh_token` payloads, OpenAI keys (`sk-...`), Gemini keys (`AIza...`), and `x-goog-api-key` headers before writing.
+- **One-Click Revocation**: Clicking **Disconnect** in **Settings -> Ring Account** immediately deletes the encrypted Ring refresh token from `ringwatch-config.json`. You can also revoke the `RingWatch Windows` session anytime from the official **Ring App -> Control Center -> Authorized Client Devices**.
+
+---
+
+## Passkeys (Touch ID, 1Password, Bitwarden, iCloud Keychain & Windows Hello)
+
+RingWatch uses standard **FIDO2 / WebAuthn discoverable Passkeys** (`residentKey: required`, ES256/RS256) with **WebAuthn Conditional UI** (`autocomplete="username webauthn"`):
+
+- **Password Managers (1Password, Bitwarden, Dashlane, Proton Pass, Apple Passwords)**: Leave the Passkey storage selector on **Any (1Password / Bitwarden / OS)** when adding a Passkey in **Access & Passkeys**. Your browser extension or OS password manager will prompt to save a **Synced Passkey**, and clicking the **Username** field on the Sign-In screen will automatically show Passkey & password autofill.
+- **macOS Touch ID & Windows Hello**: Pick **Mac Touch ID** or **Windows Hello** (or choose **This Device**) to bind a biometric passkey directly to your Mac or PC.
+- **Important URL Requirement (WebAuthn Browser Rule)**: Browsers only allow Passkeys on `http://localhost:3456` or an `https://` hostname (never on raw IP addresses like `127.0.0.1` or `http://192.168.x.x`). For LAN Passkey access across Macs, Windows PCs, and phones, put RingWatch behind HTTPS (e.g. Tailscale HTTPS, Caddy, or Nginx) and optionally set `RINGWATCH_WEBAUTHN_RP_ID` / `RINGWATCH_WEBAUTHN_ORIGIN`.
+
+---
+
 ## Configuration (Environment Variables — All Optional)
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `3456` | HTTP port for Web UI, REST API, SSE, and media streams |
 | `HOST` | `0.0.0.0` | Bind address (`127.0.0.1` for local-only, `0.0.0.0` for LAN access) |
-| `RINGWATCH_DATA_DIR` | `%APPDATA%\RingWatch` (Win) / `~/.ringwatch` | Config, encrypted secrets, user database, logs, and recordings index folder |
+| `RINGWATCH_DATA_DIR` | `%APPDATA%\RingWatch` (Win) / `C:\ProgramData\RingWatch\data` (Win Service) / `~/.ringwatch` | Config, encrypted secrets, user database, logs, and recordings index folder |
 | `RINGWATCH_RECORDINGS_DIR` | `~/Videos/RingWatch` | Default primary NVR recordings directory |
 | `RINGWATCH_DEBUG` | `0` | Set to `1` for verbose debug logging |
 | `RINGWATCH_AUTH_PASSWORD` | *(unset — managed via Access & Passkeys UI)* | Optional environment-enforced fallback admin login password |
+| `RINGWATCH_WEBAUTHN_RP_ID` | *(derived from request Host/Origin)* | Optional Relying Party domain override when serving behind an HTTPS reverse proxy |
+| `RINGWATCH_WEBAUTHN_ORIGIN` | *(derived from request Origin)* | Optional full `https://...` origin override for WebAuthn behind a reverse proxy |
 
 ---
 

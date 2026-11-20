@@ -50,6 +50,7 @@ export function App() {
     login,
     loginWithPasskey,
     registerPasskey,
+    cancelPendingPasskeyCeremony,
     logout,
     setAuthPassword,
     connection,
@@ -1109,8 +1110,10 @@ export function App() {
     return (
       <LoginGate
         hasUsers={authStatus.hasUsers}
+        hasPasskeys={Boolean(authStatus.hasPasskeys)}
         onLogin={login}
         onPasskeyLogin={loginWithPasskey}
+        onCancelConditionalPasskey={cancelPendingPasskeyCeremony}
       />
     )
   }

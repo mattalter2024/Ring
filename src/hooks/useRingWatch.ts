@@ -17,6 +17,7 @@ import type {
 import {
   startAuthentication,
   startRegistration,
+  WebAuthnAbortService,
   type PublicKeyCredentialCreationOptionsJSON,
   type PublicKeyCredentialRequestOptionsJSON,
 } from '@simplewebauthn/browser'
@@ -302,13 +303,29 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     [refreshAuthStatus],
   )
 
+  const cancelPendingPasskeyCeremony = useCallback(() => {
+    try {
+      WebAuthnAbortService.cancelCeremony()
+    } catch {
+      // Ignore if no ceremony is active
+    }
+  }, [])
+
   const loginWithPasskey = useCallback(
-    async (username?: string): Promise<{ ok: boolean; error?: string }> => {
+    async (
+      username?: string,
+      options?: { useBrowserAutofill?: boolean },
+    ): Promise<{ ok: boolean; error?: string }> => {
       try {
-        const { challengeId, options } =
+        const useAutofill = Boolean(options?.useBrowserAutofill)
+        if (!useAutofill) {
+          cancelPendingPasskeyCeremony()
+        }
+        const { challengeId, options: authOpts } =
           await webRingWatchApi.getPasskeyLoginOptions(username)
         const assertion = await startAuthentication({
-          optionsJSON: options as unknown as PublicKeyCredentialRequestOptionsJSON,
+          optionsJSON: authOpts as unknown as PublicKeyCredentialRequestOptionsJSON,
+          useBrowserAutofill: useAutofill,
         })
         const verified = await webRingWatchApi.verifyPasskeyLogin({
           challengeId,
@@ -319,6 +336,17 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
         }
         return verified
       } catch (err) {
+        const name = err instanceof Error ? err.name : ''
+        if (name === 'AbortError') {
+          return { ok: false, error: '' }
+        }
+        if (name === 'NotAllowedError') {
+          return {
+            ok: false,
+            error:
+              'Passkey prompt was cancelled or timed out. Try again or pick your passkey in Touch ID / 1Password / Windows Hello.',
+          }
+        }
         return {
           ok: false,
           error:
@@ -328,14 +356,18 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
         }
       }
     },
-    [refreshAuthStatus],
+    [cancelPendingPasskeyCeremony, refreshAuthStatus],
   )
 
   const registerPasskey = useCallback(
-    async (name: string): Promise<{ ok: boolean; error?: string }> => {
+    async (
+      name: string,
+      authenticatorType: 'any' | 'platform' | 'cross-platform' = 'any',
+    ): Promise<{ ok: boolean; error?: string }> => {
       try {
+        cancelPendingPasskeyCeremony()
         const { challengeId, options } =
-          await webRingWatchApi.getPasskeyRegisterOptions()
+          await webRingWatchApi.getPasskeyRegisterOptions(authenticatorType)
         const attestation = await startRegistration({
           optionsJSON: options as unknown as PublicKeyCredentialCreationOptionsJSON,
         })
@@ -349,6 +381,20 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
         }
         return verified
       } catch (err) {
+        const errName = err instanceof Error ? err.name : ''
+        if (errName === 'InvalidStateError') {
+          return {
+            ok: false,
+            error: 'This authenticator already has a Passkey registered for your account.',
+          }
+        }
+        if (errName === 'NotAllowedError') {
+          return {
+            ok: false,
+            error:
+              'Passkey creation was cancelled. Approve the prompt in Touch ID, 1Password, Bitwarden, or Windows Hello to save it.',
+          }
+        }
         return {
           ok: false,
           error:
@@ -358,7 +404,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
         }
       }
     },
-    [refreshAuthStatus],
+    [cancelPendingPasskeyCeremony, refreshAuthStatus],
   )
 
   const logout = useCallback(async () => {
@@ -393,6 +439,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     login,
     loginWithPasskey,
     registerPasskey,
+    cancelPendingPasskeyCeremony,
     logout,
     setAuthPassword,
     connection,
