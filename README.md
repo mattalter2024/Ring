@@ -159,7 +159,22 @@ RingWatch uses standard **FIDO2 / WebAuthn discoverable Passkeys** (`residentKey
 
 - **Password Managers (1Password, Bitwarden, Dashlane, Proton Pass, Apple Passwords)**: Leave the Passkey storage selector on **Any (1Password / Bitwarden / OS)** when adding a Passkey in **Access & Passkeys**. Your browser extension or OS password manager will prompt to save a **Synced Passkey**, and clicking the **Username** field on the Sign-In screen will automatically show Passkey & password autofill.
 - **macOS Touch ID & Windows Hello**: Pick **Mac Touch ID** or **Windows Hello** (or choose **This Device**) to bind a biometric passkey directly to your Mac or PC.
-- **Important URL Requirement (WebAuthn Browser Rule)**: Browsers only allow Passkeys on `http://localhost:3456` or an `https://` hostname (never on raw IP addresses like `127.0.0.1` or `http://192.168.x.x`). For LAN Passkey access across Macs, Windows PCs, and phones, put RingWatch behind HTTPS (e.g. Tailscale HTTPS, Caddy, or Nginx) and optionally set `RINGWATCH_WEBAUTHN_RP_ID` / `RINGWATCH_WEBAUTHN_ORIGIN`.
+- **Important URL Requirement (WebAuthn Browser Rule)**: Browsers only allow Passkeys on `http://localhost:3456` or an `https://` hostname (never on raw IP addresses like `127.0.0.1` or `http://192.168.x.x`). RingWatch includes **built-in HTTPS (`:3443`)** out of the box—use your hostname (e.g. `https://<hostname>.local:3443` or your custom domain) and optionally set `RINGWATCH_WEBAUTHN_RP_ID` / `RINGWATCH_WEBAUTHN_ORIGIN`.
+
+---
+
+## Built-In HTTPS & TLS Certificates (Auto-Renewing + Custom Certs)
+
+RingWatch automatically serves **TLS 1.2/1.3 HTTPS** on port **`3443`** alongside HTTP (`3456`), with zero external `openssl` dependencies and **zero-downtime live certificate hot-reloading** (NVR recordings never stop when a certificate updates):
+
+- **Auto-Renewing Self-Signed Certificate (Default)**: On first launch, RingWatch generates a 365-day RFC 5280 **X.509 v3 ECDSA P-256** certificate covering `localhost`, your machine hostname (`<host>` & `<host>.local`), `127.0.0.1`, `::1`, all active LAN IPv4 addresses, and any custom SAN hostnames you add in **Settings -> HTTPS & TLS Certificates**.
+  - **Automatic Renewal**: Every 12 hours (and on startup), RingWatch checks certificate validity and automatically regenerates + hot-reloads the certificate when fewer than `30` days remain (configurable) **or** whenever your machine's LAN IP / custom SAN hostnames change.
+  - **Easy Browser Trust**: Click **Download Cert (.crt)** in **Settings -> HTTPS & TLS Certificates** (or download `/api/tls/certificate/download`) to import into macOS Keychain or Windows Trusted Root if you want a green padlock with zero self-signed warning.
+- **Bring Your Own Certificate (3 Methods)**:
+  1. **Upload / Paste PEM in Web UI**: Open **Settings -> HTTPS & TLS Certificates -> Upload / Paste Custom Cert (PEM)** to load `.crt`/`.pem` + `.key` + optional CA chain. RingWatch validates key/cert match & expiry before saving (`0600`) and hot-reloading live.
+  2. **External Cert Files on Disk (Let's Encrypt / Certbot / win-acme / Tailscale)**: Open **Settings -> HTTPS & TLS Certificates -> Use Cert Files on Disk** and enter paths to `fullchain.pem`, `privkey.pem`, and optional CA chain. RingWatch automatically detects renewals on disk and hot-reloads with zero restart.
+  3. **Environment Variables**: Set `RINGWATCH_TLS_CERT_PATH`, `RINGWATCH_TLS_KEY_PATH`, and optional `RINGWATCH_TLS_CA_PATH` (also auto-reloaded when files update on disk).
+- **Optional HTTP -> HTTPS Redirect**: Enable **Redirect HTTP -> HTTPS** in **Settings** (`308 Permanent Redirect`; local `/api/health` and `/api/internal/shutdown` remain exempt so the Windows Service & Tray Icon never break).
 
 ---
 
@@ -168,8 +183,13 @@ RingWatch uses standard **FIDO2 / WebAuthn discoverable Passkeys** (`residentKey
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `3456` | HTTP port for Web UI, REST API, SSE, and media streams |
+| `RINGWATCH_HTTPS_PORT` (`HTTPS_PORT`) | `3443` | HTTPS (TLS 1.2/1.3) port for Web UI, REST API, SSE, and media streams |
+| `RINGWATCH_HTTPS_ENABLED` | `true` | Set to `false` to disable the built-in HTTPS listener |
+| `RINGWATCH_TLS_CERT_PATH` | *(auto self-signed)* | Path to a custom PEM certificate / fullchain file (auto-reloaded when renewed on disk) |
+| `RINGWATCH_TLS_KEY_PATH` | *(auto self-signed)* | Path to the matching PEM private key file |
+| `RINGWATCH_TLS_CA_PATH` | *(optional)* | Optional path to a PEM CA / intermediate chain file |
 | `HOST` | `0.0.0.0` | Bind address (`127.0.0.1` for local-only, `0.0.0.0` for LAN access) |
-| `RINGWATCH_DATA_DIR` | `%APPDATA%\RingWatch` (Win) / `C:\ProgramData\RingWatch\data` (Win Service) / `~/.ringwatch` | Config, encrypted secrets, user database, logs, and recordings index folder |
+| `RINGWATCH_DATA_DIR` | `%APPDATA%\RingWatch` (Win) / `C:\ProgramData\RingWatch\data` (Win Service) / `~/.ringwatch` | Config, encrypted secrets, TLS certs, user database, logs, and recordings index folder |
 | `RINGWATCH_RECORDINGS_DIR` | `~/Videos/RingWatch` | Default primary NVR recordings directory |
 | `RINGWATCH_DEBUG` | `0` | Set to `1` for verbose debug logging |
 | `RINGWATCH_AUTH_PASSWORD` | *(unset — managed via Access & Passkeys UI)* | Optional environment-enforced fallback admin login password |
@@ -183,6 +203,6 @@ RingWatch uses standard **FIDO2 / WebAuthn discoverable Passkeys** (`residentKey
 ```bash
 npm audit --omit=dev --audit-level=high   # Zero high/critical runtime vulnerabilities
 npm run typecheck                         # TypeScript checks for Web Frontend & Node.js Backend
-npm test                                  # 39 unit & HTTP/SSE/RBAC/Vault integration tests
+npm test                                  # 46 unit, AI Cost-Saver, HTTPS/TLS & API integration tests
 npm run build                             # Production build (dist/ + dist-server/)
 ```

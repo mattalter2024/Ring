@@ -311,6 +311,54 @@ export interface PackageDetectionRecord {
   rawError?: string
 }
 
+export type TlsCertMode = 'self-signed' | 'custom-pem' | 'custom-files'
+
+export interface TlsConfig {
+  enabled: boolean
+  httpsPort: number
+  redirectHttpToHttps: boolean
+  mode: TlsCertMode
+  autoRenewDaysBeforeExpiry: number
+  customHostnames: string[]
+  customCertPath: string
+  customKeyPath: string
+  customCaPath: string
+  hasUploadedCustomCert: boolean
+}
+
+export interface TlsConfigPatch {
+  enabled?: boolean
+  httpsPort?: number
+  redirectHttpToHttps?: boolean
+  mode?: TlsCertMode
+  autoRenewDaysBeforeExpiry?: number
+  customHostnames?: string[]
+  customCertPath?: string
+  customKeyPath?: string
+  customCaPath?: string
+}
+
+export interface TlsStatus {
+  enabled: boolean
+  active: boolean
+  httpsPort: number | null
+  redirectHttpToHttps: boolean
+  mode: TlsCertMode
+  managedByEnv: boolean
+  subject: string | null
+  issuer: string | null
+  validFrom: string | null
+  validTo: string | null
+  daysRemaining: number | null
+  fingerprint256: string | null
+  subjectAltNames: string[]
+  autoRenewEnabled: boolean
+  autoRenewDaysBeforeExpiry: number
+  lastRenewedAt: string | null
+  certSource: 'self-signed' | 'uploaded-pem' | 'file-paths' | 'env-files' | 'none'
+  lastError: string | null
+}
+
 export interface AppSettings {
   mode: AppMode
   recordingsDir: string
@@ -336,6 +384,7 @@ export interface AppSettings {
   startMinimized: boolean
   hasRingToken: boolean
   packageAi: PackageAiConfig
+  tls: TlsConfig
 }
 
 export interface AppSettingsPatch {
@@ -362,6 +411,7 @@ export interface AppSettingsPatch {
   minimizeToTray?: boolean
   startMinimized?: boolean
   packageAi?: PackageAiConfigPatch
+  tls?: TlsConfigPatch
 }
 
 export interface LiveStreamSession {
@@ -441,6 +491,7 @@ export interface RingWatchBootstrap {
   recordings: LocalRecordingItem[]
   packageDetections: PackageDetectionRecord[]
   aiUsageStats?: AiUsageStats
+  tlsStatus?: TlsStatus
   activeStreams: LiveStreamSession[]
   authStatus?: AuthStatus
   systemTheme?: SystemThemeInfo
@@ -609,6 +660,20 @@ export interface RingWatchApi {
   chooseRecordingsFolder: () => Promise<string | null>
   chooseFailoverFolder: () => Promise<string | null>
 
+  getTlsStatus: () => Promise<TlsStatus>
+  regenerateSelfSignedCert: (customHostnames?: string[]) => Promise<TlsStatus>
+  uploadCustomTlsCert: (params: {
+    certPem: string
+    keyPem: string
+    caPem?: string
+  }) => Promise<TlsStatus>
+  useCustomTlsCertFiles: (params: {
+    certPath: string
+    keyPath: string
+    caPath?: string
+  }) => Promise<TlsStatus>
+  switchToSelfSignedCert: () => Promise<TlsStatus>
+
   onConnectionChanged: (cb: (status: ConnectionStatus) => void) => () => void
   onSettingsUpdated: (cb: (settings: AppSettings) => void) => () => void
   onCamerasUpdated: (cb: (cameras: RingCameraInfo[]) => void) => () => void
@@ -621,6 +686,7 @@ export interface RingWatchApi {
   onStorageStatsUpdated: (cb: (stats: StorageStats) => void) => () => void
   onPackageDetection: (cb: (record: PackageDetectionRecord) => void) => () => void
   onAiUsageUpdated: (cb: (stats: AiUsageStats) => void) => () => void
+  onTlsStatusUpdated: (cb: (status: TlsStatus) => void) => () => void
   onPlayAlertSound: (cb: (payload: AlertSoundPayload) => void) => () => void
   onFocusCamera: (cb: (cameraId: string) => void) => () => void
   onStreamsUpdated: (cb: (streams: LiveStreamSession[]) => void) => () => void

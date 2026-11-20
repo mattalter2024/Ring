@@ -105,6 +105,20 @@ async function main(): Promise<void> {
     }
   }
 
+  const rawHttpsPort = process.env.RINGWATCH_HTTPS_PORT ?? process.env.HTTPS_PORT
+  const parsedHttpsPort = rawHttpsPort !== undefined ? Number(rawHttpsPort) : undefined
+  const httpsPort =
+    parsedHttpsPort !== undefined && Number.isFinite(parsedHttpsPort) && parsedHttpsPort > 0
+      ? parsedHttpsPort
+      : undefined
+  const rawHttpsEnabled = process.env.RINGWATCH_HTTPS_ENABLED?.trim().toLowerCase()
+  const httpsEnabled =
+    rawHttpsEnabled === '0' || rawHttpsEnabled === 'false'
+      ? false
+      : rawHttpsEnabled === '1' || rawHttpsEnabled === 'true'
+        ? true
+        : undefined
+
   const server = new RingWatchServer({
     dataDir,
     defaultRecordingsDir,
@@ -112,6 +126,11 @@ async function main(): Promise<void> {
     demoAssetsDir,
     host,
     port,
+    httpsPort,
+    httpsEnabled,
+    tlsCertPath: process.env.RINGWATCH_TLS_CERT_PATH,
+    tlsKeyPath: process.env.RINGWATCH_TLS_KEY_PATH,
+    tlsCaPath: process.env.RINGWATCH_TLS_CA_PATH,
     envAuthPassword: process.env.RINGWATCH_AUTH_PASSWORD,
     logger,
     controlToken: process.env.RINGWATCH_CONTROL_TOKEN,
@@ -122,16 +141,32 @@ async function main(): Promise<void> {
   serverRef = server
 
   const bound = await server.start()
+  const tlsStatus = server.getTlsStatus()
   console.log('')
   console.log('==============================================================')
   console.log('  RingWatch 24/7 NVR & AI Package Backend')
   console.log('==============================================================')
-  console.log(`  Local Web UI : http://localhost:${bound.port}`)
+  console.log(`  Local HTTP   : http://localhost:${bound.port}`)
+  if (bound.httpsPort) {
+    console.log(`  Local HTTPS  : https://localhost:${bound.httpsPort}`)
+  }
   if (host === '0.0.0.0') {
     for (const ip of listLanIpv4Addresses()) {
-      console.log(`  LAN Web UI   : http://${ip}:${bound.port}`)
+      console.log(`  LAN HTTP     : http://${ip}:${bound.port}`)
+      if (bound.httpsPort) {
+        console.log(`  LAN HTTPS    : https://${ip}:${bound.httpsPort}`)
+      }
     }
   }
+  console.log(
+    `  TLS Cert     : ${
+      tlsStatus.active
+        ? `${tlsStatus.certSource} (${tlsStatus.daysRemaining ?? '?'}d remaining${tlsStatus.autoRenewEnabled ? ', auto-renew ON' : ''})`
+        : tlsStatus.lastError
+          ? `Disabled/Error (${tlsStatus.lastError})`
+          : 'Disabled'
+    }`,
+  )
   console.log(`  Data Folder  : ${dataDir}`)
   console.log(`  Recordings   : ${server.configStore.getPublicSettings().recordingsDir}`)
   console.log(`  Logs Folder  : ${logsDir}${debugEnabled ? ' (VERBOSE DEBUG ON)' : ''}`)

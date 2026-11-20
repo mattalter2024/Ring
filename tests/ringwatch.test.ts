@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import https from 'node:https'
 import os from 'node:os'
 import path from 'node:path'
+import type tls from 'node:tls'
 import { ConfigStore, type SecretCryptoAdapter } from '../server/services/configStore'
 import {
   AiPackageService,
@@ -24,6 +26,11 @@ import {
   verifyPassword,
   verifySessionToken,
 } from '../server/services/secretCrypto'
+import {
+  TlsCertService,
+  generateSelfSignedX509Cert,
+  validateTlsCertAndKey,
+} from '../server/services/tlsCertService'
 import { RingWatchServer } from '../server/httpServer'
 
 function makeTempDir(): string {
@@ -3157,6 +3164,261 @@ describe('AI Spend Reduction (Cost-Saver Pipeline #1–#6)', () => {
       }
       expect(boot.aiUsageStats?.skippedByLocalGateToday).toBe(1)
       expect(boot.aiUsageStats?.dailyScanLimit).toBe(60)
+    } finally {
+      await server.stop()
+    }
+  })
+})
+
+describe('HTTPS & TLS Certificates (Auto-Renewing Self-Signed & Custom Certs)', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = makeTempDir()
+  })
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    } catch {
+      // Ignore transient Windows NTFS file handle locks in temp test dir
+    }
+  })
+
+  function httpsGetJson(port: number, urlPath: string): Promise<{
+    statusCode: number
+    body: string
+    peerFingerprint256: string
+    peerSubject: string
+  }> {
+    return new Promise((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: urlPath,
+          method: 'GET',
+          rejectUnauthorized: false,
+          agent: false,
+        },
+        (res) => {
+          const sock = res.socket as tls.TLSSocket
+          const peer = sock.getPeerCertificate()
+          const chunks: Buffer[] = []
+          res.on('data', (c: Buffer) => chunks.push(c))
+          res.on('end', () => {
+            resolve({
+              statusCode: res.statusCode ?? 0,
+              body: Buffer.concat(chunks).toString('utf-8'),
+              peerFingerprint256: peer.fingerprint256 ?? '',
+              peerSubject: peer.subject?.CN ?? '',
+            })
+          })
+        },
+      )
+      req.on('error', reject)
+      req.end()
+    })
+  }
+
+  it('generates valid RFC 5280 X.509 v3 self-signed certs with SANs and auto-renews when expiring or when SANs change', () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    const reloadSpy = vi.fn()
+    const tlsSvc = new TlsCertService({
+      dataDir: tmpDir,
+      configStore: store,
+      onMaterialUpdated: reloadSpy,
+    })
+
+    // 1. Initial self-signed generation
+    const initial = tlsSvc.ensureCertificate({ notifyOnReload: false })
+    const x509 = new crypto.X509Certificate(initial.material.cert)
+    expect(x509.verify(x509.publicKey)).toBe(true)
+    expect(x509.subjectAltName).toContain('DNS:localhost')
+    expect(x509.subjectAltName).toContain('IP Address:127.0.0.1')
+    const initialFp = x509.fingerprint256
+
+    // Subsequent check with healthy cert does NOT regenerate
+    const second = tlsSvc.ensureCertificate({ notifyOnReload: true })
+    expect(second.reloaded).toBe(false)
+    expect(reloadSpy).not.toHaveBeenCalled()
+
+    // 2. Simulate an expiring self-signed cert (only 5 days remaining < 30-day threshold)
+    const expiring = generateSelfSignedX509Cert({
+      commonName: 'localhost',
+      dnsNames: ['localhost'],
+      ipAddresses: ['127.0.0.1', '::1'],
+      validityDays: 5,
+    })
+    fs.writeFileSync(path.join(tmpDir, 'certs', 'self-signed-cert.pem'), expiring.certPem)
+    fs.writeFileSync(path.join(tmpDir, 'certs', 'self-signed-key.pem'), expiring.keyPem)
+
+    const renewed = tlsSvc.ensureCertificate({ notifyOnReload: true })
+    expect(renewed.reloaded).toBe(true)
+    expect(reloadSpy).toHaveBeenCalledTimes(1)
+    const renewedX509 = new crypto.X509Certificate(renewed.material.cert)
+    expect(renewedX509.fingerprint256).not.toBe(initialFp)
+    const daysLeft = Math.floor(
+      (new Date(renewedX509.validTo).getTime() - Date.now()) / (24 * 60 * 60 * 1000),
+    )
+    expect(daysLeft).toBeGreaterThan(350)
+
+    // 3. Adding a custom hostname SAN triggers automatic renewal with the new SAN
+    store.updateSettings({ tls: { customHostnames: ['ringwatch.home.arpa'] } })
+    const sanRenewed = tlsSvc.ensureCertificate({ notifyOnReload: true })
+    expect(sanRenewed.reloaded).toBe(true)
+    const sanX509 = new crypto.X509Certificate(sanRenewed.material.cert)
+    expect(sanX509.subjectAltName).toContain('DNS:ringwatch.home.arpa')
+
+    // 4. Rejects mismatched key/cert pairs and expired certificates cleanly
+    const other = generateSelfSignedX509Cert({
+      commonName: 'other.local',
+      dnsNames: ['other.local'],
+      ipAddresses: ['127.0.0.1'],
+    })
+    expect(() => validateTlsCertAndKey(sanRenewed.material.cert, other.keyPem)).toThrow(
+      /validation failed/i,
+    )
+
+    const expired = generateSelfSignedX509Cert({
+      commonName: 'expired.local',
+      dnsNames: ['expired.local'],
+      ipAddresses: ['127.0.0.1'],
+      validityDays: 1,
+      notBefore: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000),
+    })
+    expect(() => validateTlsCertAndKey(expired.certPem, expired.keyPem)).toThrow(/expired/i)
+  })
+
+  it('serves live HTTPS, hot-reloads uploaded custom PEM and external cert files without restart, downloads public .crt, and redirects HTTP->HTTPS', async () => {
+    const recDir = path.join(tmpDir, 'videos')
+    const webDir = path.join(tmpDir, 'web')
+    fs.mkdirSync(webDir, { recursive: true })
+    fs.writeFileSync(path.join(webDir, 'index.html'), '<html>RingWatch HTTPS</html>')
+
+    const preStore = new ConfigStore(tmpDir, recDir)
+    preStore.updateSettings({ continuousAutoStart: false })
+
+    const server = new RingWatchServer({
+      dataDir: tmpDir,
+      defaultRecordingsDir: recDir,
+      demoAssetsDir: path.resolve(process.cwd(), 'public', 'demo'),
+      webDistDir: webDir,
+      host: '127.0.0.1',
+      port: 0,
+      httpsPort: 0,
+    })
+
+    const bound = await server.start()
+    expect(bound.httpsPort).toBeGreaterThan(0)
+    const httpBase = `http://127.0.0.1:${bound.port}`
+    const httpsPort = bound.httpsPort!
+
+    try {
+      // 1. Live HTTPS handshake works immediately with auto-generated self-signed cert
+      const initialHttps = await httpsGetJson(httpsPort, '/api/health')
+      expect(initialHttps.statusCode).toBe(200)
+      const health = JSON.parse(initialHttps.body) as {
+        ok: boolean
+        httpsActive: boolean
+        httpsPort: number
+      }
+      expect(health.ok).toBe(true)
+      expect(health.httpsActive).toBe(true)
+      expect(health.httpsPort).toBe(httpsPort)
+      const selfSignedFp = initialHttps.peerFingerprint256
+      expect(selfSignedFp.length).toBeGreaterThan(20)
+
+      // 2. Public certificate download returns ONLY public PEM (never private key)
+      const dlRes = await fetch(`${httpBase}/api/tls/certificate/download`)
+      expect(dlRes.status).toBe(200)
+      const dlText = await dlRes.text()
+      expect(dlText).toContain('-----BEGIN CERTIFICATE-----')
+      expect(dlText).not.toContain('PRIVATE KEY')
+
+      // 3. Upload custom PEM certificate -> live HTTPS server hot-reloads with ZERO restart!
+      const customA = generateSelfSignedX509Cert({
+        commonName: 'custom-pem.ringwatch.local',
+        dnsNames: ['custom-pem.ringwatch.local', 'localhost'],
+        ipAddresses: ['127.0.0.1'],
+        validityDays: 180,
+      })
+      const customAFp = new crypto.X509Certificate(customA.certPem).fingerprint256
+      const uploadRes = await fetch(`${httpBase}/api/tls/custom-pem`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ certPem: customA.certPem, keyPem: customA.keyPem }),
+      })
+      expect(uploadRes.status).toBe(200)
+      const uploadStatus = (await uploadRes.json()) as {
+        certSource: string
+        fingerprint256: string
+      }
+      expect(uploadStatus.certSource).toBe('uploaded-pem')
+      expect(uploadStatus.fingerprint256).toBe(customAFp)
+
+      const afterUploadHttps = await httpsGetJson(httpsPort, '/api/health')
+      expect(afterUploadHttps.peerFingerprint256).toBe(customAFp)
+      expect(afterUploadHttps.peerSubject).toBe('custom-pem.ringwatch.local')
+
+      // 4. External cert files on disk (Certbot / win-acme workflow) + live auto-reload on file update
+      const extDir = path.join(tmpDir, 'external-acme')
+      fs.mkdirSync(extDir, { recursive: true })
+      const extCertPath = path.join(extDir, 'fullchain.pem')
+      const extKeyPath = path.join(extDir, 'privkey.pem')
+
+      const acmeV1 = generateSelfSignedX509Cert({
+        commonName: 'acme-v1.example.test',
+        dnsNames: ['acme-v1.example.test', 'localhost'],
+        ipAddresses: ['127.0.0.1'],
+        validityDays: 90,
+      })
+      fs.writeFileSync(extCertPath, acmeV1.certPem)
+      fs.writeFileSync(extKeyPath, acmeV1.keyPem)
+
+      const filesRes = await fetch(`${httpBase}/api/tls/custom-files`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ certPath: extCertPath, keyPath: extKeyPath }),
+      })
+      expect(filesRes.status).toBe(200)
+      const acmeV1Fp = new crypto.X509Certificate(acmeV1.certPem).fingerprint256
+      expect((await httpsGetJson(httpsPort, '/api/health')).peerFingerprint256).toBe(acmeV1Fp)
+
+      // Simulate Certbot/win-acme renewing files on disk -> ensureCertificate auto-hot-reloads!
+      const acmeV2 = generateSelfSignedX509Cert({
+        commonName: 'acme-v2.example.test',
+        dnsNames: ['acme-v2.example.test', 'localhost'],
+        ipAddresses: ['127.0.0.1'],
+        validityDays: 90,
+      })
+      fs.writeFileSync(extCertPath, acmeV2.certPem)
+      fs.writeFileSync(extKeyPath, acmeV2.keyPem)
+      const reloadRes = server.tlsCertService.ensureCertificate({ notifyOnReload: true })
+      expect(reloadRes.reloaded).toBe(true)
+      const acmeV2Fp = new crypto.X509Certificate(acmeV2.certPem).fingerprint256
+      expect((await httpsGetJson(httpsPort, '/api/health')).peerFingerprint256).toBe(acmeV2Fp)
+
+      // 5. Switch back to auto-renewing self-signed cert
+      const backRes = await fetch(`${httpBase}/api/tls/use-self-signed`, { method: 'POST' })
+      expect(backRes.status).toBe(200)
+      expect((await httpsGetJson(httpsPort, '/api/health')).peerFingerprint256).toBe(selfSignedFp)
+
+      // 6. Optional HTTP -> HTTPS redirect (exempting /api/health for Windows Service & Tray)
+      const patchRes = await fetch(`${httpBase}/api/settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tls: { redirectHttpToHttps: true } }),
+      })
+      expect(patchRes.status).toBe(200)
+
+      const redirectRes = await fetch(`${httpBase}/`, { redirect: 'manual' })
+      expect(redirectRes.status).toBe(308)
+      expect(redirectRes.headers.get('location')).toBe(`https://127.0.0.1:${httpsPort}/`)
+
+      // /api/health MUST remain 200 on HTTP so Windows Tray & Service health checks never break
+      const healthHttp = await fetch(`${httpBase}/api/health`, { redirect: 'manual' })
+      expect(healthHttp.status).toBe(200)
     } finally {
       await server.stop()
     }

@@ -21,6 +21,7 @@ import type {
   StorageDriveInfo,
   StorageStats,
   SystemThemeInfo,
+  TlsStatus,
 } from '@shared/types'
 
 class ApiError extends Error {
@@ -74,6 +75,7 @@ const SSE_CHANNELS = [
   'storage-stats-updated',
   'package-detection',
   'ai-usage-updated',
+  'tls-status-updated',
   'play-alert-sound',
   'focus-camera',
   'streams-updated',
@@ -538,6 +540,19 @@ export const webRingWatchApi: RingWatchApi = {
   chooseRecordingsFolder: async () => null,
   chooseFailoverFolder: async () => null,
 
+  getTlsStatus: () => apiJson<TlsStatus>('/api/tls/status'),
+  regenerateSelfSignedCert: (customHostnames?: string[]) =>
+    apiJson<TlsStatus>('/api/tls/regenerate', {
+      method: 'POST',
+      body: customHostnames !== undefined ? { customHostnames } : {},
+    }),
+  uploadCustomTlsCert: (params: { certPem: string; keyPem: string; caPem?: string }) =>
+    apiJson<TlsStatus>('/api/tls/custom-pem', { method: 'POST', body: params }),
+  useCustomTlsCertFiles: (params: { certPath: string; keyPath: string; caPath?: string }) =>
+    apiJson<TlsStatus>('/api/tls/custom-files', { method: 'POST', body: params }),
+  switchToSelfSignedCert: () =>
+    apiJson<TlsStatus>('/api/tls/use-self-signed', { method: 'POST', body: {} }),
+
   onConnectionChanged: (cb) => sseHub.subscribe<ConnectionStatus>('connection-changed', cb),
   onSettingsUpdated: (cb) => sseHub.subscribe<AppSettings>('settings-updated', cb),
   onCamerasUpdated: (cb) => sseHub.subscribe<RingCameraInfo[]>('cameras-updated', cb),
@@ -550,6 +565,7 @@ export const webRingWatchApi: RingWatchApi = {
   onStorageStatsUpdated: (cb) => sseHub.subscribe<StorageStats>('storage-stats-updated', cb),
   onPackageDetection: (cb) => sseHub.subscribe<PackageDetectionRecord>('package-detection', cb),
   onAiUsageUpdated: (cb) => sseHub.subscribe<AiUsageStats>('ai-usage-updated', cb),
+  onTlsStatusUpdated: (cb) => sseHub.subscribe<TlsStatus>('tls-status-updated', cb),
   onPlayAlertSound: (cb) => sseHub.subscribe<AlertSoundPayload>('play-alert-sound', cb),
   onFocusCamera: (cb) => sseHub.subscribe<string>('focus-camera', cb),
   onStreamsUpdated: (cb) => sseHub.subscribe<LiveStreamSession[]>('streams-updated', cb),

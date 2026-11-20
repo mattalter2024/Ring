@@ -1,4 +1,6 @@
 import http from 'node:http'
+import https from 'node:https'
+import tls from 'node:tls'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -22,6 +24,7 @@ import type {
   PackageDetectionRecord,
   PublicUser,
   RingWatchBootstrap,
+  TlsStatus,
 } from '../shared/types'
 import { ConfigStore } from './services/configStore'
 import { StreamService } from './services/streamService'
@@ -31,6 +34,7 @@ import { AiPackageService } from './services/aiPackageService'
 import { RingService } from './services/ringService'
 import { BackendLogger } from './services/logger'
 import { AuthService } from './services/authService'
+import { TlsCertService } from './services/tlsCertService'
 import {
   FileKeyCryptoAdapter,
   createUserSessionToken,
@@ -152,6 +156,11 @@ export interface RingWatchServerOptions {
   demoAssetsDir: string
   host?: string
   port?: number
+  httpsPort?: number
+  httpsEnabled?: boolean
+  tlsCertPath?: string
+  tlsKeyPath?: string
+  tlsCaPath?: string
   envAuthPassword?: string
   logger?: BackendLogger
   controlToken?: string
@@ -161,6 +170,7 @@ export interface RingWatchServerOptions {
 export class RingWatchServer {
   readonly configStore: ConfigStore
   readonly authService: AuthService
+  readonly tlsCertService: TlsCertService
   readonly streamService: StreamService
   readonly recordingService: RecordingService
   readonly notificationService: NotificationService
@@ -173,12 +183,17 @@ export class RingWatchServer {
   private readonly webDistDir: string
   private readonly host: string
   private readonly requestedPort: number
+  private readonly explicitHttpsPort?: number
+  private readonly explicitHttpsEnabled?: boolean
   private readonly envAuthPassword: string | null
   private readonly controlTokenBuf: Buffer | null
   private readonly onRequestShutdown?: () => void
 
   private server: http.Server | null = null
+  private httpsServer: https.Server | null = null
   private boundPort = 0
+  private boundHttpsPort = 0
+  private httpsBindError: string | null = null
   private readonly sseClients = new Set<SseClientEntry>()
   private sseHeartbeatTimer: NodeJS.Timeout | null = null
   private rescanTimer: NodeJS.Timeout | null = null
@@ -188,6 +203,8 @@ export class RingWatchServer {
     this.webDistDir = path.resolve(options.webDistDir)
     this.host = options.host ?? '0.0.0.0'
     this.requestedPort = options.port ?? 3456
+    this.explicitHttpsPort = options.httpsPort
+    this.explicitHttpsEnabled = options.httpsEnabled
     this.envAuthPassword = options.envAuthPassword?.trim() || null
     this.logger =
       options.logger ??
@@ -212,6 +229,29 @@ export class RingWatchServer {
     // Migrate legacy single password hash (if any) into multi-user AuthService
     const legacyHash = this.configStore.getAuthPasswordHash()
     this.authService = new AuthService(options.dataDir, legacyHash)
+
+    this.tlsCertService = new TlsCertService({
+      dataDir: options.dataDir,
+      configStore: this.configStore,
+      envCertPath: options.tlsCertPath,
+      envKeyPath: options.tlsKeyPath,
+      envCaPath: options.tlsCaPath,
+      onMaterialUpdated: (material) => {
+        if (this.httpsServer) {
+          try {
+            this.httpsServer.setSecureContext({
+              cert: material.cert,
+              key: material.key,
+              ca: material.ca,
+            })
+            this.httpsBindError = null
+          } catch (err) {
+            this.httpsBindError = err instanceof Error ? err.message : String(err)
+          }
+        }
+        this.broadcast('tls-status-updated', this.getTlsStatus(), 'settings:manage')
+      },
+    })
 
     this.streamService = new StreamService(
       () => this.configStore.getPublicSettings().recordingsDir,
@@ -278,6 +318,27 @@ export class RingWatchServer {
           this.broadcast('storage-stats-updated', stats, 'recordings:view'),
       },
     })
+  }
+
+  getTlsStatus(): TlsStatus {
+    return this.tlsCertService.getStatus({
+      active: Boolean(this.httpsServer && this.boundHttpsPort > 0),
+      boundHttpsPort: this.boundHttpsPort > 0 ? this.boundHttpsPort : null,
+      bindError: this.httpsBindError,
+    })
+  }
+
+  private isDirectTlsRequest(req: http.IncomingMessage): boolean {
+    return Boolean((req.socket as tls.TLSSocket | undefined)?.encrypted)
+  }
+
+  private isRequestSecure(req: http.IncomingMessage): boolean {
+    if (this.isDirectTlsRequest(req)) return true
+    const proto =
+      typeof req.headers['x-forwarded-proto'] === 'string'
+        ? req.headers['x-forwarded-proto'].split(',')[0].trim().toLowerCase()
+        : ''
+    return proto === 'https'
   }
 
   isAuthEnabled(): boolean {
@@ -361,19 +422,20 @@ export class RingWatchServer {
     }
 
     if (!rpID || !expectedOrigin) {
-      const protoHeader =
-        typeof req.headers['x-forwarded-proto'] === 'string'
-          ? req.headers['x-forwarded-proto'].split(',')[0].trim()
-          : 'http'
+      const protoHeader = this.isRequestSecure(req) ? 'https' : 'http'
       const forwardedHost =
         typeof req.headers['x-forwarded-host'] === 'string'
           ? req.headers['x-forwarded-host'].split(',')[0].trim()
           : ''
+      const fallbackPort =
+        protoHeader === 'https'
+          ? this.boundHttpsPort || this.configStore.getPublicSettings().tls.httpsPort
+          : this.boundPort || this.requestedPort
       const hostHeader =
         forwardedHost ||
         (typeof req.headers.host === 'string' && req.headers.host.trim()
           ? req.headers.host.trim()
-          : `localhost:${this.boundPort || this.requestedPort}`)
+          : `localhost:${fallbackPort}`)
       const parsed = new URL(`${protoHeader}://${hostHeader}`)
       rpID = parsed.hostname
       expectedOrigin = parsed.origin
@@ -385,16 +447,24 @@ export class RingWatchServer {
     const isIpv4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(rpID)
     const isIpv6 = rpID.includes(':') || rpID.startsWith('[')
     if (isIpv4 || isIpv6) {
+      const httpsHint = this.boundHttpsPort
+        ? ` or https://localhost:${this.boundHttpsPort}`
+        : ''
       throw new Error(
-        `Passkeys (Touch ID, 1Password, Windows Hello) require a domain name rather than an IP address (${rpID}). Open http://localhost:${this.boundPort || this.requestedPort} on this device or access RingWatch via an HTTPS hostname.`,
+        `Passkeys (Touch ID, 1Password, Windows Hello) require a domain name rather than an IP address (${rpID}). Open http://localhost:${this.boundPort || this.requestedPort}${httpsHint} on this device or access RingWatch via an HTTPS hostname.`,
       )
     }
 
     return { rpID, expectedOrigin }
   }
 
-  private buildSessionCookieHeader(token: string, maxAgeSeconds: number): string {
-    return `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSeconds}`
+  private buildSessionCookieHeader(
+    token: string,
+    maxAgeSeconds: number,
+    req?: http.IncomingMessage,
+  ): string {
+    const secureFlag = req && this.isRequestSecure(req) ? '; Secure' : ''
+    return `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSeconds}${secureFlag}`
   }
 
   private getClientPermissions(userId: string | null): Permission[] {
@@ -450,9 +520,107 @@ export class RingWatchServer {
     return false
   }
 
-  async start(): Promise<{ port: number; host: string }> {
+  private resolveDesiredHttpsPort(): number {
+    if (this.explicitHttpsPort !== undefined) return this.explicitHttpsPort
+    // When running ephemeral tests (port: 0), bind HTTPS on an ephemeral port too to avoid conflicts
+    if (this.requestedPort === 0) return 0
+    return this.configStore.getPublicSettings().tls.httpsPort
+  }
+
+  private isHttpsDesired(): boolean {
+    if (this.explicitHttpsEnabled !== undefined) return this.explicitHttpsEnabled
+    return this.configStore.getPublicSettings().tls.enabled
+  }
+
+  private async stopHttpsListener(): Promise<void> {
+    if (!this.httpsServer) {
+      this.boundHttpsPort = 0
+      return
+    }
+    const closing = this.httpsServer
+    this.httpsServer = null
+    this.boundHttpsPort = 0
+    await new Promise<void>((resolve) => {
+      closing.close(() => resolve())
+    })
+  }
+
+  private async syncHttpsListener(): Promise<void> {
+    const desiredEnabled = this.isHttpsDesired()
+    const desiredPort = this.resolveDesiredHttpsPort()
+
+    if (!desiredEnabled) {
+      await this.stopHttpsListener()
+      this.httpsBindError = null
+      this.broadcast('tls-status-updated', this.getTlsStatus(), 'settings:manage')
+      return
+    }
+
+    // Ensure certificate material is ready (generates/renews self-signed cert automatically if needed)
+    const { material } = this.tlsCertService.ensureCertificate({ notifyOnReload: false })
+
+    // If HTTPS server is already running on the desired port, just hot-reload the TLS context
+    if (
+      this.httpsServer &&
+      this.boundHttpsPort > 0 &&
+      (desiredPort === 0 || this.boundHttpsPort === desiredPort)
+    ) {
+      try {
+        this.httpsServer.setSecureContext({
+          cert: material.cert,
+          key: material.key,
+          ca: material.ca,
+        })
+        this.httpsBindError = null
+      } catch (err) {
+        this.httpsBindError = err instanceof Error ? err.message : String(err)
+      }
+      this.broadcast('tls-status-updated', this.getTlsStatus(), 'settings:manage')
+      return
+    }
+
+    // Otherwise (re)bind HTTPS listener on desiredPort
+    await this.stopHttpsListener()
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const srv = https.createServer(
+          {
+            cert: material.cert,
+            key: material.key,
+            ca: material.ca,
+            minVersion: 'TLSv1.2',
+          },
+          (req, res) => {
+            void this.handleRequest(req, res)
+          },
+        )
+        srv.on('error', reject)
+        srv.listen(desiredPort, this.host, () => {
+          const addr = srv.address()
+          if (addr && typeof addr === 'object') {
+            this.boundHttpsPort = addr.port
+            this.httpsServer = srv
+            this.httpsBindError = null
+            resolve()
+          } else {
+            reject(new Error('Failed to start RingWatch HTTPS server'))
+          }
+        })
+      })
+    } catch (err) {
+      this.httpsBindError = err instanceof Error ? err.message : String(err)
+      console.warn(`[RingWatch TLS] Could not bind HTTPS port ${desiredPort}: ${this.httpsBindError}`)
+    }
+    this.broadcast('tls-status-updated', this.getTlsStatus(), 'settings:manage')
+  }
+
+  async start(): Promise<{ port: number; httpsPort: number | null; host: string }> {
     if (this.server && this.boundPort > 0) {
-      return { port: this.boundPort, host: this.host }
+      return {
+        port: this.boundPort,
+        httpsPort: this.boundHttpsPort > 0 ? this.boundHttpsPort : null,
+        host: this.host,
+      }
     }
 
     await new Promise<void>((resolve, reject) => {
@@ -471,6 +639,9 @@ export class RingWatchServer {
         }
       })
     })
+
+    await this.syncHttpsListener()
+    this.tlsCertService.startAutoRenewal()
 
     this.sseHeartbeatTimer = setInterval(() => {
       for (const client of Array.from(this.sseClients)) {
@@ -506,10 +677,15 @@ export class RingWatchServer {
       this.rescanTimer.unref()
     }
 
-    return { port: this.boundPort, host: this.host }
+    return {
+      port: this.boundPort,
+      httpsPort: this.boundHttpsPort > 0 ? this.boundHttpsPort : null,
+      host: this.host,
+    }
   }
 
   async stop(): Promise<void> {
+    this.tlsCertService.stopAutoRenewal()
     if (this.rescanTimer) {
       clearTimeout(this.rescanTimer)
       this.rescanTimer = null
@@ -530,6 +706,8 @@ export class RingWatchServer {
     this.ringService.shutdown()
     this.recordingService.flushIndexSync()
     this.streamService.stopAll()
+
+    await this.stopHttpsListener()
 
     if (this.server) {
       await new Promise<void>((resolve) => {
@@ -577,6 +755,32 @@ export class RingWatchServer {
     }
     if (pathname.includes('\0')) {
       this.sendJson(res, 400, { error: 'Bad Request' })
+      return
+    }
+
+    // Optional HTTP -> HTTPS redirect (always exempts /api/health and /api/internal/shutdown for Windows Service & Tray)
+    const tlsSettings = this.configStore.getPublicSettings().tls
+    if (
+      !this.isDirectTlsRequest(req) &&
+      tlsSettings.redirectHttpToHttps &&
+      this.boundHttpsPort > 0 &&
+      pathname !== '/api/health' &&
+      pathname !== '/api/internal/shutdown'
+    ) {
+      const hostHeader = typeof req.headers.host === 'string' ? req.headers.host.trim() : ''
+      let redirectHost = 'localhost'
+      if (hostHeader) {
+        try {
+          redirectHost = new URL(`http://${hostHeader}`).hostname
+        } catch {
+          redirectHost = 'localhost'
+        }
+      }
+      const hostPart = redirectHost.includes(':') ? `[${redirectHost}]` : redirectHost
+      const portSuffix = this.boundHttpsPort === 443 ? '' : `:${this.boundHttpsPort}`
+      const location = `https://${hostPart}${portSuffix}${rawUrl}`
+      res.writeHead(308, { Location: location })
+      res.end()
       return
     }
 
@@ -630,10 +834,30 @@ export class RingWatchServer {
         mode: this.ringService.getConnection().mode,
         nvrActive: this.ringService.getNvrStatus().active,
         authEnabled: this.isAuthEnabled(),
+        httpsActive: Boolean(this.httpsServer && this.boundHttpsPort > 0),
+        httpsPort: this.boundHttpsPort > 0 ? this.boundHttpsPort : null,
         uptimeSeconds: Math.round(process.uptime()),
         logsDir: this.logger.logsDir,
         debugEnabled: this.logger.debugEnabled,
       })
+      return
+    }
+
+    // Public HTTPS certificate download (public cert only — NEVER private key)
+    if (method === 'GET' && pathname === '/api/tls/certificate/download') {
+      const certPem = this.tlsCertService.getActiveCertificatePem()
+      if (!certPem) {
+        this.sendJson(res, 404, { error: 'No active HTTPS certificate is loaded.' })
+        return
+      }
+      const buf = Buffer.from(certPem, 'utf-8')
+      res.writeHead(200, {
+        'Content-Type': 'application/x-x509-ca-cert',
+        'Content-Length': buf.length,
+        'Content-Disposition': 'attachment; filename="ringwatch-cert.crt"',
+        'Cache-Control': 'no-store',
+      })
+      res.end(buf)
       return
     }
 
@@ -684,7 +908,7 @@ export class RingWatchServer {
             res,
             200,
             { ok: true, user },
-            { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+            { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC, req) },
           )
           return
         }
@@ -702,7 +926,7 @@ export class RingWatchServer {
           res,
           200,
           { ok: true },
-          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC, req) },
         )
         return
       }
@@ -740,7 +964,7 @@ export class RingWatchServer {
           res,
           200,
           { ok: true, user },
-          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC, req) },
         )
       } catch (err) {
         this.sendJson(res, 401, {
@@ -895,7 +1119,7 @@ export class RingWatchServer {
         res,
         200,
         { ok: true, authEnabled: true },
-        { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+        { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC, req) },
       )
       return
     }
@@ -927,7 +1151,7 @@ export class RingWatchServer {
           res,
           201,
           created,
-          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC) },
+          { 'Set-Cookie': this.buildSessionCookieHeader(token, SESSION_MAX_AGE_SEC, req) },
         )
         return
       }
@@ -1043,6 +1267,9 @@ export class RingWatchServer {
         recordings: canRecs ? this.recordingService.listRecordings() : [],
         packageDetections: canAi ? this.aiPackageService.listDetections() : [],
         aiUsageStats: canAi ? this.aiPackageService.getUsageStats() : undefined,
+        tlsStatus: hasPermission(session.permissions, 'settings:manage')
+          ? this.getTlsStatus()
+          : undefined,
         activeStreams: canCameras ? this.streamService.listActiveSessions() : [],
         authStatus: this.getAuthStatus(req),
       }
@@ -1510,6 +1737,61 @@ export class RingWatchServer {
       return
     }
 
+    // HTTPS & TLS Certificate Management (settings:manage)
+    if (method === 'GET' && pathname === '/api/tls/status') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
+      this.sendJson(res, 200, this.getTlsStatus())
+      return
+    }
+    if (method === 'POST' && pathname === '/api/tls/regenerate') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
+      const body = await readJsonBody(req)
+      const customHostnames = Array.isArray(body.customHostnames)
+        ? body.customHostnames.map((h) => String(h).trim()).filter(Boolean)
+        : undefined
+      this.tlsCertService.regenerateSelfSigned(customHostnames)
+      await this.syncHttpsListener()
+      const status = this.getTlsStatus()
+      this.broadcast('settings-updated', this.configStore.getPublicSettings(), 'settings:manage')
+      this.sendJson(res, 200, status)
+      return
+    }
+    if (method === 'POST' && pathname === '/api/tls/custom-pem') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
+      const body = await readJsonBody(req)
+      const certPem = typeof body.certPem === 'string' ? body.certPem : ''
+      const keyPem = typeof body.keyPem === 'string' ? body.keyPem : ''
+      const caPem = typeof body.caPem === 'string' ? body.caPem : undefined
+      this.tlsCertService.installCustomPem({ certPem, keyPem, caPem })
+      await this.syncHttpsListener()
+      const status = this.getTlsStatus()
+      this.broadcast('settings-updated', this.configStore.getPublicSettings(), 'settings:manage')
+      this.sendJson(res, 200, status)
+      return
+    }
+    if (method === 'POST' && pathname === '/api/tls/custom-files') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
+      const body = await readJsonBody(req)
+      const certPath = typeof body.certPath === 'string' ? body.certPath : ''
+      const keyPath = typeof body.keyPath === 'string' ? body.keyPath : ''
+      const caPath = typeof body.caPath === 'string' ? body.caPath : undefined
+      this.tlsCertService.useCustomCertFiles({ certPath, keyPath, caPath })
+      await this.syncHttpsListener()
+      const status = this.getTlsStatus()
+      this.broadcast('settings-updated', this.configStore.getPublicSettings(), 'settings:manage')
+      this.sendJson(res, 200, status)
+      return
+    }
+    if (method === 'POST' && pathname === '/api/tls/use-self-signed') {
+      if (!this.requirePerm(res, session, 'settings:manage')) return
+      this.tlsCertService.switchToSelfSigned()
+      await this.syncHttpsListener()
+      const status = this.getTlsStatus()
+      this.broadcast('settings-updated', this.configStore.getPublicSettings(), 'settings:manage')
+      this.sendJson(res, 200, status)
+      return
+    }
+
     // Settings (scope: ai:manage for packageAi rules without API keys, nvr:manage for NVR fields, settings:manage for everything)
     if (method === 'PATCH' && pathname === '/api/settings') {
       const body = (await readJsonBody(req)) as AppSettingsPatch
@@ -1558,6 +1840,9 @@ export class RingWatchServer {
       const updated = this.configStore.updateSettings(body)
       this.aiPackageService.syncScheduler()
       this.ringService.syncNvrSettings()
+      if (body.tls) {
+        await this.syncHttpsListener()
+      }
       this.broadcast('settings-updated', updated, 'settings:manage')
       this.broadcast('ai-usage-updated', this.aiPackageService.getUsageStats(), 'ai:view')
       this.broadcast('storage-stats-updated', this.recordingService.getStorageStats(), 'recordings:view')

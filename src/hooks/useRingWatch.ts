@@ -14,6 +14,7 @@ import type {
   RingSensorInfo,
   SecurityEvent,
   StorageStats,
+  TlsStatus,
 } from '@shared/types'
 import {
   startAuthentication,
@@ -86,6 +87,18 @@ const DEFAULT_SETTINGS: AppSettings = {
     activeHoursStart: 6,
     activeHoursEnd: 22,
   },
+  tls: {
+    enabled: true,
+    httpsPort: 3443,
+    redirectHttpToHttps: false,
+    mode: 'self-signed',
+    autoRenewDaysBeforeExpiry: 30,
+    customHostnames: [],
+    customCertPath: '',
+    customKeyPath: '',
+    customCaPath: '',
+    hasUploadedCustomCert: false,
+  },
 }
 
 const DEFAULT_AI_USAGE: AiUsageStats = {
@@ -98,6 +111,27 @@ const DEFAULT_AI_USAGE: AiUsageStats = {
   skippedByQuietHoursToday: 0,
   skippedByDailyLimitToday: 0,
   dailyScanLimit: 60,
+}
+
+const DEFAULT_TLS_STATUS: TlsStatus = {
+  enabled: true,
+  active: false,
+  httpsPort: 3443,
+  redirectHttpToHttps: false,
+  mode: 'self-signed',
+  managedByEnv: false,
+  subject: null,
+  issuer: null,
+  validFrom: null,
+  validTo: null,
+  daysRemaining: null,
+  fingerprint256: null,
+  subjectAltNames: [],
+  autoRenewEnabled: true,
+  autoRenewDaysBeforeExpiry: 30,
+  lastRenewedAt: null,
+  certSource: 'none',
+  lastError: null,
 }
 
 const DEFAULT_STORAGE_STATS: StorageStats = {
@@ -163,6 +197,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
   const [recordings, setRecordings] = useState<LocalRecordingItem[]>([])
   const [packageDetections, setPackageDetections] = useState<PackageDetectionRecord[]>([])
   const [aiUsageStats, setAiUsageStats] = useState<AiUsageStats>(DEFAULT_AI_USAGE)
+  const [tlsStatus, setTlsStatus] = useState<TlsStatus>(DEFAULT_TLS_STATUS)
   const [streamsByCamera, setStreamsByCamera] = useState<Record<string, LiveStreamSession>>({})
   const [toasts, setToasts] = useState<UiToast[]>([])
 
@@ -197,6 +232,9 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     setPackageDetections(boot.packageDetections)
     if (boot.aiUsageStats) {
       setAiUsageStats(boot.aiUsageStats)
+    }
+    if (boot.tlsStatus) {
+      setTlsStatus(boot.tlsStatus)
     }
     const streamMap: Record<string, LiveStreamSession> = {}
     for (const s of boot.activeStreams) streamMap[s.cameraId] = s
@@ -273,6 +311,7 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
         setPackageDetections((prev) => [rec, ...prev].slice(0, 150)),
       ),
       webRingWatchApi.onAiUsageUpdated((stats) => setAiUsageStats(stats)),
+      webRingWatchApi.onTlsStatusUpdated((status) => setTlsStatus(status)),
       webRingWatchApi.onPlayAlertSound((payload: AlertSoundPayload) => {
         if (payload.profile !== 'none') {
           playAlertChime(payload.profile, payload.volume)
@@ -490,6 +529,8 @@ export function useRingWatch(onFocusCameraExternal?: (cameraId: string) => void)
     packageDetections,
     setPackageDetections,
     aiUsageStats,
+    tlsStatus,
+    setTlsStatus,
     streamsByCamera,
     setStreamsByCamera,
     toasts,

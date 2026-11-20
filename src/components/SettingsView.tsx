@@ -2,13 +2,19 @@ import { useState } from 'react'
 import {
   Bell,
   CheckCircle2,
+  Download,
+  ExternalLink,
+  FileKey2,
+  FolderOpen,
   KeyRound,
   Link2,
   Lock,
   LogOut,
   PlugZap,
+  RefreshCw,
   ShieldCheck,
   Unplug,
+  Upload,
 } from 'lucide-react'
 import type {
   AiProvider,
@@ -19,6 +25,7 @@ import type {
   ConnectionStatus,
   RingAuthStepResult,
   RingCameraInfo,
+  TlsStatus,
 } from '@shared/types'
 
 interface SettingsViewProps {
@@ -26,6 +33,7 @@ interface SettingsViewProps {
   settings: AppSettings
   cameras: RingCameraInfo[]
   authStatus: AuthStatus
+  tlsStatus?: TlsStatus
   onSwitchMode: (mode: AppMode) => Promise<void>
   onLoginCredentials: (params: {
     email: string
@@ -47,12 +55,25 @@ interface SettingsViewProps {
     newPassword: string
   }) => Promise<{ ok: boolean; authEnabled: boolean; error?: string }>
   onLogout: () => Promise<void>
+  onRegenerateSelfSignedCert?: (customHostnames?: string[]) => Promise<TlsStatus>
+  onUploadCustomTlsCert?: (params: {
+    certPem: string
+    keyPem: string
+    caPem?: string
+  }) => Promise<TlsStatus>
+  onUseCustomTlsCertFiles?: (params: {
+    certPath: string
+    keyPath: string
+    caPath?: string
+  }) => Promise<TlsStatus>
+  onSwitchToSelfSignedCert?: () => Promise<TlsStatus>
 }
 
 export function SettingsView({
   connection,
   settings,
   authStatus,
+  tlsStatus,
   onSwitchMode,
   onLoginCredentials,
   onConnectToken,
@@ -61,6 +82,10 @@ export function SettingsView({
   onTestAiConnection,
   onUpdateAuthPassword,
   onLogout,
+  onRegenerateSelfSignedCert,
+  onUploadCustomTlsCert,
+  onUseCustomTlsCertFiles,
+  onSwitchToSelfSignedCert,
 }: SettingsViewProps) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -89,7 +114,27 @@ export function SettingsView({
     typeof Notification !== 'undefined' ? Notification.permission : 'unsupported',
   )
 
+  const tlsCfg = settings.tls
+  const [tlsTab, setTlsTab] = useState<'self-signed' | 'custom-pem' | 'custom-files'>(
+    tlsCfg?.mode ?? 'self-signed',
+  )
+  const [sanInput, setSanInput] = useState(() => (tlsCfg?.customHostnames ?? []).join(', '))
+  const [certPemInput, setCertPemInput] = useState('')
+  const [keyPemInput, setKeyPemInput] = useState('')
+  const [caPemInput, setCaPemInput] = useState('')
+  const [certPathInput, setCertPathInput] = useState(() => tlsCfg?.customCertPath ?? '')
+  const [keyPathInput, setKeyPathInput] = useState(() => tlsCfg?.customKeyPath ?? '')
+  const [caPathInput, setCaPathInput] = useState(() => tlsCfg?.customCaPath ?? '')
+  const [tlsBusy, setTlsBusy] = useState(false)
+  const [tlsMsg, setTlsMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
   const ai = settings.packageAi
+
+  const readFileText = async (file: File | undefined, setter: (v: string) => void) => {
+    if (!file) return
+    const text = await file.text()
+    setter(text)
+  }
 
   const handleRingLogin = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -765,6 +810,623 @@ export function SettingsView({
                 </div>
               </div>
             </details>
+          </div>
+        </section>
+
+        <section className="panel" style={{ gridColumn: '1 / -1' }}>
+          <div className="panel-header">
+            <h3 style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+              <ShieldCheck size={16} />
+              HTTPS &amp; TLS Certificates
+            </h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+              <span className={`chip ${tlsStatus?.active ? 'ok' : ''}`}>
+                <Lock size={11} />
+                {tlsStatus?.active
+                  ? `HTTPS Active (:${tlsStatus.httpsPort ?? tlsCfg?.httpsPort ?? 3443})`
+                  : 'HTTPS Inactive'}
+              </span>
+              {tlsStatus?.certSource && tlsStatus.certSource !== 'none' && (
+                <span className="chip accent">
+                  {tlsStatus.certSource === 'self-signed'
+                    ? 'Auto Self-Signed'
+                    : tlsStatus.certSource === 'uploaded-pem'
+                      ? 'Custom PEM'
+                      : tlsStatus.certSource === 'env-files'
+                        ? 'Env Cert Files'
+                        : 'Custom File Paths'}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="panel-body form-stack">
+            {tlsStatus?.lastError && (
+              <div
+                style={{
+                  padding: '9px 12px',
+                  borderRadius: 8,
+                  background: 'rgba(239, 68, 68, 0.12)',
+                  border: '1px solid rgba(239, 68, 68, 0.35)',
+                  fontSize: 12,
+                  color: '#fca5a5',
+                }}
+              >
+                TLS Notice: {tlsStatus.lastError}
+              </div>
+            )}
+
+            {tlsStatus?.subject && (
+              <div
+                style={{
+                  padding: '12px 14px',
+                  borderRadius: 10,
+                  background: 'var(--bg-subtle)',
+                  border: '1px solid var(--border-subtle)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 10,
+                    flexWrap: 'wrap',
+                  }}
+                >
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-primary)' }}>
+                    Active Certificate Details
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    {tlsStatus.active && tlsStatus.httpsPort && (
+                      <a
+                        href={`https://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:${tlsStatus.httpsPort}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="btn btn-sm btn-primary"
+                        style={{ textDecoration: 'none' }}
+                      >
+                        <ExternalLink size={12} />
+                        Open HTTPS (:{tlsStatus.httpsPort})
+                      </a>
+                    )}
+                    <a
+                      href="/api/tls/certificate/download"
+                      download="ringwatch-cert.crt"
+                      className="btn btn-sm"
+                      style={{ textDecoration: 'none' }}
+                    >
+                      <Download size={12} />
+                      Download Cert (.crt)
+                    </a>
+                    {!tlsStatus.managedByEnv &&
+                      tlsStatus.certSource === 'self-signed' &&
+                      onRegenerateSelfSignedCert && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={tlsBusy}
+                          onClick={async () => {
+                            setTlsBusy(true)
+                            setTlsMsg(null)
+                            try {
+                              await onRegenerateSelfSignedCert()
+                              setTlsMsg({
+                                ok: true,
+                                text: 'Generated a fresh 365-day self-signed certificate and reloaded HTTPS live.',
+                              })
+                            } catch (err) {
+                              setTlsMsg({
+                                ok: false,
+                                text: err instanceof Error ? err.message : String(err),
+                              })
+                            } finally {
+                              setTlsBusy(false)
+                            }
+                          }}
+                        >
+                          <RefreshCw size={12} />
+                          Regenerate Now
+                        </button>
+                      )}
+                  </div>
+                </div>
+
+                <div
+                  className="mono"
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                    gap: 8,
+                    fontSize: 11.5,
+                    color: 'var(--text-secondary)',
+                  }}
+                >
+                  <div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: 10.5 }}>Subject</div>
+                    <div style={{ color: 'var(--text-primary)', wordBreak: 'break-word' }}>
+                      {tlsStatus.subject}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: 10.5 }}>Issuer</div>
+                    <div style={{ color: 'var(--text-primary)', wordBreak: 'break-word' }}>
+                      {tlsStatus.issuer}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: 10.5 }}>Valid Until</div>
+                    <div
+                      style={{
+                        color:
+                          (tlsStatus.daysRemaining ?? 0) > 30 ? '#4ade80' : '#fbbf24',
+                        fontWeight: 600,
+                      }}
+                    >
+                      {tlsStatus.validTo
+                        ? `${new Date(tlsStatus.validTo).toLocaleDateString()} (${tlsStatus.daysRemaining ?? 0}d left)`
+                        : '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ color: 'var(--text-muted)', fontSize: 10.5 }}>Auto-Update</div>
+                    <div style={{ color: 'var(--text-primary)' }}>
+                      {tlsStatus.certSource === 'self-signed'
+                        ? `Auto-renews ${tlsStatus.autoRenewDaysBeforeExpiry}d before expiry & on LAN IP change`
+                        : tlsStatus.certSource === 'file-paths' ||
+                            tlsStatus.certSource === 'env-files'
+                          ? 'Auto-reloads when cert files update on disk'
+                          : 'Manual upload (replace anytime)'}
+                    </div>
+                  </div>
+                </div>
+
+                {tlsStatus.subjectAltNames.length > 0 && (
+                  <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                    SANs: {tlsStatus.subjectAltNames.join(', ')}
+                  </div>
+                )}
+                {tlsStatus.fingerprint256 && (
+                  <div
+                    className="mono"
+                    style={{ fontSize: 10.5, color: 'var(--text-muted)', wordBreak: 'break-all' }}
+                  >
+                    SHA-256: {tlsStatus.fingerprint256}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+                gap: 12,
+              }}
+            >
+              <div className="toggle-row">
+                <div>
+                  <div className="toggle-label-main">Enable Built-In HTTPS Server</div>
+                  <div className="toggle-label-sub">
+                    Serve RingWatch over TLS 1.2/1.3 (required for Passkeys &amp; notifications on LAN hostnames)
+                  </div>
+                </div>
+                <button
+                  id="toggle-tls-enabled"
+                  type="button"
+                  role="switch"
+                  aria-checked={tlsCfg?.enabled ?? true}
+                  className={`switch ${tlsCfg?.enabled ?? true ? 'on' : ''}`}
+                  onClick={() =>
+                    void onUpdateSettings({
+                      tls: { enabled: !(tlsCfg?.enabled ?? true) },
+                    })
+                  }
+                />
+              </div>
+
+              <div className="toggle-row">
+                <div>
+                  <div className="toggle-label-main">Redirect HTTP → HTTPS</div>
+                  <div className="toggle-label-sub">
+                    Automatically redirect browser HTTP traffic to HTTPS (exempts local service health checks)
+                  </div>
+                </div>
+                <button
+                  id="toggle-tls-redirect"
+                  type="button"
+                  role="switch"
+                  aria-checked={tlsCfg?.redirectHttpToHttps ?? false}
+                  className={`switch ${tlsCfg?.redirectHttpToHttps ? 'on' : ''}`}
+                  onClick={() =>
+                    void onUpdateSettings({
+                      tls: { redirectHttpToHttps: !(tlsCfg?.redirectHttpToHttps ?? false) },
+                    })
+                  }
+                />
+              </div>
+            </div>
+
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                gap: 10,
+              }}
+            >
+              <div className="field">
+                <label htmlFor="tls-https-port">HTTPS Port</label>
+                <input
+                  id="tls-https-port"
+                  type="number"
+                  min={1}
+                  max={65535}
+                  className="input mono"
+                  value={tlsCfg?.httpsPort ?? 3443}
+                  onChange={(e) => {
+                    const port = Number(e.target.value)
+                    if (Number.isFinite(port) && port >= 1 && port <= 65535) {
+                      void onUpdateSettings({ tls: { httpsPort: port } })
+                    }
+                  }}
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="tls-renew-days">Self-Signed Auto-Renew (days before expiry)</label>
+                <input
+                  id="tls-renew-days"
+                  type="number"
+                  min={1}
+                  max={180}
+                  className="input mono"
+                  value={tlsCfg?.autoRenewDaysBeforeExpiry ?? 30}
+                  onChange={(e) => {
+                    const days = Number(e.target.value)
+                    if (Number.isFinite(days) && days >= 1 && days <= 180) {
+                      void onUpdateSettings({
+                        tls: { autoRenewDaysBeforeExpiry: days },
+                      })
+                    }
+                  }}
+                />
+              </div>
+            </div>
+
+            {tlsStatus?.managedByEnv ? (
+              <div
+                style={{
+                  padding: '9px 11px',
+                  borderRadius: 7,
+                  background: 'var(--bg-subtle)',
+                  border: '1px solid var(--border-subtle)',
+                  fontSize: 12,
+                  color: 'var(--text-secondary)',
+                }}
+              >
+                TLS certificates are managed via{' '}
+                <code className="mono">RINGWATCH_TLS_CERT_PATH</code> and{' '}
+                <code className="mono">RINGWATCH_TLS_KEY_PATH</code> environment variables
+                and automatically hot-reload when updated on disk.
+              </div>
+            ) : (
+              <div className="form-stack" style={{ gap: 10 }}>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className={`btn btn-sm ${tlsTab === 'self-signed' ? 'btn-primary' : ''}`}
+                    onClick={() => setTlsTab('self-signed')}
+                  >
+                    <RefreshCw size={12} />
+                    Auto Self-Signed
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn btn-sm ${tlsTab === 'custom-pem' ? 'btn-primary' : ''}`}
+                    onClick={() => setTlsTab('custom-pem')}
+                  >
+                    <Upload size={12} />
+                    Upload / Paste Custom Cert (PEM)
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn btn-sm ${tlsTab === 'custom-files' ? 'btn-primary' : ''}`}
+                    onClick={() => setTlsTab('custom-files')}
+                  >
+                    <FolderOpen size={12} />
+                    Use Cert Files on Disk (Certbot / ACME)
+                  </button>
+                </div>
+
+                {tlsTab === 'self-signed' && (
+                  <div className="form-stack" style={{ gap: 8 }}>
+                    <div className="field">
+                      <label htmlFor="tls-san-hosts">
+                        Extra Hostnames / Domains (SANs, comma-separated, optional)
+                      </label>
+                      <input
+                        id="tls-san-hosts"
+                        type="text"
+                        className="input mono"
+                        placeholder="e.g. ringwatch.home.arpa, nvr.lan (localhost & LAN IPs are included automatically)"
+                        value={sanInput}
+                        onChange={(e) => setSanInput(e.target.value)}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      {onRegenerateSelfSignedCert && (
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={tlsBusy}
+                          onClick={async () => {
+                            setTlsBusy(true)
+                            setTlsMsg(null)
+                            try {
+                              const hosts = sanInput
+                                .split(',')
+                                .map((s) => s.trim())
+                                .filter(Boolean)
+                              await onRegenerateSelfSignedCert(hosts)
+                              setTlsMsg({
+                                ok: true,
+                                text: 'Self-signed certificate regenerated with updated SANs and reloaded live.',
+                              })
+                            } catch (err) {
+                              setTlsMsg({
+                                ok: false,
+                                text: err instanceof Error ? err.message : String(err),
+                              })
+                            } finally {
+                              setTlsBusy(false)
+                            }
+                          }}
+                        >
+                          <RefreshCw size={13} />
+                          {tlsCfg?.mode === 'self-signed'
+                            ? 'Save SANs & Regenerate Self-Signed Cert'
+                            : 'Switch to Auto Self-Signed Cert'}
+                        </button>
+                      )}
+                      {tlsCfg?.mode !== 'self-signed' && onSwitchToSelfSignedCert && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={tlsBusy}
+                          onClick={async () => {
+                            setTlsBusy(true)
+                            setTlsMsg(null)
+                            try {
+                              await onSwitchToSelfSignedCert()
+                              setTlsMsg({
+                                ok: true,
+                                text: 'Switched back to the auto-renewing self-signed certificate.',
+                              })
+                            } catch (err) {
+                              setTlsMsg({
+                                ok: false,
+                                text: err instanceof Error ? err.message : String(err),
+                              })
+                            } finally {
+                              setTlsBusy(false)
+                            }
+                          }}
+                        >
+                          Use Existing Self-Signed Cert
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {tlsTab === 'custom-pem' && (
+                  <div className="form-stack" style={{ gap: 8 }}>
+                    <div className="field">
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: 8,
+                        }}
+                      >
+                        <label htmlFor="tls-cert-pem">Certificate / Fullchain PEM</label>
+                        <label className="btn btn-sm" style={{ cursor: 'pointer', margin: 0 }}>
+                          <FileKey2 size={12} />
+                          Load .crt / .pem
+                          <input
+                            type="file"
+                            accept=".pem,.crt,.cer,text/plain"
+                            style={{ display: 'none' }}
+                            onChange={(e) =>
+                              void readFileText(e.target.files?.[0], setCertPemInput)
+                            }
+                          />
+                        </label>
+                      </div>
+                      <textarea
+                        id="tls-cert-pem"
+                        rows={4}
+                        className="input mono"
+                        style={{ fontSize: 11, resize: 'vertical' }}
+                        placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+                        value={certPemInput}
+                        onChange={(e) => setCertPemInput(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="field">
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: 8,
+                        }}
+                      >
+                        <label htmlFor="tls-key-pem">Private Key PEM</label>
+                        <label className="btn btn-sm" style={{ cursor: 'pointer', margin: 0 }}>
+                          <KeyRound size={12} />
+                          Load .key / .pem
+                          <input
+                            type="file"
+                            accept=".key,.pem,text/plain"
+                            style={{ display: 'none' }}
+                            onChange={(e) =>
+                              void readFileText(e.target.files?.[0], setKeyPemInput)
+                            }
+                          />
+                        </label>
+                      </div>
+                      <textarea
+                        id="tls-key-pem"
+                        rows={4}
+                        className="input mono"
+                        style={{ fontSize: 11, resize: 'vertical' }}
+                        placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"
+                        value={keyPemInput}
+                        onChange={(e) => setKeyPemInput(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="field">
+                      <label htmlFor="tls-ca-pem">Intermediate / CA Chain PEM (optional)</label>
+                      <textarea
+                        id="tls-ca-pem"
+                        rows={2}
+                        className="input mono"
+                        style={{ fontSize: 11, resize: 'vertical' }}
+                        placeholder="Optional CA bundle if not already included in fullchain"
+                        value={caPemInput}
+                        onChange={(e) => setCaPemInput(e.target.value)}
+                      />
+                    </div>
+
+                    {onUploadCustomTlsCert && (
+                      <div>
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={tlsBusy || !certPemInput.trim() || !keyPemInput.trim()}
+                          onClick={async () => {
+                            setTlsBusy(true)
+                            setTlsMsg(null)
+                            try {
+                              await onUploadCustomTlsCert({
+                                certPem: certPemInput,
+                                keyPem: keyPemInput,
+                                caPem: caPemInput.trim() || undefined,
+                              })
+                              setKeyPemInput('')
+                              setTlsMsg({
+                                ok: true,
+                                text: 'Custom certificate validated, saved locally (0600), and hot-reloaded live.',
+                              })
+                            } catch (err) {
+                              setTlsMsg({
+                                ok: false,
+                                text: err instanceof Error ? err.message : String(err),
+                              })
+                            } finally {
+                              setTlsBusy(false)
+                            }
+                          }}
+                        >
+                          <Upload size={13} />
+                          Validate &amp; Install Certificate
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {tlsTab === 'custom-files' && (
+                  <div className="form-stack" style={{ gap: 8 }}>
+                    <div className="field">
+                      <label htmlFor="tls-cert-path">Certificate / Fullchain File Path</label>
+                      <input
+                        id="tls-cert-path"
+                        type="text"
+                        className="input mono"
+                        placeholder="e.g. C:\certs\fullchain.pem or /etc/letsencrypt/live/domain/fullchain.pem"
+                        value={certPathInput}
+                        onChange={(e) => setCertPathInput(e.target.value)}
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="tls-key-path">Private Key File Path</label>
+                      <input
+                        id="tls-key-path"
+                        type="text"
+                        className="input mono"
+                        placeholder="e.g. C:\certs\privkey.pem or /etc/letsencrypt/live/domain/privkey.pem"
+                        value={keyPathInput}
+                        onChange={(e) => setKeyPathInput(e.target.value)}
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="tls-ca-path">CA Chain File Path (optional)</label>
+                      <input
+                        id="tls-ca-path"
+                        type="text"
+                        className="input mono"
+                        placeholder="Optional intermediate/CA chain file path"
+                        value={caPathInput}
+                        onChange={(e) => setCaPathInput(e.target.value)}
+                      />
+                    </div>
+                    {onUseCustomTlsCertFiles && (
+                      <div>
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={tlsBusy || !certPathInput.trim() || !keyPathInput.trim()}
+                          onClick={async () => {
+                            setTlsBusy(true)
+                            setTlsMsg(null)
+                            try {
+                              await onUseCustomTlsCertFiles({
+                                certPath: certPathInput,
+                                keyPath: keyPathInput,
+                                caPath: caPathInput.trim() || undefined,
+                              })
+                              setTlsMsg({
+                                ok: true,
+                                text: 'Loaded external certificate files. RingWatch will auto-reload them whenever renewed on disk.',
+                              })
+                            } catch (err) {
+                              setTlsMsg({
+                                ok: false,
+                                text: err instanceof Error ? err.message : String(err),
+                              })
+                            } finally {
+                              setTlsBusy(false)
+                            }
+                          }}
+                        >
+                          <FolderOpen size={13} />
+                          Load &amp; Auto-Watch Cert Files
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {tlsMsg && (
+                  <div
+                    style={{
+                      fontSize: 12,
+                      color: tlsMsg.ok ? '#4ade80' : '#fca5a5',
+                    }}
+                  >
+                    {tlsMsg.text}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </section>
       </div>

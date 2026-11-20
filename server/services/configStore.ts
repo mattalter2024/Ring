@@ -5,6 +5,7 @@ import type {
   AppSettings,
   AppSettingsPatch,
   PackageAiConfig,
+  TlsConfig,
 } from '../../shared/types'
 
 interface StoredSecrets {
@@ -42,6 +43,7 @@ interface PersistedConfigFile {
   minimizeToTray: boolean
   startMinimized: boolean
   packageAi: Omit<PackageAiConfig, 'hasOpenaiKey' | 'hasGeminiKey'>
+  tls: Omit<TlsConfig, 'hasUploadedCustomCert'>
   secretsPlain?: StoredSecrets
   secretsEncrypted?: Record<string, string>
 }
@@ -100,12 +102,26 @@ const DEFAULT_PACKAGE_AI: Omit<PackageAiConfig, 'hasOpenaiKey' | 'hasGeminiKey'>
   activeHoursEnd: 22,
 }
 
+const DEFAULT_TLS: Omit<TlsConfig, 'hasUploadedCustomCert'> = {
+  enabled: true,
+  httpsPort: 3443,
+  redirectHttpToHttps: false,
+  mode: 'self-signed',
+  autoRenewDaysBeforeExpiry: 30,
+  customHostnames: [],
+  customCertPath: '',
+  customKeyPath: '',
+  customCaPath: '',
+}
+
 export class ConfigStore {
+  private readonly userDataDir: string
   private readonly configPath: string
   private readonly defaultRecordingsDir: string
   private readonly cryptoAdapter?: SecretCryptoAdapter
   private data: PersistedConfigFile
   private secrets: StoredSecrets = {}
+  private cachedHasUploadedCustomCert = false
 
   constructor(
     userDataDir: string,
@@ -113,14 +129,28 @@ export class ConfigStore {
     cryptoAdapter?: SecretCryptoAdapter,
   ) {
     fs.mkdirSync(userDataDir, { recursive: true })
+    this.userDataDir = userDataDir
     this.configPath = path.join(userDataDir, 'ringwatch-config.json')
     this.defaultRecordingsDir = defaultRecordingsDir
     this.cryptoAdapter = cryptoAdapter
+    this.cachedHasUploadedCustomCert = this.checkUploadedCustomCertFiles()
     const { config, migrated } = this.loadFromDisk()
     this.data = config
     if (migrated) {
       this.persist()
     }
+  }
+
+  private checkUploadedCustomCertFiles(): boolean {
+    const certsDir = path.join(this.userDataDir, 'certs')
+    return (
+      fs.existsSync(path.join(certsDir, 'custom-cert.pem')) &&
+      fs.existsSync(path.join(certsDir, 'custom-key.pem'))
+    )
+  }
+
+  setHasUploadedCustomCert(present: boolean): void {
+    this.cachedHasUploadedCustomCert = present
   }
 
   getDefaultRecordingsDir(): string {
@@ -153,6 +183,7 @@ export class ConfigStore {
       minimizeToTray: true,
       startMinimized: false,
       packageAi: { ...DEFAULT_PACKAGE_AI },
+      tls: { ...DEFAULT_TLS, customHostnames: [] },
     }
   }
 
@@ -177,6 +208,15 @@ export class ConfigStore {
           ...DEFAULT_PACKAGE_AI,
           ...(parsed.packageAi ?? {}),
           geminiModel: normalizeGeminiModel(parsed.packageAi?.geminiModel),
+        },
+        tls: {
+          ...DEFAULT_TLS,
+          ...(parsed.tls ?? {}),
+          customHostnames: Array.isArray(parsed.tls?.customHostnames)
+            ? parsed.tls.customHostnames
+                .map((h) => String(h).trim())
+                .filter(Boolean)
+            : [],
         },
       }
 
@@ -281,6 +321,7 @@ export class ConfigStore {
       minimizeToTray: this.data.minimizeToTray,
       startMinimized: this.data.startMinimized,
       packageAi: this.data.packageAi,
+      tls: this.data.tls,
     }
 
     const canEncrypt = Boolean(
@@ -335,6 +376,11 @@ export class ConfigStore {
         ...this.data.packageAi,
         hasOpenaiKey: Boolean(this.secrets.openaiApiKey),
         hasGeminiKey: Boolean(this.secrets.geminiApiKey),
+      },
+      tls: {
+        ...this.data.tls,
+        customHostnames: [...this.data.tls.customHostnames],
+        hasUploadedCustomCert: this.cachedHasUploadedCustomCert,
       },
     }
   }
@@ -499,6 +545,49 @@ export class ConfigStore {
         const trimmed = ai.geminiApiKey.trim()
         if (trimmed) this.secrets.geminiApiKey = trimmed
         else delete this.secrets.geminiApiKey
+      }
+    }
+
+    if (patch.tls) {
+      const t = patch.tls
+      if (t.enabled !== undefined) this.data.tls.enabled = t.enabled
+      if (t.httpsPort !== undefined && Number.isFinite(t.httpsPort)) {
+        this.data.tls.httpsPort = Math.max(1, Math.min(65535, Math.round(t.httpsPort)))
+      }
+      if (t.redirectHttpToHttps !== undefined) {
+        this.data.tls.redirectHttpToHttps = t.redirectHttpToHttps
+      }
+      if (
+        t.mode === 'self-signed' ||
+        t.mode === 'custom-pem' ||
+        t.mode === 'custom-files'
+      ) {
+        this.data.tls.mode = t.mode
+      }
+      if (t.autoRenewDaysBeforeExpiry !== undefined && Number.isFinite(t.autoRenewDaysBeforeExpiry)) {
+        this.data.tls.autoRenewDaysBeforeExpiry = Math.max(
+          1,
+          Math.min(180, Math.round(t.autoRenewDaysBeforeExpiry)),
+        )
+      }
+      if (Array.isArray(t.customHostnames)) {
+        const cleaned = Array.from(
+          new Set(
+            t.customHostnames
+              .map((h) => String(h).trim().toLowerCase())
+              .filter((h) => h.length > 0 && h.length <= 253 && !/\s/.test(h)),
+          ),
+        )
+        this.data.tls.customHostnames = cleaned
+      }
+      if (t.customCertPath !== undefined) {
+        this.data.tls.customCertPath = t.customCertPath.trim()
+      }
+      if (t.customKeyPath !== undefined) {
+        this.data.tls.customKeyPath = t.customKeyPath.trim()
+      }
+      if (t.customCaPath !== undefined) {
+        this.data.tls.customCaPath = t.customCaPath.trim()
       }
     }
 

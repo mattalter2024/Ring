@@ -8,6 +8,7 @@ const MEMORY_RING_LIMIT = 800
 
 function sanitizeLogText(text: string): string {
   return text
+    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[REDACTED]')
     .replace(/(sk-[A-Za-z0-9_-]{12,})/g, '[REDACTED_OPENAI_KEY]')
     .replace(/(AIza[0-9A-Za-z_-]{20,})/g, '[REDACTED_GEMINI_KEY]')

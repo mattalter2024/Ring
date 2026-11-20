@@ -74,6 +74,8 @@ export function App() {
     packageDetections,
     setPackageDetections,
     aiUsageStats,
+    tlsStatus,
+    setTlsStatus,
     streamsByCamera,
     setStreamsByCamera,
     toasts,
@@ -671,12 +673,17 @@ export function App() {
         ...prev,
         ...patch,
         packageAi: { ...prev.packageAi, ...(patch.packageAi ?? {}) },
+        tls: { ...prev.tls, ...(patch.tls ?? {}) },
       }))
       return
     }
     try {
       const updated = await api.updateSettings(patch)
       setSettings(updated)
+      if (patch.tls) {
+        const nextTls = await api.getTlsStatus()
+        setTlsStatus(nextTls)
+      }
     } catch (err) {
       pushToast(
         'Settings Update Failed',
@@ -1300,6 +1307,7 @@ export function App() {
               settings={settings}
               cameras={cameras}
               authStatus={authStatus}
+              tlsStatus={tlsStatus}
               onSwitchMode={handleSwitchMode}
               onLoginCredentials={handleLoginCredentials}
               onConnectToken={handleConnectToken}
@@ -1310,6 +1318,46 @@ export function App() {
               onTestAiConnection={handleTestAiConnection}
               onUpdateAuthPassword={setAuthPassword}
               onLogout={logout}
+              onRegenerateSelfSignedCert={async (customHostnames) => {
+                const status = await api.regenerateSelfSignedCert(customHostnames)
+                setTlsStatus(status)
+                pushToast(
+                  'HTTPS Certificate Updated',
+                  'Generated a fresh 365-day self-signed TLS certificate and reloaded live.',
+                  'ok',
+                )
+                return status
+              }}
+              onUploadCustomTlsCert={async (params) => {
+                const status = await api.uploadCustomTlsCert(params)
+                setTlsStatus(status)
+                pushToast(
+                  'Custom Certificate Installed',
+                  'Your custom HTTPS certificate was validated and hot-reloaded live.',
+                  'ok',
+                )
+                return status
+              }}
+              onUseCustomTlsCertFiles={async (params) => {
+                const status = await api.useCustomTlsCertFiles(params)
+                setTlsStatus(status)
+                pushToast(
+                  'External Cert Paths Active',
+                  'Loaded your certificate files and enabled automatic renewal watching.',
+                  'ok',
+                )
+                return status
+              }}
+              onSwitchToSelfSignedCert={async () => {
+                const status = await api.switchToSelfSignedCert()
+                setTlsStatus(status)
+                pushToast(
+                  'Self-Signed Certificate Active',
+                  'Switched back to the auto-renewing RingWatch self-signed certificate.',
+                  'info',
+                )
+                return status
+              }}
             />
           )}
         </main>
