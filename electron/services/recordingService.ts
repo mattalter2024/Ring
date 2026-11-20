@@ -17,6 +17,96 @@ import type { StreamService, StreamableRingCamera } from './streamService'
 const execFileAsync = promisify(execFile)
 const BYTES_PER_GB = 1024 * 1024 * 1024
 
+export const MOTION_GRID_WIDTH = 64
+export const MOTION_GRID_HEIGHT = 36
+export const MOTION_GRID_PIXELS = MOTION_GRID_WIDTH * MOTION_GRID_HEIGHT
+
+export interface LumaSceneChangeResult {
+  significant: boolean
+  changedRatio: number
+  lowerChangedRatio: number
+  meanAbsDiff: number
+  prevMean: number
+  currMean: number
+}
+
+/**
+ * Illumination-normalized scene-change detector comparing two 64x36 grayscale luma grids.
+ * Subtracts global brightness drift (passing clouds, sun angle, IR exposure) while catching
+ * localized object/person/box changes—especially in the lower 75% porch/walkway delivery zone.
+ */
+export function computeLumaSceneChange(
+  prev: Buffer,
+  curr: Buffer,
+): LumaSceneChangeResult {
+  const len = Math.min(prev.length, curr.length, MOTION_GRID_PIXELS)
+  if (len < 64) {
+    return {
+      significant: false,
+      changedRatio: 0,
+      lowerChangedRatio: 0,
+      meanAbsDiff: 0,
+      prevMean: 0,
+      currMean: 0,
+    }
+  }
+
+  let prevSum = 0
+  let currSum = 0
+  for (let i = 0; i < len; i++) {
+    prevSum += prev[i]
+    currSum += curr[i]
+  }
+  const prevMean = prevSum / len
+  const currMean = currSum / len
+
+  // Ignore nearly black / blank frames during camera reconnects
+  if (prevMean < 4 || currMean < 4) {
+    return {
+      significant: false,
+      changedRatio: 0,
+      lowerChangedRatio: 0,
+      meanAbsDiff: 0,
+      prevMean,
+      currMean,
+    }
+  }
+
+  const deltaMean = currMean - prevMean
+  const lowerStart = Math.floor(len * 0.25)
+  const lowerLen = Math.max(1, len - lowerStart)
+
+  let changedCount = 0
+  let lowerChangedCount = 0
+  let absDiffSum = 0
+
+  for (let i = 0; i < len; i++) {
+    const diff = Math.abs(curr[i] - deltaMean - prev[i])
+    absDiffSum += diff
+    if (diff >= 22) {
+      changedCount++
+      if (i >= lowerStart) {
+        lowerChangedCount++
+      }
+    }
+  }
+
+  const changedRatio = changedCount / len
+  const lowerChangedRatio = lowerChangedCount / lowerLen
+  const meanAbsDiff = absDiffSum / len
+  const significant =
+    (changedRatio >= 0.032 || lowerChangedRatio >= 0.03) && meanAbsDiff >= 1.2
+
+  return {
+    significant,
+    changedRatio,
+    lowerChangedRatio,
+    meanAbsDiff,
+    prevMean,
+    currMean,
+  }
+}
+
 export interface RecordableRingCamera {
   recordToFile(outputPath: string, duration?: number): Promise<void>
   streamVideo?: StreamableRingCamera['streamVideo']
@@ -1567,6 +1657,107 @@ export class RecordingService {
         finish(null)
       }
     })
+  }
+
+  /**
+   * Extract a tiny 64x36 grayscale luma frame (2,304 raw bytes) directly from a video segment
+   * using keyframe-only decoding. Used for ultra-low-CPU local scene-change detection when
+   * 24/7 NVR streaming prevents Ring cloud from emitting motion push notifications.
+   */
+  async extractMotionLumaGrid(videoPath: string): Promise<Buffer | null> {
+    if (!videoPath || !fs.existsSync(videoPath)) return null
+    try {
+      const stat = fs.statSync(videoPath)
+      if (!stat.isFile() || stat.size < 1024) return null
+    } catch {
+      return null
+    }
+
+    const ffmpegBin = this.resolveFfmpegBinary()
+    const runProbe = (args: string[]): Promise<Buffer | null> =>
+      new Promise((resolve) => {
+        let settled = false
+        const chunks: Buffer[] = []
+        let totalBytes = 0
+
+        let child: ReturnType<typeof spawn>
+        try {
+          child = spawn(ffmpegBin, args, { windowsHide: true })
+        } catch {
+          resolve(null)
+          return
+        }
+
+        const finish = (buf: Buffer | null) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve(buf)
+        }
+
+        const timer = setTimeout(() => {
+          try {
+            child.kill('SIGKILL')
+          } catch {
+            // ignore
+          }
+          finish(null)
+        }, 3000)
+
+        child.stdout?.on('data', (chunk: Buffer) => {
+          totalBytes += chunk.length
+          if (totalBytes <= MOTION_GRID_PIXELS * 4) {
+            chunks.push(chunk)
+          }
+        })
+
+        child.on('error', () => finish(null))
+        child.on('close', (code) => {
+          if (code !== 0 || chunks.length === 0) {
+            finish(null)
+            return
+          }
+          const out = Buffer.concat(chunks)
+          if (out.length >= MOTION_GRID_PIXELS) {
+            finish(out.subarray(0, MOTION_GRID_PIXELS))
+          } else {
+            finish(null)
+          }
+        })
+      })
+
+    const keyframeGrid = await runProbe([
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-skip_frame',
+      'nokey',
+      '-i',
+      videoPath,
+      '-frames:v',
+      '1',
+      '-vf',
+      `scale=${MOTION_GRID_WIDTH}:${MOTION_GRID_HEIGHT},format=gray`,
+      '-f',
+      'rawvideo',
+      'pipe:1',
+    ])
+    if (keyframeGrid) return keyframeGrid
+
+    return runProbe([
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-i',
+      videoPath,
+      '-frames:v',
+      '1',
+      '-vf',
+      `scale=${MOTION_GRID_WIDTH}:${MOTION_GRID_HEIGHT},format=gray`,
+      '-f',
+      'rawvideo',
+      'pipe:1',
+    ])
   }
 
   resolveFfmpegBinary(): string {

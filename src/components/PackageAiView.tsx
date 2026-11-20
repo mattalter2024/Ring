@@ -151,7 +151,7 @@ export function PackageAiView({
             <div>
               <div className="toggle-label-main">Scan on Camera Motion</div>
               <div className="toggle-label-sub">
-                Inspect frame whenever Ring reports motion
+                Inspect frame on Ring motion alerts and live NVR scene changes
               </div>
             </div>
             <button

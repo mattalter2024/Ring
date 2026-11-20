@@ -163,6 +163,11 @@ export class AiPackageService {
     { base64: string; capturedAtMs: number }
   >()
   private readonly inFlightCameras = new Set<string>()
+  private readonly inFlightStartedAtByCamera = new Map<string, number>()
+  private readonly pendingAutoTriggerByCamera = new Map<
+    string,
+    'motion' | 'doorbell'
+  >()
   private readonly followUpTimers = new Map<string, Set<NodeJS.Timeout>>()
   private schedulerTimer: NodeJS.Timeout | null = null
   private snapshotSource: SnapshotSource | null = null
@@ -277,9 +282,23 @@ export class AiPackageService {
       clearInterval(this.schedulerTimer)
       this.schedulerTimer = null
     }
+    this.pendingAutoTriggerByCamera.clear()
     for (const camId of Array.from(this.followUpTimers.keys())) {
       this.cancelFollowUps(camId)
     }
+  }
+
+  private isPermanentConfigError(rawError?: string): boolean {
+    if (!rawError) return false
+    const lower = rawError.toLowerCase()
+    return (
+      lower.includes('no openai api key') ||
+      lower.includes('no gemini api key') ||
+      lower.includes('api key not valid') ||
+      lower.includes('invalid api key') ||
+      lower.includes('http 401') ||
+      lower.includes('http 403')
+    )
   }
 
   shouldTriggerForCamera(
@@ -334,7 +353,10 @@ export class AiPackageService {
         if (!this.shouldTriggerForCamera(cameraId, trigger)) return
         const lastHitSeq = this.lastDetectedSeqByCamera.get(cameraId) ?? 0
         if (lastHitSeq > burstStartSeq) return
-        if (this.inFlightCameras.has(cameraId)) return
+        if (this.inFlightCameras.has(cameraId)) {
+          this.pendingAutoTriggerByCamera.set(cameraId, trigger)
+          return
+        }
 
         void this.scanCamera(cameraId, trigger).then((rec) => {
           // If a person/courier is still in frame at the final follow-up without a dropped box yet,
@@ -371,10 +393,14 @@ export class AiPackageService {
 
     const scheduledSeq = this.detectionSeq
     this.scheduleTimer(cameraId, this.motionEndDelayMs, () => {
-      if (!this.snapshotSource || this.inFlightCameras.has(cameraId)) return
+      if (!this.snapshotSource) return
       if (!this.shouldTriggerForCamera(cameraId, 'motion')) return
       const hitSeq = this.lastDetectedSeqByCamera.get(cameraId) ?? 0
       if (hitSeq > scheduledSeq) return
+      if (this.inFlightCameras.has(cameraId)) {
+        this.pendingAutoTriggerByCamera.set(cameraId, 'motion')
+        return
+      }
       void this.scanCamera(cameraId, 'motion')
     })
   }
@@ -384,12 +410,24 @@ export class AiPackageService {
     trigger: 'motion' | 'doorbell',
   ): Promise<PackageDetectionRecord | null> {
     if (!this.shouldTriggerForCamera(cameraId, trigger)) return null
-    if (this.inFlightCameras.has(cameraId)) return null
+    if (this.inFlightCameras.has(cameraId)) {
+      // Ignore duplicate synchronous callback fire from onMotionDetected + onNewNotification
+      // for the exact same Ring event, but queue genuine follow-up/overlapping triggers.
+      const startedAt = this.inFlightStartedAtByCamera.get(cameraId) ?? 0
+      if (trigger === 'doorbell' || Date.now() - startedAt >= 1000) {
+        const existing = this.pendingAutoTriggerByCamera.get(cameraId)
+        if (existing !== 'doorbell') {
+          this.pendingAutoTriggerByCamera.set(cameraId, trigger)
+        }
+      }
+      return null
+    }
     const burstStartSeq = this.detectionSeq
     const record = await this.scanCamera(cameraId, trigger)
-    // Motion often fires while the delivery driver is still approaching the porch.
-    // If no package was detected yet, schedule multi-stage follow-up verification scans.
-    if (!record.packageDetected && !record.rawError) {
+    // Motion often fires while the delivery driver is still approaching the porch—or the
+    // initial scan can hit a transient API/snapshot hiccup. Keep follow-up verification active
+    // unless a package was already found or the error is a permanent API-key configuration error.
+    if (!record.packageDetected && !this.isPermanentConfigError(record.rawError)) {
       this.scheduleMotionFollowUps(cameraId, trigger, burstStartSeq)
     }
     return record
@@ -407,8 +445,10 @@ export class AiPackageService {
       throw new Error(`Camera ${cameraId} not found`)
     }
 
-    this.inFlightCameras.add(cameraId)
     const started = Date.now()
+    this.inFlightCameras.add(cameraId)
+    this.inFlightStartedAtByCamera.set(cameraId, started)
+    let detectedInThisScan = false
     const settings = this.configStore.getPublicSettings()
     const aiCfg = settings.packageAi
 
@@ -493,6 +533,7 @@ export class AiPackageService {
           })
         }
       } else {
+        detectedInThisScan = true
         this.lastDetectedAtByCamera.set(cameraId, Date.now())
         this.lastDetectedSeqByCamera.set(cameraId, ++this.detectionSeq)
         this.cancelFollowUps(cameraId)
@@ -598,6 +639,22 @@ export class AiPackageService {
       return record
     } finally {
       this.inFlightCameras.delete(cameraId)
+      this.inFlightStartedAtByCamera.delete(cameraId)
+      const pendingTrigger = this.pendingAutoTriggerByCamera.get(cameraId)
+      if (pendingTrigger) {
+        this.pendingAutoTriggerByCamera.delete(cameraId)
+        if (
+          (!detectedInThisScan || pendingTrigger === 'doorbell') &&
+          this.snapshotSource &&
+          this.shouldTriggerForCamera(cameraId, pendingTrigger)
+        ) {
+          const delayMs = Math.min(Math.max(this.motionEndDelayMs, 50), 1000)
+          this.scheduleTimer(cameraId, delayMs, () => {
+            if (!this.snapshotSource || this.inFlightCameras.has(cameraId)) return
+            void this.handleAutoTrigger(cameraId, pendingTrigger)
+          })
+        }
+      }
     }
   }
 

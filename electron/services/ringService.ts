@@ -24,7 +24,11 @@ import type {
 } from '../../shared/types'
 import type { ConfigStore } from './configStore'
 import type { StreamService, StreamableRingCamera } from './streamService'
-import type { RecordingService, RecordableRingCamera } from './recordingService'
+import {
+  computeLumaSceneChange,
+  type RecordingService,
+  type RecordableRingCamera,
+} from './recordingService'
 import type { AiPackageService, SnapshotSource } from './aiPackageService'
 import type { NotificationService } from './notificationService'
 
@@ -155,6 +159,11 @@ export class RingService implements SnapshotSource {
   private lastFailoverNotifiedAt = 0
   private lastCloudEventPollAt = 0
   private readonly seenRingEventIds = new Set<string>()
+  private visualMotionTimer: NodeJS.Timeout | null = null
+  private visualMotionChecking = false
+  private readonly lastVisualSegmentByCamera = new Map<string, string>()
+  private readonly lastVisualLumaByCamera = new Map<string, Buffer>()
+  private readonly lastVisualTriggerAtByCamera = new Map<string, number>()
   private snapshotCache = new Map<string, { dataUrl: string; capturedAt: string }>()
 
   private connection: ConnectionStatus = {
@@ -239,6 +248,7 @@ export class RingService implements SnapshotSource {
     await this.streamService.startServer()
     this.aiPackageService.attachSnapshotSource(this)
     this.startNvrWatchdog()
+    this.startVisualMotionWatcher()
 
     const settings = this.configStore.getPublicSettings()
     const savedToken = this.configStore.getRingRefreshToken()
@@ -506,11 +516,15 @@ export class RingService implements SnapshotSource {
         continue
       }
       try {
-        const res = await liveCam.getEvents({ limit: 3 })
+        // Fetch 10 events so frequent on_demand 24/7 NVR sessions don't push out real motion/ding events
+        const res = await liveCam.getEvents({ limit: 10 })
         const list = res?.events ?? []
         let triggered = false
         for (const ev of list) {
-          const evId = `${camId}:${ev.ding_id_str}`
+          const rawEv = ev as unknown as Record<string, unknown>
+          const rawId = rawEv.ding_id_str ?? rawEv.ding_id ?? ev.created_at
+          if (!rawId) continue
+          const evId = `${camId}:${String(rawId)}`
           if (this.seenRingEventIds.has(evId)) continue
           this.seenRingEventIds.add(evId)
           if (this.seenRingEventIds.size > 500) {
@@ -522,13 +536,20 @@ export class RingService implements SnapshotSource {
           if (!Number.isFinite(createdMs) || createdMs < cutoffMs) continue
 
           const kindLower = String(ev.kind ?? '').toLowerCase()
+          const cvProps = (rawEv.cv_properties ?? {}) as Record<string, unknown>
+          const cvType = String(cvProps.detection_type ?? '').toLowerCase()
+          const personDetected = Boolean(cvProps.person_detected)
           const trigger: 'motion' | 'doorbell' | null =
             kindLower === 'ding'
               ? 'doorbell'
               : kindLower.includes('motion') ||
                   kindLower.includes('package') ||
                   kindLower.includes('person') ||
-                  kindLower.includes('loiter')
+                  kindLower.includes('loiter') ||
+                  cvType.includes('package') ||
+                  cvType.includes('human') ||
+                  cvType.includes('person') ||
+                  personDetected
                 ? 'motion'
                 : null
 
@@ -540,6 +561,88 @@ export class RingService implements SnapshotSource {
       } catch {
         // Ignore transient Ring cloud API errors during background catch-all poll
       }
+    }
+  }
+
+  private startVisualMotionWatcher(): void {
+    this.stopVisualMotionWatcher()
+    this.visualMotionTimer = setInterval(() => {
+      void this.pollVisualMotionForAi()
+    }, 15_000)
+    if (typeof this.visualMotionTimer.unref === 'function') {
+      this.visualMotionTimer.unref()
+    }
+  }
+
+  private stopVisualMotionWatcher(): void {
+    if (this.visualMotionTimer) {
+      clearInterval(this.visualMotionTimer)
+      this.visualMotionTimer = null
+    }
+  }
+
+  /**
+   * Local visual scene-change detector on active 24/7 NVR / Live View HLS streams.
+   * Ring cameras commonly suppress cloud motion push events while a continuous Live View
+   * WebRTC session is open. Comparing tiny 64x36 grayscale keyframes locally costs $0 in
+   * Cloud Vision API calls when the porch is idle, and immediately triggers AI package
+   * scanning whenever a courier, person, or box changes the scene.
+   */
+  private async pollVisualMotionForAi(): Promise<void> {
+    if (this.visualMotionChecking) return
+    if (this.connection.mode !== 'live' || this.liveCamerasById.size === 0) return
+
+    const aiCfg = this.configStore.getPublicSettings().packageAi
+    if (!aiCfg.enabled || !aiCfg.triggerOnMotion) return
+
+    this.visualMotionChecking = true
+    try {
+      const nowMs = Date.now()
+      for (const camId of this.liveCamerasById.keys()) {
+        if (
+          aiCfg.monitoredCameraIds.length > 0 &&
+          !aiCfg.monitoredCameraIds.includes(camId)
+        ) {
+          continue
+        }
+
+        const segPath = this.streamService.getLatestHlsSegmentPath(camId, 25_000)
+        if (!segPath) continue
+        if (this.lastVisualSegmentByCamera.get(camId) === segPath) continue
+        this.lastVisualSegmentByCamera.set(camId, segPath)
+
+        const currGrid = await this.recordingService.extractMotionLumaGrid(segPath)
+        if (!currGrid) continue
+
+        const prevGrid = this.lastVisualLumaByCamera.get(camId)
+        if (!prevGrid) {
+          this.lastVisualLumaByCamera.set(camId, currGrid)
+          continue
+        }
+
+        const diff = computeLumaSceneChange(prevGrid, currGrid)
+        // Only update reference frame if the current frame isn't a blank/black reconnect frame
+        if (diff.currMean >= 4) {
+          this.lastVisualLumaByCamera.set(camId, currGrid)
+        }
+
+        if (!diff.significant) continue
+
+        const lastTriggeredAt = this.lastVisualTriggerAtByCamera.get(camId) ?? 0
+        if (nowMs - lastTriggeredAt < 45_000) continue
+        this.lastVisualTriggerAtByCamera.set(camId, nowMs)
+
+        const nowIso = new Date().toISOString()
+        this.cameras = this.cameras.map((c) =>
+          c.id === camId ? { ...c, lastMotionAt: nowIso } : c,
+        )
+        this.callbacks.onCamerasUpdated(this.getCameras())
+        void this.aiPackageService.handleAutoTrigger(camId, 'motion')
+      }
+    } catch {
+      // Ignore transient local frame-diff errors
+    } finally {
+      this.visualMotionChecking = false
     }
   }
 
@@ -641,6 +744,9 @@ export class RingService implements SnapshotSource {
     this.liveCamerasById.clear()
     this.liveLocationsById.clear()
     this.boundSensorZids.clear()
+    this.lastVisualSegmentByCamera.clear()
+    this.lastVisualLumaByCamera.clear()
+    this.lastVisualTriggerAtByCamera.clear()
     this.callbacks.onNvrStatusUpdated?.(this.getNvrStatus())
   }
 
@@ -2851,6 +2957,7 @@ export class RingService implements SnapshotSource {
 
   shutdown(): void {
     this.stopNvrWatchdog()
+    this.stopVisualMotionWatcher()
     this.aiPackageService.stop()
     this.clearLiveSubscriptions()
     this.syncPowerSaveBlocker()

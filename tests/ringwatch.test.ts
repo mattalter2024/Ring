@@ -10,7 +10,11 @@ import {
   type SnapshotSource,
 } from '../electron/services/aiPackageService'
 import { StreamService } from '../electron/services/streamService'
-import { RecordingService } from '../electron/services/recordingService'
+import {
+  computeLumaSceneChange,
+  MOTION_GRID_PIXELS,
+  RecordingService,
+} from '../electron/services/recordingService'
 import { RingService } from '../electron/services/ringService'
 import type { NotificationService } from '../electron/services/notificationService'
 
@@ -1682,7 +1686,178 @@ describe('Enhanced Delivery Detection (Baseline Diff, Ground Crop, Motion-End & 
     const savedRaw = fs.readFileSync(path.join(tmpDir, 'recordings-index.json'), 'utf-8')
     expect(savedRaw.length).toBeLessThan(1000)
   })
+
+  it('detects localized porch scene changes while ignoring uniform sunlight/cloud shifts and blank frames', () => {
+    const base = Buffer.alloc(MOTION_GRID_PIXELS, 110)
+
+    // 1. Uniform brightness shift (+35 across whole frame = passing cloud / exposure change) -> NOT significant
+    const sunlit = Buffer.alloc(MOTION_GRID_PIXELS, 145)
+    expect(computeLumaSceneChange(base, sunlit).significant).toBe(false)
+
+    // 2. Minor H.264 compression jitter (+/- 4) -> NOT significant
+    const jitter = Buffer.from(base)
+    for (let i = 0; i < jitter.length; i++) {
+      jitter[i] = i % 2 === 0 ? 114 : 106
+    }
+    expect(computeLumaSceneChange(base, jitter).significant).toBe(false)
+
+    // 3. Blank/black reconnect frame -> NOT significant
+    const black = Buffer.alloc(MOTION_GRID_PIXELS, 0)
+    expect(computeLumaSceneChange(base, black).significant).toBe(false)
+
+    // 4. Localized cardboard box (~5% of lower porch zone, +60 contrast) -> SIGNIFICANT
+    const withBox = Buffer.from(base)
+    const lowerStart = Math.floor(MOTION_GRID_PIXELS * 0.65)
+    for (let i = lowerStart; i < lowerStart + 100; i++) {
+      withBox[i] = 170
+    }
+    const diff = computeLumaSceneChange(base, withBox)
+    expect(diff.significant).toBe(true)
+    expect(diff.lowerChangedRatio).toBeGreaterThan(0.03)
+  })
+
+  it('keeps motion follow-ups active after a transient initial error and queues overlapping triggers instead of dropping them', async () => {
+    const store = new ConfigStore(tmpDir, path.join(tmpDir, 'videos'))
+    store.updateSettings({
+      mode: 'live',
+      packageAi: {
+        enabled: true,
+        provider: 'openai',
+        openaiModel: 'gpt-4o-mini',
+        openaiApiKey: 'sk-test-resilience',
+        triggerOnMotion: true,
+        triggerOnDoorbell: true,
+        cooldownMinutes: 5,
+      },
+    })
+
+    const notifyMock = vi.fn()
+    const fakeNotifications = {
+      notifyPackageAlert: notifyMock,
+    } as unknown as NotificationService
+
+    const service = new AiPackageService({
+      userDataDir: tmpDir,
+      configStore: store,
+      notifications: fakeNotifications,
+      onDetection: () => {},
+      onSecurityEvent: () => {},
+      retryDelayMs: 0,
+      motionFollowUpDelaysMs: [40],
+      motionEndDelayMs: 40,
+    })
+
+    let snapCall = 0
+    const source: SnapshotSource = {
+      getCameraMeta: (id) => (id === 'porch' ? { id, name: 'Porch' } : undefined),
+      listCameraIds: () => ['porch'],
+      captureSnapshotBase64: async () => {
+        snapCall++
+        if (snapCall === 1) {
+          throw new Error('Snapshot timed out while camera woke up')
+        }
+        return {
+          base64: Buffer.from(`frame-${snapCall}`).toString('base64'),
+          dataUrl: `data:image/jpeg;base64,${Buffer.from(`frame-${snapCall}`).toString('base64')}`,
+        }
+      },
+    }
+    service.attachSnapshotSource(source)
+
+    let visionCalls = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async () => {
+        visionCalls++
+        return {
+          ok: true,
+          json: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    packageDetected: visionCalls >= 1,
+                    confidence: 0.92,
+                    packageCount: 1,
+                    carrierHint: 'UPS',
+                    placement: 'Front porch',
+                    personPresent: false,
+                    summary: 'UPS box left on front porch.',
+                  }),
+                },
+              },
+            ],
+          }),
+        }
+      }),
+    )
+
+    // Initial scan fails transiently on snapshot -> follow-up at 40ms MUST still run and detect package
+    const first = await service.handleAutoTrigger('porch', 'motion')
+    expect(first?.rawError).toContain('Snapshot timed out')
+    await new Promise((r) => setTimeout(r, 120))
+    expect(visionCalls).toBe(1)
+    expect(service.listDetections()[0].packageDetected).toBe(true)
+
+    // Overlapping doorbell press while a scan is in flight MUST be queued rather than dropped
+    let releaseSlowScan!: () => void
+    let slowScanStarted!: () => void
+    const slowStartedPromise = new Promise<void>((r) => {
+      slowScanStarted = r
+    })
+    let overlapCalls = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(async () => {
+        overlapCalls++
+        if (overlapCalls === 1) {
+          slowScanStarted()
+          await new Promise<void>((r) => {
+            releaseSlowScan = r
+          })
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    packageDetected: overlapCalls >= 2,
+                    confidence: 0.95,
+                    packageCount: overlapCalls >= 2 ? 2 : 0,
+                    carrierHint: 'Amazon',
+                    placement: 'Steps',
+                    personPresent: false,
+                    summary:
+                      overlapCalls >= 2
+                        ? 'Two Amazon boxes on steps.'
+                        : 'Clear.',
+                  }),
+                },
+              },
+            ],
+          }),
+        }
+      }),
+    )
+
+    const slowPromise = service.handleAutoTrigger('porch', 'motion')
+    await slowStartedPromise
+    // Doorbell arrives while motion scan is still waiting on API
+    const queued = await service.handleAutoTrigger('porch', 'doorbell')
+    expect(queued).toBeNull()
+    releaseSlowScan()
+    await slowPromise
+
+    await new Promise((r) => setTimeout(r, 150))
+    expect(overlapCalls).toBeGreaterThanOrEqual(2)
+    expect(service.listDetections()[0].packageCount).toBe(2)
+
+    service.stop()
+  })
 })
+
 
 
 
