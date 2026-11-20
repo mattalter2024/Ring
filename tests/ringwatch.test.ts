@@ -1619,6 +1619,24 @@ describe('Enhanced Delivery Detection (Baseline Diff, Ground Crop, Motion-End & 
     expect(cropped![1]).toBe(0xd8)
     expect(cropped!.length).toBeGreaterThan(1024)
   })
+
+  it('safely handles Windows ENOTEMPTY/EBUSY errors during HLS temp folder cleanup without throwing', async () => {
+    const streamService = new StreamService(() => tmpDir)
+    const prepared = await streamService.prepareNvrHlsOutput('cam-lock')
+    streamService.registerNvrHlsFeed('cam-lock', prepared)
+
+    // Simulate Windows NTFS lock throwing ENOTEMPTY on rmSync
+    const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation(() => {
+      const err = new Error('ENOTEMPTY, Directory not empty') as NodeJS.ErrnoException
+      err.code = 'ENOTEMPTY'
+      throw err
+    })
+
+    expect(() => streamService.unregisterNvrHlsFeed('cam-lock')).not.toThrow()
+    expect(() => streamService.stopAll()).not.toThrow()
+    rmSpy.mockRestore()
+    fs.rmSync(prepared.dirPath, { recursive: true, force: true })
+  })
 })
 
 

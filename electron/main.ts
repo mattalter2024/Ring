@@ -35,6 +35,29 @@ if (process.platform === 'win32') {
   app.setAppUserModelId('com.ringwatch.desktop')
 }
 
+// Keep 24/7 unattended NVR resilient against transient OS/socket errors (e.g. Windows EBUSY/ENOTEMPTY/EPIPE)
+const TRANSIENT_ERROR_CODES = new Set([
+  'ENOTEMPTY',
+  'EBUSY',
+  'EPERM',
+  'ENOENT',
+  'EPIPE',
+  'ECONNRESET',
+  'ECONNABORTED',
+])
+
+process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
+  if (err?.code && TRANSIENT_ERROR_CODES.has(err.code)) {
+    console.warn('[RingWatch] Suppressed transient main-process error:', err.code, err.message)
+    return
+  }
+  console.error('[RingWatch] Uncaught main-process exception:', err)
+})
+
+process.on('unhandledRejection', (reason) => {
+  console.warn('[RingWatch] Unhandled promise rejection:', reason)
+})
+
 nativeTheme.themeSource = 'system'
 
 function assertSafeDrivePath(drivePath: unknown): string {

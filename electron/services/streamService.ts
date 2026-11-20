@@ -54,6 +54,7 @@ export class StreamService {
   >()
   private readonly pendingNvrCameras = new Set<string>()
   private readonly wantedLiveViewers = new Map<string, { onEnded?: () => void }>()
+  private readonly cleanupTimers = new Set<NodeJS.Timeout>()
   private readonly getRecordingsDir: () => string
   private readonly getAdditionalRecordingsDirs?: () => string[]
   private recordingPathResolver?: (id: string) => string | undefined
@@ -69,6 +70,43 @@ export class StreamService {
     this.authTokenBuf = Buffer.from(this.authToken, 'utf-8')
     this.hlsRoot = path.join(os.tmpdir(), 'ringwatch-hls')
     fs.mkdirSync(this.hlsRoot, { recursive: true, mode: 0o700 })
+  }
+
+  private tryRemoveSync(targetPath: string): void {
+    try {
+      fs.rmSync(targetPath, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 100,
+      })
+    } catch {
+      // On Windows, NTFS/FFmpeg/Defender may briefly hold a handle (ENOTEMPTY/EBUSY/EPERM).
+      // Never crash the main process over temp HLS folder cleanup.
+    }
+  }
+
+  private scheduleDirCleanup(targetPath: string, delayMs = 3000, retriesLeft = 4): void {
+    const timer = setTimeout(() => {
+      this.cleanupTimers.delete(timer)
+      void fs.promises
+        .rm(targetPath, {
+          recursive: true,
+          force: true,
+          maxRetries: 5,
+          retryDelay: 250,
+        })
+        .catch(() => {
+          // Retry with backoff if Windows still holds an open file handle (ENOTEMPTY/EBUSY)
+          if (retriesLeft > 0 && fs.existsSync(targetPath)) {
+            this.scheduleDirCleanup(targetPath, Math.min(delayMs * 2, 20_000), retriesLeft - 1)
+          }
+        })
+    }, delayMs)
+    if (typeof timer.unref === 'function') {
+      timer.unref()
+    }
+    this.cleanupTimers.add(timer)
   }
 
   setRecordingPathResolver(resolver: (id: string) => string | undefined): void {
@@ -508,9 +546,9 @@ export class StreamService {
     }
 
     const safeId = cameraId.replace(/[^a-zA-Z0-9_-]/g, '_')
-    const sessionKey = `nvr_${safeId}_${++this.sessionSeq}`
+    const sessionKey = `nvr_${safeId}_${Date.now()}_${++this.sessionSeq}`
     const dirPath = path.join(this.hlsRoot, sessionKey)
-    fs.rmSync(dirPath, { recursive: true, force: true })
+    this.tryRemoveSync(dirPath)
     fs.mkdirSync(dirPath, { recursive: true })
 
     const playlistPath = path.join(dirPath, 'index.m3u8')
@@ -599,10 +637,7 @@ export class StreamService {
     }
 
     if (feed?.dirPath) {
-      const oldDir = feed.dirPath
-      setTimeout(() => {
-        fs.rmSync(oldDir, { recursive: true, force: true })
-      }, 3000)
+      this.scheduleDirCleanup(feed.dirPath, 4000, 4)
     }
   }
 
@@ -678,9 +713,9 @@ export class StreamService {
     }
 
     const safeId = cameraId.replace(/[^a-zA-Z0-9_-]/g, '_')
-    const sessionKey = `live_${safeId}_${++this.sessionSeq}`
+    const sessionKey = `live_${safeId}_${Date.now()}_${++this.sessionSeq}`
     const dirPath = path.join(this.hlsRoot, sessionKey)
-    fs.rmSync(dirPath, { recursive: true, force: true })
+    this.tryRemoveSync(dirPath)
     fs.mkdirSync(dirPath, { recursive: true })
 
     const playlistPath = path.join(dirPath, 'index.m3u8')
@@ -724,9 +759,7 @@ export class StreamService {
       } catch {
         // Already stopped
       }
-      setTimeout(() => {
-        fs.rmSync(dirPath, { recursive: true, force: true })
-      }, 3000)
+      this.scheduleDirCleanup(dirPath, 4000, 4)
       this.notifyStreamsChanged()
       onEnded?.()
     }
@@ -806,11 +839,15 @@ export class StreamService {
       this.stopStream(id)
     }
     this.nvrHlsFeeds.clear()
+    for (const timer of this.cleanupTimers) {
+      clearTimeout(timer)
+    }
+    this.cleanupTimers.clear()
     if (this.server) {
       this.server.close()
       this.server = null
       this.port = 0
     }
-    fs.rmSync(this.hlsRoot, { recursive: true, force: true })
+    this.tryRemoveSync(this.hlsRoot)
   }
 }

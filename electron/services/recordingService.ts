@@ -564,7 +564,15 @@ export class RecordingService {
   deleteRecording(id: string): void {
     const target = this.recordings.find((r) => r.id === id)
     if (target && fs.existsSync(target.filePath)) {
-      fs.unlinkSync(target.filePath)
+      try {
+        fs.rmSync(target.filePath, {
+          force: true,
+          maxRetries: 4,
+          retryDelay: 150,
+        })
+      } catch {
+        // Ignore transient Windows EBUSY/EPERM lock if video element just closed
+      }
     }
     this.recordings = this.recordings.filter((r) => r.id !== id)
     this.saveIndex()
